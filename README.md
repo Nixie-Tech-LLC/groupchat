@@ -32,7 +32,34 @@ One binary, three roles, sharing one persistent node:
 State lives under `$GROUPCHAT_HOME` (or the platform config dir): `secret.key`,
 `contacts.json`, `profile.json`, and the `blobs/` store.
 
-## Build
+## Install (no Rust needed)
+
+End users don't need the Rust toolchain — `groupchat` is a single self-contained
+binary. CI builds it for every tag and publishes a GitLab Release.
+
+```bash
+# one-liner (grab the install.sh link from the latest release's assets)
+curl -fsSL <install.sh link from the Release> | sh
+# then make sure ~/.local/bin is on your PATH
+```
+
+Or download the right `groupchat-<target>.tar.gz` for your OS/arch straight from
+the release assets and extract the binary.
+
+**Cutting a release:** push a version tag and CI does the rest —
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.gitlab-ci.yml` builds linux-amd64 (and best-effort linux-arm64 / windows),
+uploads them to the package registry, and creates the Release with an
+`install.sh`. macOS builds need GitLab SaaS macOS runners (those jobs are
+`manual`); alternatively the bundled GitHub `release.yml` (cargo-dist) builds
+mac/windows/linux on free runners and can publish a Homebrew formula
+(`brew install ItsOhmar/homebrew-tap/groupchat`).
+
+## Build (from source)
 
 ```bash
 cargo build --release
