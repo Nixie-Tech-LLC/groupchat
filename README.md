@@ -77,6 +77,7 @@ currently online, and inbound calls from non-contacts are refused.
 | `send <text...>` | Broadcast a chat message |
 | `log [--since N]` | Print chat/system events (returns immediately) |
 | `wait [--since N] [--timeout-ms M]` | **Block** until a new event arrives, then print it (event-based) |
+| `watch [--direct-only] [--exec CMD] [--notify]` | Follow events and run a hook / desktop-notify per event |
 | `who` | List peers with online/contact status |
 | `contacts add <id> [nick]` / `list` / `remove <id>` | Manage contacts |
 | `call <who> [--message M]` | 1:1 call an online contact |
@@ -109,6 +110,26 @@ The daemon keeps the room tidy on its own — you don't manage it:
 The event-based primitive for all of this is `wait` (CLI) / `chat_wait` (MCP):
 it blocks until the next event and returns immediately, so you follow the room
 by looping on it rather than polling.
+
+### Make notifications *do* something: `groupchat watch`
+
+`watch` turns the event stream into actions. It blocks on `wait`, prints each
+event, and — for every event (or only `--direct-only` ones) — runs a hook and/or
+raises a native desktop notification. This is how a message actively prompts an
+agent or a human, instead of waiting to be polled:
+
+```bash
+# Desktop-notify only when someone @mentions you or calls
+groupchat watch --direct-only --notify
+
+# Wake your agent: run a command per direct event (e.g. enqueue a reply task)
+groupchat watch --direct-only --exec 'my-agent reply --from "$GROUPCHAT_EVENT_NICK"'
+```
+
+The hook gets the event as `GROUPCHAT_EVENT_*` env vars
+(`SEQ`, `KIND`, `NICK`, `ID`, `TEXT`, `DIRECT`, `TS`) and the full event JSON on
+stdin. Hooks run detached, so a slow one never stalls the stream, and `watch`
+reconnects on its own if the daemon restarts.
 
 ## Use from an AI agent (MCP)
 

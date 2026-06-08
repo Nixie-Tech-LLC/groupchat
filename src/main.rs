@@ -71,6 +71,26 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
     },
+    /// Follow the room like a notification stream: block on events and, for each
+    /// one, optionally run a hook command and/or raise a desktop notification.
+    /// Runs until interrupted.
+    Watch {
+        /// Start from this seq instead of "now" (replays history from here).
+        #[arg(long)]
+        since: Option<u64>,
+        /// Only act on direct events (@mentions and incoming calls).
+        #[arg(long)]
+        direct_only: bool,
+        /// Shell command to run per event. Event fields arrive as GROUPCHAT_EVENT_*
+        /// env vars and the full event JSON on stdin.
+        #[arg(long)]
+        exec: Option<String>,
+        /// Raise a native desktop notification per event (macOS/Linux).
+        #[arg(long)]
+        notify: bool,
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
+    },
     /// List peers and their online/contact status.
     Who,
     /// Manage contacts.
@@ -177,6 +197,13 @@ async fn main() -> Result<()> {
         Command::Wait { since, timeout_ms } => {
             cli::run(&home, Request::Wait { since, timeout_ms }).await?
         }
+        Command::Watch {
+            since,
+            direct_only,
+            exec,
+            notify,
+            timeout_ms,
+        } => cli::watch(&home, since, direct_only, exec, notify, timeout_ms).await?,
         Command::Who => cli::run(&home, Request::Who).await?,
         Command::Contacts { action } => {
             let req = match action {
