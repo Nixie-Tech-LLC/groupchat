@@ -492,7 +492,13 @@ impl Node {
             Request::Invite => {
                 // Minting an invite is an explicit "let this person in", so
                 // auto-approve their inbound join request for one-step onboarding.
-                self.auto_approve.store(true, Ordering::SeqCst);
+                // Persist it so a reused ticket still auto-approves after a restart.
+                if !self.auto_approve.swap(true, Ordering::SeqCst) {
+                    if let Ok(mut p) = Profile::load(&self.home) {
+                        p.auto_approve = true;
+                        let _ = p.save(&self.home);
+                    }
+                }
                 let ticket = RoomTicket {
                     topic: topic_for_room(&self.shared.room),
                     peers: vec![self.endpoint.addr()],
@@ -822,7 +828,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         shared,
         shutdown: Arc::new(Notify::new()),
         recv_gen: AtomicU64::new(1),
-        auto_approve: AtomicBool::new(false),
+        auto_approve: AtomicBool::new(profile.auto_approve),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));

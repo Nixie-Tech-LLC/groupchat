@@ -138,6 +138,11 @@ pub struct Profile {
     pub nick: String,
     /// The room name we chat in (everyone sharing a name shares a topic).
     pub room: String,
+    /// Whether to auto-approve inbound join requests as contacts. Set once you
+    /// mint an invite; persisted so a reused ticket keeps working across daemon
+    /// restarts.
+    #[serde(default)]
+    pub auto_approve: bool,
 }
 
 impl Default for Profile {
@@ -145,6 +150,7 @@ impl Default for Profile {
         Self {
             nick: whoami_fallback(),
             room: "default".to_string(),
+            auto_approve: false,
         }
     }
 }
