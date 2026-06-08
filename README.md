@@ -15,7 +15,7 @@ Built on `iroh` (p2p QUIC + NAT traversal), `iroh-gossip` (the room), and
 | Identity / contact handle | a persistent `EndpointId` (public key) |
 | The group chat room | an `iroh-gossip` topic (derived from the room name) |
 | "add me to the chat" | a signed `JoinRequest` + member approval |
-| Presence (online/offline) | gossip heartbeats + neighbor events |
+| Presence (online/offline) | gossip heartbeats + neighbor events + a `Bye` on shutdown |
 | 1:1 call (contacts + online only) | a direct QUIC stream on a custom ALPN |
 | Share a resource | `iroh-blobs`: a file becomes a `BlobTicket` |
 
@@ -86,6 +86,29 @@ currently online, and inbound calls from non-contacts are refused.
 | `daemon` | Run the node in the foreground |
 | `mcp` | Run the MCP server over stdio |
 | `stop` | Stop the daemon |
+
+## Presence & notifications (it behaves like a messaging app)
+
+The daemon keeps the room tidy on its own — you don't manage it:
+
+- **Online/offline is accurate and event-driven.** Peers go online on their first
+  heartbeat, and offline the instant they leave: a graceful `stop` broadcasts a
+  `Bye`, a hard exit trips a `NeighborDown`, and a silent stall is caught by a
+  background reaper (30s window). Each transition logs a `presence` event —
+  `alice is online`, `bob left` — so it surfaces in `log`/`wait` like a read
+  receipt.
+- **Notifications carry urgency.** Events have a `direct` flag: a message that
+  `@mention`s you (or an incoming `call`) is `direct` and prints with a 🔔 —
+  it's addressed to you and wants a reply. Ambient room chatter and presence
+  changes are not. An agent triages like a human: glance, open if it's for you,
+  respond or ack, move on.
+- **Cleanup is automatic.** Stale peers are pruned, and if someone reinstalls and
+  rejoins under the same nick with a fresh key, the old contact is replaced — no
+  duplicate handles to manage.
+
+The event-based primitive for all of this is `wait` (CLI) / `chat_wait` (MCP):
+it blocks until the next event and returns immediately, so you follow the room
+by looping on it rather than polling.
 
 ## Use from an AI agent (MCP)
 

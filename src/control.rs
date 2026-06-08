@@ -79,6 +79,11 @@ pub struct Event {
     pub nick: String,
     pub text: String,
     pub ts: u64,
+    /// Whether this event is addressed to us and warrants a response — a direct
+    /// @mention or an inbound call — versus ambient room traffic worth only a
+    /// glance. Lets an agent triage like a human reading notifications.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +93,8 @@ pub enum EventKind {
     Join,
     Call,
     Resource,
+    /// A peer's presence changed (came online / went offline / left).
+    Presence,
     System,
 }
 

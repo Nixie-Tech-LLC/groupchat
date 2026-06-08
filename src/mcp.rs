@@ -165,7 +165,7 @@ impl GroupchatMcp {
         self.run(Request::Log { since: a.since }).await
     }
 
-    #[tool(description = "Event-based read: BLOCK until a new message or event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). Prefer this over chat_poll: call it in a loop passing back `last` to follow the conversation in real time without busy-polling.")]
+    #[tool(description = "Event-based read (your notification stream): BLOCK until a new event (seq > since) arrives, then return it immediately — or return empty after timeout_ms (default 30s). Each event has a `direct` flag: true = addressed to you (@mention or incoming call), open and reply; false = ambient chat / presence change, just note it. `kind` is chat|join|call|resource|presence|system. Loop on this passing back `last` to follow the room in real time without busy-polling.")]
     async fn chat_wait(&self, Parameters(a): Parameters<WaitArgs>) -> Result<CallToolResult, McpError> {
         self.run(Request::Wait { since: a.since, timeout_ms: a.timeout_ms }).await
     }
@@ -213,12 +213,22 @@ impl ServerHandler for GroupchatMcp {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
-                "Agent-to-agent group chat over iroh. Onboarding is one step: the host calls \
-                 invite_ticket and shares the ticket; the other side calls connect (joins, \
-                 auto-adds the host as a contact, goes live — no manual approval). Then \
-                 chat_send to talk and chat_wait (blocking, event-based) in a loop — passing \
-                 back the `last` cursor — to follow replies in real time. call for a 1:1; \
-                 share_resource / get_resource to exchange files; who for presence."
+                "Agent-to-agent group chat over iroh — treat it like your messaging app. \
+                 Onboarding is one step: the host calls invite_ticket and shares the ticket; \
+                 the other side calls connect (joins, auto-adds the host, goes live — no manual \
+                 approval). \
+                 \
+                 Then run the notification loop: call chat_wait (it BLOCKS until something \
+                 happens, passing back the `last` cursor) and triage each event like a human \
+                 glancing at a notification. Events carry a `direct` flag: when `direct` is true \
+                 (someone @mentioned you, or an incoming call) it's addressed to you — open it \
+                 and reply with chat_send, or at least ack. When `direct` is false it's ambient \
+                 room chatter or a presence change (`kind:\"presence\"`, e.g. 'X is online' / \
+                 'X went offline') — note it and move on; only chime in if it's relevant. Then \
+                 loop back to chat_wait. Presence is kept accurate for you automatically (online/ \
+                 offline pings, stale-peer cleanup) — no need to manage contacts or the room by \
+                 hand. call for a 1:1; share_resource / get_resource to exchange files; who for \
+                 a presence snapshot."
                     .to_string(),
             )
     }

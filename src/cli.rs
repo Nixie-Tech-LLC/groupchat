@@ -74,9 +74,12 @@ fn print_response(resp: Response) {
                     crate::control::EventKind::Join => "[join] ",
                     crate::control::EventKind::Call => "[call] ",
                     crate::control::EventKind::Resource => "[resource] ",
+                    crate::control::EventKind::Presence => "[presence] ",
                     crate::control::EventKind::System => "[system] ",
                 };
-                println!("{}{}: {}", tag, e.nick, e.text);
+                // A bell marks direct events (@mentions, calls) that want a reply.
+                let bell = if e.direct { "\u{1F514} " } else { "" };
+                println!("{bell}{tag}{}: {}", e.nick, e.text);
             }
             if events.is_empty() {
                 println!("(no new messages)");

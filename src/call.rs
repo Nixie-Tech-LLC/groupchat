@@ -71,7 +71,7 @@ impl ProtocolHandler for CallHandler {
             .unwrap()
             .nick_of(&remote)
             .unwrap_or_else(|| msg.nick.clone());
-        self.shared.events.lock().unwrap().push(
+        self.shared.events.lock().unwrap().push_direct(
             EventKind::Call,
             remote.to_string(),
             nick,

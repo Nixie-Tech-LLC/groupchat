@@ -101,6 +101,23 @@ impl Contacts {
         self.contacts.remove(&id.to_string()).is_some()
     }
 
+    /// Remove any contacts that share `nick` but are not `keep` — used to dedupe
+    /// when a peer rejoins under the same nick with a fresh identity (e.g. after
+    /// a reinstall). Returns the nicks/ids removed.
+    pub fn remove_stale_nick(&mut self, nick: &str, keep: &EndpointId) -> Vec<String> {
+        let keep = keep.to_string();
+        let stale: Vec<String> = self
+            .contacts
+            .values()
+            .filter(|c| c.nick == nick && c.id != keep)
+            .map(|c| c.id.clone())
+            .collect();
+        for id in &stale {
+            self.contacts.remove(id);
+        }
+        stale
+    }
+
     pub fn contains(&self, id: &EndpointId) -> bool {
         self.contacts.contains_key(&id.to_string())
     }

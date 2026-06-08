@@ -44,6 +44,10 @@ use crate::{
 const ONLINE_WINDOW: Duration = Duration::from_secs(30);
 /// How often we broadcast a presence heartbeat.
 const HEARTBEAT: Duration = Duration::from_secs(10);
+/// How often the reaper sweeps for stale peers.
+const REAP_INTERVAL: Duration = Duration::from_secs(5);
+/// Drop an offline peer from the presence table entirely after this long.
+const PRUNE_WINDOW: Duration = Duration::from_secs(600);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -57,6 +61,9 @@ fn now_secs() -> u64 {
 pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
+    /// Last broadcast presence state, so we emit a notification only on the
+    /// online<->offline transition rather than on every heartbeat.
+    pub online: bool,
 }
 
 /// Append-only-ish ring buffer of chat/system events. Holds a `Notify` that is
@@ -77,6 +84,16 @@ impl EventLog {
     }
 
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
+        self.push_full(kind, id, nick, text, false);
+    }
+
+    /// Push an event marked `direct` — addressed to us, warranting a response
+    /// (an @mention or an inbound call).
+    pub fn push_direct(&mut self, kind: EventKind, id: String, nick: String, text: String) {
+        self.push_full(kind, id, nick, text, true);
+    }
+
+    fn push_full(&mut self, kind: EventKind, id: String, nick: String, text: String, direct: bool) {
         self.seq += 1;
         self.events.push_back(LogEvent {
             seq: self.seq,
@@ -85,6 +102,7 @@ impl EventLog {
             nick,
             text,
             ts: now_secs(),
+            direct,
         });
         while self.events.len() > 1000 {
             self.events.pop_front();
@@ -137,14 +155,21 @@ pub struct Node {
 }
 
 impl Node {
-    /// Update presence for a peer and return the best display nick.
+    /// Update presence for a peer and return the best display nick. Emits a
+    /// "is online" notification when a peer transitions from offline to online.
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
+        let mut came_online = false;
         {
             let mut p = self.shared.presence.lock().unwrap();
             let entry = p.entry(id).or_insert_with(|| Peer {
                 nick: id.fmt_short().to_string(),
                 last_seen: Instant::now(),
+                online: false,
             });
+            if !entry.online {
+                entry.online = true;
+                came_online = true;
+            }
             entry.last_seen = Instant::now();
             if let Some(n) = nick {
                 if !n.is_empty() {
@@ -152,33 +177,120 @@ impl Node {
                 }
             }
         }
-        if let Some(cn) = self.shared.contacts.lock().unwrap().nick_of(&id) {
-            return cn;
-        }
-        self.shared
-            .presence
+        let display = self
+            .shared
+            .contacts
             .lock()
             .unwrap()
-            .get(&id)
-            .map(|p| p.nick.clone())
-            .unwrap_or_else(|| id.fmt_short().to_string())
+            .nick_of(&id)
+            .or_else(|| {
+                self.shared
+                    .presence
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|p| p.nick.clone())
+            })
+            .unwrap_or_else(|| id.fmt_short().to_string());
+        if came_online && id != self.shared.my_id {
+            self.shared.events.lock().unwrap().push(
+                EventKind::Presence,
+                id.to_string(),
+                display.clone(),
+                format!("{display} is online"),
+            );
+        }
+        display
+    }
+
+    /// Mark a peer offline and emit a "went offline" notification, once.
+    fn mark_offline(&self, id: EndpointId, left: bool) {
+        let nick = {
+            let mut p = self.shared.presence.lock().unwrap();
+            match p.get_mut(&id) {
+                Some(peer) if peer.online => {
+                    peer.online = false;
+                    peer.nick.clone()
+                }
+                _ => return, // unknown or already offline — nothing to announce
+            }
+        };
+        let display = self.shared.contacts.lock().unwrap().nick_of(&id).unwrap_or(nick);
+        let text = if left {
+            format!("{display} left")
+        } else {
+            format!("{display} went offline")
+        };
+        self.shared
+            .events
+            .lock()
+            .unwrap()
+            .push(EventKind::Presence, id.to_string(), display, text);
     }
 
     /// Add (or update) a contact, persist it, and log a system event. Returns
     /// the nick used. Idempotent.
     fn add_contact(&self, id: EndpointId, nick: String) -> Result<String> {
-        {
+        let pruned = {
             let mut c = self.shared.contacts.lock().unwrap();
+            // Replace any stale identity that used this nick (e.g. a reinstall).
+            let pruned = c.remove_stale_nick(&nick, &id);
             c.add(id, nick.clone());
             c.save(&self.home)?;
+            pruned
+        };
+        for old in &pruned {
+            if let Ok(old_id) = old.parse::<EndpointId>() {
+                self.shared.presence.lock().unwrap().remove(&old_id);
+            }
         }
         self.shared.events.lock().unwrap().push(
             EventKind::System,
             id.to_string(),
             nick.clone(),
-            format!("added {nick} to contacts"),
+            if pruned.is_empty() {
+                format!("added {nick} to contacts")
+            } else {
+                format!("added {nick} to contacts (replaced {} stale identity)", pruned.len())
+            },
         );
         Ok(nick)
+    }
+
+    /// Periodically mark stale-online peers offline and prune long-dead ones —
+    /// presence stays accurate without anyone managing it by hand.
+    async fn reaper_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(REAP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let stale: Vec<EndpointId> = {
+                let p = self.shared.presence.lock().unwrap();
+                p.iter()
+                    .filter(|(_, peer)| peer.online && peer.last_seen.elapsed() >= ONLINE_WINDOW)
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            for id in stale {
+                self.mark_offline(id, false);
+            }
+            self.shared
+                .presence
+                .lock()
+                .unwrap()
+                .retain(|_, peer| peer.online || peer.last_seen.elapsed() < PRUNE_WINDOW);
+        }
+    }
+
+    /// Whether a chat line addresses us directly (an `@nick` or a bare mention
+    /// of our nick as a word) — worth a response rather than a glance.
+    fn mentions_me(&self, text: &str) -> bool {
+        let nick = self.shared.nick.to_lowercase();
+        if nick.is_empty() {
+            return false;
+        }
+        let t = text.to_lowercase();
+        t.contains(&format!("@{nick}"))
+            || t.split(|c: char| !c.is_alphanumeric()).any(|w| w == nick)
     }
 
     fn handle_payload(&self, from: EndpointId, payload: Payload) {
@@ -186,13 +298,19 @@ impl Node {
             Payload::Hello { nick } | Payload::Presence { nick } => {
                 self.touch(from, Some(nick));
             }
+            Payload::Bye { nick } => {
+                self.touch(from, Some(nick));
+                self.mark_offline(from, true);
+            }
             Payload::Chat { text } => {
                 let nick = self.touch(from, None);
-                self.shared
-                    .events
-                    .lock()
-                    .unwrap()
-                    .push(EventKind::Chat, from.to_string(), nick, text);
+                let direct = self.mentions_me(&text);
+                let mut log = self.shared.events.lock().unwrap();
+                if direct {
+                    log.push_direct(EventKind::Chat, from.to_string(), nick, text);
+                } else {
+                    log.push(EventKind::Chat, from.to_string(), nick, text);
+                }
             }
             Payload::JoinRequest { nick } => {
                 let display = self.touch(from, Some(nick.clone()));
@@ -290,7 +408,10 @@ impl Node {
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
                     }
-                    Event::NeighborDown(_) | Event::Lagged => {}
+                    Event::NeighborDown(id) => {
+                        self.mark_offline(id, false);
+                    }
+                    Event::Lagged => {}
                 },
                 Ok(None) => break,
                 Err(_) => break,
@@ -341,7 +462,7 @@ impl Node {
             .lock()
             .unwrap()
             .get(id)
-            .map(|p| p.last_seen.elapsed() < ONLINE_WINDOW)
+            .map(|p| p.online)
             .unwrap_or(false)
     }
 
@@ -354,7 +475,7 @@ impl Node {
                     .lock()
                     .unwrap()
                     .values()
-                    .filter(|p| p.last_seen.elapsed() < ONLINE_WINDOW)
+                    .filter(|p| p.online)
                     .count();
                 Ok(Response::Status(StatusInfo {
                     id: self.shared.my_id.to_string(),
@@ -479,7 +600,7 @@ impl Node {
                         PresenceEntry {
                             id: id.to_string(),
                             nick,
-                            online: p.last_seen.elapsed() < ONLINE_WINDOW,
+                            online: p.online,
                             is_contact,
                             last_seen_secs: p.last_seen.elapsed().as_secs(),
                         }
@@ -706,6 +827,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));
     tokio::spawn(node.clone().heartbeat_loop());
+    tokio::spawn(node.clone().reaper_loop());
 
     // announce ourselves
     node.broadcast(Payload::Hello {
@@ -737,6 +859,16 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
             }
         }
     }
+
+    // Tell the room we're going offline so peers update presence immediately
+    // instead of waiting for our heartbeat to lapse. Give gossip a moment to
+    // flush the message to neighbors before we tear the router down.
+    node.broadcast(Payload::Bye {
+        nick: node.shared.nick.clone(),
+    })
+    .await
+    .ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let _ = std::fs::remove_file(&socket);
     node.router.shutdown().await.ok();

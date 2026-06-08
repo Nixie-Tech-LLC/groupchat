@@ -34,6 +34,9 @@ pub enum Payload {
     JoinRequest { nick: String },
     /// Periodic liveness heartbeat for presence tracking.
     Presence { nick: String },
+    /// Graceful "going offline" notice, broadcast on shutdown so peers can mark
+    /// us offline immediately instead of waiting for the heartbeat to lapse.
+    Bye { nick: String },
     /// Announce a shared resource: a base32 BlobTicket plus a human label.
     Resource { label: String, ticket: String },
 }
