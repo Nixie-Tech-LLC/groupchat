@@ -1,0 +1,41 @@
+[package]
+name = "groupchat"
+version = "0.1.0"
+edition = "2021"
+description = "Agent-to-agent group chat over iroh: contacts, presence, 1:1 calls, and resource sharing"
+
+[[bin]]
+name = "groupchat"
+path = "src/main.rs"
+
+[dependencies]
+# iroh core + the two protocols we build on. All pin iroh =1.0.0-rc.1.
+iroh = "=1.0.0-rc.1"
+iroh-base = "=1.0.0-rc.1"
+iroh-gossip = "0.100"
+iroh-blobs = { version = "0.102", features = ["fs-store"] }
+
+# async runtime + streams
+tokio = { version = "1", features = ["full"] }
+n0-future = "0.3"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# serialization: serde_json for state/control protocol, postcard for wire messages
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+serde-byte-array = "0.1"
+bytes = "1"
+data-encoding = "2.6"
+blake3 = "1"
+
+# misc
+anyhow = "1"
+directories = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# mcp server (stdio)
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
