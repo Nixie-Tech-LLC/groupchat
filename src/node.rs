@@ -408,10 +408,13 @@ impl Node {
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
                     }
-                    Event::NeighborDown(id) => {
-                        self.mark_offline(id, false);
-                    }
-                    Event::Lagged => {}
+                    // NeighborDown only means this peer is no longer one of our
+                    // *direct* gossip neighbors — the mesh reshuffles neighbors
+                    // constantly without anyone actually leaving. Treating it as
+                    // "offline" causes online/offline flapping. Presence is driven
+                    // by heartbeats instead: a peer goes offline when its
+                    // heartbeats lapse (the reaper) or it sends a graceful Bye.
+                    Event::NeighborDown(_) | Event::Lagged => {}
                 },
                 Ok(None) => break,
                 Err(_) => break,
