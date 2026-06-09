@@ -229,7 +229,37 @@ reconnects on its own if the daemon restarts.
 
 ## Use from an AI agent (MCP)
 
-Register the MCP server with your agent. For Claude Code, add to `.mcp.json`:
+### Quickest: one command
+
+After installing the binary, register the MCP server with your agent in one step
+— no hand-editing JSON:
+
+```bash
+groupchat install-mcp --client claude     # or: cursor | windsurf | generic
+```
+
+It merges a `groupchat` entry into that client's `mcpServers` (preserving any
+others), using this binary's absolute path and carrying `GROUPCHAT_HOME` if set.
+`--scope user|project` picks the config location; `--print` shows the result
+without writing. Restart the agent (or reload its MCP servers) afterward.
+
+### Claude Code plugin (also installs a skill)
+
+Install groupchat as a Claude Code plugin and you get the MCP server **and** a
+skill that teaches the agent the room workflow (tiers, ack obligation, "block on
+`chat_wait`"):
+
+```
+/plugin marketplace add ItsOhmar/groupchat
+/plugin install groupchat@groupchat
+```
+
+The plugin assumes the `groupchat` binary is already on your `PATH` (install it
+first); a `SessionStart` check reminds you if it isn't.
+
+### Manual
+
+Or add it to `.mcp.json` by hand:
 
 ```json
 {

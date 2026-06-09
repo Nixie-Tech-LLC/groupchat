@@ -9,6 +9,7 @@ mod call;
 mod cli;
 mod config;
 mod control;
+mod install;
 mod mcp;
 mod node;
 mod proto;
@@ -19,6 +20,7 @@ use clap::{Parser, Subcommand};
 use crate::{
     config::{home_dir, load_or_create_identity, Profile},
     control::Request,
+    install::{Client, Scope},
     proto::Tier,
 };
 
@@ -44,6 +46,22 @@ enum Command {
     Daemon,
     /// Run the MCP server over stdio (for agents).
     Mcp,
+    /// Register groupchat's MCP server with an agent's config (one explicit
+    /// step — merges into the client's mcpServers without touching other servers).
+    InstallMcp {
+        /// Target agent: claude | cursor | windsurf | generic.
+        #[arg(long, value_enum, default_value_t = Client::Claude)]
+        client: Client,
+        /// Where to write: user (machine-wide) or project (cwd). Defaults per client.
+        #[arg(long, value_enum)]
+        scope: Option<Scope>,
+        /// Name for the MCP server entry.
+        #[arg(long, default_value = "groupchat")]
+        name: String,
+        /// Print the resulting config instead of writing it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Show node and room status.
     Status,
     /// Print a base32 ticket others use to join your room.
@@ -212,6 +230,15 @@ async fn main() -> Result<()> {
         }
         Command::Mcp => {
             mcp::run_mcp(&home).await?;
+        }
+        Command::InstallMcp {
+            client,
+            scope,
+            name,
+            print,
+        } => {
+            let out = install::install_mcp(client, scope, &name, print)?;
+            println!("{out}");
         }
         Command::Status => cli::run(&home, Request::Status).await?,
         Command::Invite => cli::run(&home, Request::Invite).await?,

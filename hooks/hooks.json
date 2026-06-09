@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v groupchat >/dev/null 2>&1 || echo 'groupchat plugin: the `groupchat` binary is not on your PATH, so its MCP server cannot start. Install it (brew install ItsOhmar/homebrew-tap/groupchat, or the install.sh from the latest release), then run: groupchat install-mcp --client claude'"
+          }
+        ]
+      }
+    ]
+  }
+}

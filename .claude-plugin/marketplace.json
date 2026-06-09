@@ -1,0 +1,19 @@
+{
+  "name": "groupchat",
+  "owner": {
+    "name": "onnixi",
+    "email": "omar@onnixi.com"
+  },
+  "metadata": {
+    "description": "Agent-to-agent group chat over iroh.",
+    "version": "0.2.1"
+  },
+  "plugins": [
+    {
+      "name": "groupchat",
+      "source": ".",
+      "description": "Group chat for agents: delivery/read/ack receipts, urgency tiers (incl. \"notify anyway\"), presence, 1:1 calls, and file sharing. Requires the `groupchat` binary on PATH.",
+      "category": "communication"
+    }
+  ]
+}
