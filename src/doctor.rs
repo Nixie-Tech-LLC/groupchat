@@ -108,6 +108,27 @@ pub fn updater_sibling(binary: &Path) -> PathBuf {
     binary.with_file_name("groupchat-update")
 }
 
+/// The hint shown when more than one groupchat binary is installed. Empty when
+/// `count < 2`.
+pub fn format_duplicate_hint(count: usize) -> String {
+    if count < 2 {
+        String::new()
+    } else {
+        format!("note: {count} groupchat installs detected — run `groupchat doctor` to clean up.")
+    }
+}
+
+/// A one-line hint to stderr if the machine has duplicate installs, else None.
+pub fn duplicate_hint() -> Option<String> {
+    let found = discover_binaries(&candidate_dirs());
+    let msg = format_duplicate_hint(found.len());
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
 /// Converge the machine to a single groupchat binary. Non-destructive to
 /// identity/state. With `dry_run`, only report. The keeper defaults to the
 /// running binary (`current_exe`).
@@ -248,6 +269,13 @@ mod tests {
             updater_sibling(Path::new("/home/me/.cargo/bin/groupchat")),
             PathBuf::from("/home/me/.cargo/bin/groupchat-update")
         );
+    }
+
+    #[test]
+    fn hint_text_mentions_doctor_when_multiple() {
+        let msg = format_duplicate_hint(2);
+        assert!(msg.contains("groupchat doctor"));
+        assert!(format_duplicate_hint(1).is_empty());
     }
 
     #[test]

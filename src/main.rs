@@ -221,6 +221,14 @@ enum ContactsCmd {
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
+    // Cheap nudge: if duplicate installs exist, mention doctor once. Never for
+    // the doctor command itself (it does the real work).
+    if !matches!(args.command, Command::Doctor { .. }) {
+        if let Some(hint) = doctor::duplicate_hint() {
+            eprintln!("{hint}");
+        }
+    }
+
     // Registry-level commands that operate across identities, not on one
     // resolved home — handle them before resolution so they never mint.
     match &args.command {
