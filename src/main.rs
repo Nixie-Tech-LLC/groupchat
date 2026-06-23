@@ -9,6 +9,7 @@ mod call;
 mod cli;
 mod config;
 mod control;
+mod doctor;
 mod install;
 mod mcp;
 mod node;
