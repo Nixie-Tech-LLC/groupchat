@@ -168,9 +168,24 @@ package:installer:
       url="\$BASE/groupchat-\$t.\$ext"
       dest="\${GROUPCHAT_BIN_DIR:-\$HOME/.local/bin}"
       mkdir -p "\$dest"
+      tmp=\$(mktemp -d)
+      trap 'rm -rf "\$tmp"' EXIT
       echo "downloading \$url"
-      curl -fsSL "\$url" | tar -xz -C "\$dest"
-      chmod +x "\$dest/groupchat" || true
+      # Download to a file and check curl's exit explicitly. Do NOT pipe curl into
+      # tar: on a 404 with -f, curl emits an empty body, and bsdtar (macOS) treats
+      # empty input as an empty archive and exits 0 — so the install would silently
+      # "succeed" with no binary written.
+      if ! curl -fsSL "\$url" -o "\$tmp/groupchat.\$ext"; then
+        echo "error: download failed for \$t — this platform's binary may not be" >&2
+        echo "       published for this release. See the assets under \$BASE" >&2
+        exit 1
+      fi
+      tar -xzf "\$tmp/groupchat.\$ext" -C "\$dest"
+      if [ ! -x "\$dest/groupchat" ]; then
+        echo "error: install failed — \$dest/groupchat is missing after extraction." >&2
+        exit 1
+      fi
+      chmod +x "\$dest/groupchat"
       echo "installed groupchat to \$dest (add it to PATH if needed)"
       EOF
     - 'curl --fail --silent --show-error --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "dist/install.sh" "${PKG_URL}/install.sh"'
