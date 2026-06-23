@@ -172,6 +172,9 @@ package:installer:
       curl -fsSL "\$url" | tar -xz -C "\$dest"
       chmod +x "\$dest/groupchat" || true
       echo "installed groupchat to \$dest (add it to PATH if needed)"
+      # Converge to a single clean install: the just-installed binary removes any
+      # older/duplicate groupchat copies (e.g. a prior ~/.cargo/bin install).
+      "\$dest/groupchat" doctor --yes || true
       EOF
     - 'curl --fail --silent --show-error --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "dist/install.sh" "${PKG_URL}/install.sh"'
     - printf '{"name":"install.sh","url":"%s/install.sh","link_type":"other"}' "$PKG_URL" > "assets/installer.json"
