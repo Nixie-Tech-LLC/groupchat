@@ -6,8 +6,64 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::{cli, config, control::Request};
+
+/// A per-session identity home, with the metadata `prune` decides on.
+#[derive(Debug, Clone)]
+pub struct IdentityHome {
+    pub name: String,
+    pub path: PathBuf,
+    /// Present in `sessions.json` (some session still recalls it).
+    pub mapped: bool,
+    /// Seconds since the home was last modified.
+    pub modified_secs_ago: u64,
+}
+
+/// Indices of homes to prune given the filters. No filters = all.
+pub fn prune_set(
+    homes: &[IdentityHome],
+    unmapped_only: bool,
+    older_than_secs: Option<u64>,
+) -> Vec<usize> {
+    homes
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| !(unmapped_only && h.mapped))
+        .filter(|(_, h)| older_than_secs.map_or(true, |t| h.modified_secs_ago >= t))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// All identity homes with metadata, reading the registry and `sessions.json`.
+pub fn list_identity_homes() -> anyhow::Result<Vec<IdentityHome>> {
+    let (reg, sessions_path) = config::registry()?;
+    let mapped_names: std::collections::HashSet<String> = fs::read_to_string(&sessions_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s).ok())
+        .map(|m| m.into_values().collect())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for name in reg.list() {
+        let path = reg.home_for(&name);
+        let modified_secs_ago = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mapped = mapped_names.contains(&name);
+        out.push(IdentityHome { name, path, mapped, modified_secs_ago });
+    }
+    Ok(out)
+}
+
+/// Remove an identity home directory (and everything under it).
+pub fn remove_identity_home(h: &IdentityHome) -> std::io::Result<()> {
+    fs::remove_dir_all(&h.path)
+}
 
 /// Best-effort: send `Stop` to every identity home with a live control socket,
 /// so after a binary swap no stale-version daemon keeps running. Failures
@@ -269,6 +325,32 @@ mod tests {
             updater_sibling(Path::new("/home/me/.cargo/bin/groupchat")),
             PathBuf::from("/home/me/.cargo/bin/groupchat-update")
         );
+    }
+
+    fn home(name: &str, mapped: bool, age: u64) -> IdentityHome {
+        IdentityHome {
+            name: name.into(),
+            path: PathBuf::from("/x").join(name),
+            mapped,
+            modified_secs_ago: age,
+        }
+    }
+
+    #[test]
+    fn prune_set_filters_unmapped_and_old() {
+        let homes = vec![
+            home("a", true, 100),   // mapped -> kept when unmapped_only
+            home("b", false, 10),   // unmapped but young
+            home("c", false, 1000), // unmapped and old
+        ];
+        // unmapped only
+        assert_eq!(prune_set(&homes, true, None), vec![1, 2]);
+        // older than 500s only
+        assert_eq!(prune_set(&homes, false, Some(500)), vec![2]);
+        // unmapped AND older than 500s
+        assert_eq!(prune_set(&homes, true, Some(500)), vec![2]);
+        // no filters -> all
+        assert_eq!(prune_set(&homes, false, None), vec![0, 1, 2]);
     }
 
     #[test]
