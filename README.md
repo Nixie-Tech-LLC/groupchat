@@ -35,29 +35,30 @@ State lives under `$GROUPCHAT_HOME` (or the platform config dir): `secret.key`,
 ## Install (no Rust needed)
 
 End users don't need the Rust toolchain — `groupchat` is a single self-contained
-binary. CI builds it for every tag and publishes a GitLab Release.
+binary. Every tag is built for macOS (arm64 + x86) and Linux (arm64 + x86) and
+published as a GitHub Release.
 
 ```bash
-# one-liner (grab the install.sh link from the latest release's assets)
-curl -fsSL <install.sh link from the Release> | sh
-# then make sure ~/.local/bin is on your PATH
+# one-liner — installs the binary plus a self-updater
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Nixie-Tech-LLC/groupchat/releases/latest/download/groupchat-installer.sh | sh
 ```
 
-Or download the right `groupchat-<target>.tar.gz` for your OS/arch straight from
-the release assets and extract the binary.
+The installer places `groupchat` in `~/.cargo/bin` (add it to your `PATH` if it
+isn't already). Upgrade later in place with `groupchat-update`. Or download the
+right `groupchat-<target>.tar.xz` for your OS/arch straight from the release
+assets and extract the binary.
 
 **Cutting a release:** push a version tag and CI does the rest —
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.0 && git push github v0.1.0
 ```
 
-`.gitlab-ci.yml` builds linux-amd64 (and best-effort linux-arm64) and creates a
-GitLab Release with an `install.sh`. The bundled GitHub `release.yml`
-(cargo-dist) builds mac + linux on free runners, publishes the GitHub Release,
-and ships a self-updater (`groupchat-<target>-update`) so installs can upgrade
-in place. (Windows is not built — the daemon's control channel is a Unix domain
-socket.)
+The GitHub `release.yml` (cargo-dist) builds mac + linux on free runners and
+publishes the GitHub Release with binaries, an `install.sh`, and a self-updater.
+A secondary `.gitlab-ci.yml` builds linux-amd64 and publishes a GitLab Release
+(macOS there needs Premium runners, so those jobs are manual). (Windows is not
+built — the daemon's control channel is a Unix domain socket.)
 
 ## Build (from source)
 
