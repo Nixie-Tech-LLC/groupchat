@@ -130,14 +130,19 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
 > encrypted on the wire, so the ACL/keys must be readable to bootstrap decryption
 > (recorded here + in the code).
 
-## P4 — Agent/MCP hardening + release engineering — **in progress (MCP surface + parity done)**
+## P4 — Agent/MCP hardening + release engineering — **release candidate prepared**
 
-- MCP hardening + multi-seed + security review + TUI polish (themes/resize/wide-table
-  scroll).
-- Release: cargo-dist artifacts for all target OS/arches **incl. Windows** + shell/
-  powershell installers + self-updater; verify the install one-liner + `groupchat-update`
-  install and launch. Prepare a tagged RC with drafted notes; **stop before pushing the
-  public version tag** (the single human-gated step).
+- **done** Agent-native MCP surface (full tracker + membership tools) generated/
+  checked against the Layer-B DTOs (`tests/mcp_parity.rs`); MCP handshake verified.
+- **done** Release engineering: version bumped to **0.3.0**; `dist plan` produces
+  all target OS/arches **incl. x86_64-pc-windows-msvc**, shell + PowerShell
+  installers, and a per-target self-updater; the Windows `.zip` + updater +
+  checksum were **built and the packaged binary verified** (`groupchat 0.3.0`,
+  ran the tracker flow). `CHANGELOG.md` drafts the release notes.
+- **prepared, human-gated**: a `v0.3.0` tag is ready; pushing the public tag (which
+  triggers the GitHub Release publish) is the single step left to a human.
+- Deferred/logged: multi-seed hardening, an independent security review of the
+  research-grade E2EE, and TUI theming/resize polish.
 
 ## Merge strategy
 

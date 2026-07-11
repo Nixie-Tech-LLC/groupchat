@@ -1,10 +1,10 @@
 [package]
 name = "groupchat"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 # MSRV: driven by iroh 1.0.0-rc.1, which requires rustc 1.91.
 rust-version = "1.91"
-description = "A peer-to-peer node built on iroh — the transport/identity/presence foundation for a P2P issue tracker"
+description = "A local-first, peer-to-peer, end-to-end-encrypted issue tracker built on iroh + Loro CRDTs"
 authors = ["onnixi <omar@onnixi.com>"]
 license = "MIT OR Apache-2.0"
 # Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
