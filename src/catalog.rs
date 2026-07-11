@@ -429,7 +429,12 @@ impl CatalogDoc {
     }
 
     /// Move `doc_id` to just before/after `anchor` in the board (a real
-    /// `IssueMove` reorder, UI.md §5.1). Inserts if not present.
+    /// `IssueMove` reorder, UI.md §5.1). When the doc is already listed this uses
+    /// the movable list's native `mov` (a single conflict-free move op — the A§9
+    /// "native movable-list win") rather than delete-then-insert; that matters
+    /// under concurrency: two peers concurrently moving the **same** doc converge
+    /// to one position with **no duplicate** in the raw list, instead of each
+    /// contributing a surviving insert. Inserts if not yet present.
     pub fn board_move(
         &self,
         project_id: &ProjectId,
@@ -437,23 +442,45 @@ impl CatalogDoc {
         anchor: &DocId,
         after: bool,
     ) -> Result<()> {
+        use std::cmp::Ordering;
         let l = self.board_list(project_id)?;
-        // remove doc if present
-        if let Some(i) = lx::list_index_of(&l, doc_id.as_str()) {
-            l.delete(i, 1)?;
-        }
+        let cur = lx::list_index_of(&l, doc_id.as_str());
         let anchor_idx = lx::list_index_of(&l, anchor.as_str());
-        let target = match anchor_idx {
-            Some(i) => {
-                if after {
-                    i + 1
-                } else {
-                    i
+        match (cur, anchor_idx) {
+            // reorder an existing element relative to an existing anchor — the
+            // native, conflict-free path.
+            (Some(from), Some(a)) => {
+                if from == a {
+                    return Ok(()); // anchor is the doc itself: no-op
+                }
+                // desired FINAL index (loro `mov(from,to)` targets the final idx),
+                // accounting for the doc's own removal shifting the anchor.
+                let to = match (after, from.cmp(&a)) {
+                    (false, Ordering::Greater) => a,
+                    (false, Ordering::Less) => a - 1,
+                    (true, Ordering::Greater) => a + 1,
+                    (true, Ordering::Less) => a,
+                    (_, Ordering::Equal) => return Ok(()),
+                };
+                let to = to.min(l.len().saturating_sub(1));
+                l.mov(from, to)?;
+            }
+            // not yet listed: insert at the anchor-relative position.
+            (None, Some(a)) => {
+                let target = if after { a + 1 } else { a };
+                l.insert(target.min(l.len()), doc_id.as_str())?;
+            }
+            // anchor gone (or list empty): append; move an existing one to the end.
+            (Some(from), None) => {
+                let last = l.len().saturating_sub(1);
+                if from != last {
+                    l.mov(from, last)?;
                 }
             }
-            None => l.len(),
-        };
-        l.insert(target.min(l.len()), doc_id.as_str())?;
+            (None, None) => {
+                l.insert(l.len(), doc_id.as_str())?;
+            }
+        }
         Ok(())
     }
 }
@@ -605,6 +632,80 @@ mod tests {
         c.board_remove(&p, &ai).unwrap();
         c.doc().commit();
         assert_eq!(c.board_order(&p), vec![ci, bi]);
+    }
+
+    #[test]
+    fn board_move_after_positions_correctly() {
+        let (c, w, p) = cat();
+        let ids: Vec<DocId> = ["a", "b", "d", "e"]
+            .iter()
+            .map(|t| {
+                let i = make_issue(&w, &p, t);
+                let id = i.doc_id().unwrap();
+                c.upsert_row(&i).unwrap();
+                c.board_insert_bottom(&p, &id).unwrap();
+                id
+            })
+            .collect();
+        c.doc().commit();
+        // move a (idx 0) AFTER d (idx 2): expect [b, d, a, e]
+        c.board_move(&p, &ids[0], &ids[2], true).unwrap();
+        c.doc().commit();
+        assert_eq!(
+            c.board_order(&p),
+            vec![
+                ids[1].clone(),
+                ids[2].clone(),
+                ids[0].clone(),
+                ids[3].clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_same_doc_move_converges_without_duplicate() {
+        // The finding from the adversarial convergence pass: a delete-then-insert
+        // board_move duplicates a doc when two peers move the SAME doc; the native
+        // `mov` converges to one position with no raw-list duplicate (A§9).
+        let (c, w, p) = cat();
+        let ids: Vec<DocId> = ["a", "b", "d", "e"]
+            .iter()
+            .map(|t| {
+                let i = make_issue(&w, &p, t);
+                let id = i.doc_id().unwrap();
+                c.upsert_row(&i).unwrap();
+                c.board_insert_bottom(&p, &id).unwrap();
+                id
+            })
+            .collect();
+        c.doc().commit();
+        // fork a replica from a snapshot
+        let snap = c.snapshot().unwrap();
+        let c2 = CatalogDoc::from_doc({
+            let d = LoroDoc::new();
+            d.import(&snap).unwrap();
+            d
+        });
+        // both replicas move `a` concurrently to different anchors
+        c.board_move(&p, &ids[0], &ids[3], true).unwrap(); // a after e
+        c.doc().commit();
+        c2.board_move(&p, &ids[0], &ids[1], true).unwrap(); // a after b
+        c2.doc().commit();
+        // sync both directions
+        c.import(&c2.snapshot().unwrap()).unwrap();
+        c2.import(&c.snapshot().unwrap()).unwrap();
+        c.doc().commit();
+        c2.doc().commit();
+        let o1 = c.board_order(&p);
+        let o2 = c2.board_order(&p);
+        assert_eq!(o1, o2, "raw board orders converge byte-identical");
+        // `a` appears exactly once — no duplicate from concurrent moves.
+        assert_eq!(
+            o1.iter().filter(|d| **d == ids[0]).count(),
+            1,
+            "native mov must not duplicate a doc under concurrent same-doc moves: {o1:?}"
+        );
+        assert_eq!(o1.len(), 4);
     }
 
     #[test]
