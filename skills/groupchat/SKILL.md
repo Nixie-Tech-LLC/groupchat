@@ -1,33 +1,44 @@
 ---
 name: groupchat
-description: Join and follow a shared peer-to-peer room via the groupchat MCP server — connect from an invite ticket, watch presence/join/system events, and see who's online. Use when the user hands you a groupchat invite ticket, or asks this agent to connect to or follow a groupchat room. (groupchat is becoming a P2P issue tracker; issue tools arrive as the model lands.)
+description: File and drive issues in a local-first, peer-to-peer issue tracker via the groupchat MCP server — create/edit/move/assign/label/comment/close issues, read boards and lists, and follow the activity feed. Use when the user asks this agent to track work, file an issue, update a ticket, or work a board in groupchat.
 ---
 
-# Groupchat: peer-to-peer node
+# Groupchat: a peer-to-peer issue tracker
 
-You have a `groupchat` MCP server. It drives a local iroh node — a signed-gossip
-room with presence. (groupchat is being built into a local-first, P2P **issue
-tracker**; today the MCP surface is the transport/presence foundation.)
+You have a `groupchat` MCP server. It drives a local node that owns the workspace's
+Loro-CRDT issue documents over a git-backed store. Every tool returns the same
+versioned JSON DTO the CLI `--json` emits.
 
-## Onboarding (one step)
-- To start a room and invite someone: call `invite_ticket`, share the ticket.
-- Given a ticket: call `connect` once — it joins the room and goes live.
-- Prefer `join_room` only when you want to join and announce a join request
-  without the one-step `connect` flow.
+## Refs
+An issue `<ref>` is a short `iss_` handle (canonical, collision-free) or a `KEY-n`
+alias like `ENG-142`. A project ref is its key (`ENG`) or a `prj_` id. A user ref
+is `@me` or a 64-hex key. If a ref is ambiguous the tool returns a candidate list —
+re-issue with a more specific handle.
 
-## Follow the room — block, don't poll
-Loop on **`wait`**, passing back the `last` cursor each call. It blocks
-server-side and returns the instant something happens. Don't busy-poll `poll`,
-and don't stop to ask the user whether to keep waiting — keep blocking on `wait`.
+## File and drive work
+- `project_new {name, key}` / `project_list` — manage projects. Create a project
+  before the first issue.
+- `issue_new {title, project?, assignees?, priority?, labels?, body?}` — create an
+  issue; returns the resolved handle. Priority is none|low|medium|high|urgent.
+- `issue_edit {reff, title?, status?, priority?}` — patch fields; all flags in one
+  call is one commit = one activity row.
+- `issue_move {reff, project?, position?}` — position is `top`|`bottom`|
+  `before:<ref>`|`after:<ref>`. Setting a project changes membership (the truth).
+- `assign {reff, who:[…], remove?}` · `label {reff, add:[…], remove:[…]}` ·
+  `comment {reff, body}` · `issue_delete {reff}` (tombstone; stays in history).
 
-Each event has a `kind`:
-- **presence** — a peer came online / went offline / left. Note it.
-- **join** — a peer joined the room.
-- **system** — a local notice.
+## Read
+- `list {project?, mine?, status?, label?, all?}` — rows from the catalog cache
+  (fast, no issue-doc loads). `all` includes done/tombstoned.
+- `board {project}` — workflow columns × ordered rows.
+- `issue_view {reff}` — the full issue: body, comments, metadata.
+- `history {reff}` — the issue's derived activity feed.
+- `activity {since}` — workspace-wide recent transitions; pass back `last` to follow.
 
-## Also available
-- `status` — our id, nick, room, online peer count.
-- `my_id` — our endpoint id (the handle others use to reach us).
-- `who` — a presence snapshot (who's online).
+## Multi-node (P2P)
+Onboarding across nodes is one step: the host calls `invite_ticket` and shares it;
+the other side calls `connect`. `who` is a presence snapshot; `status` shows the
+workspace + issue/project counts.
 
-Presence and cleanup are automatic — you don't manage the room by hand.
+There is no compare-and-swap: an edit always applies and merges (a CRDT). Read the
+current state, act, and let it converge.

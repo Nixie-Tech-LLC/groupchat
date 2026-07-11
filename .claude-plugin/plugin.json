@@ -2,7 +2,7 @@
   "name": "groupchat",
   "displayName": "Groupchat",
   "version": "0.2.2",
-  "description": "A local-first, peer-to-peer node built on iroh — a signed-gossip room with presence, the foundation for a P2P issue tracker. Exposes connect/wait/who tools over MCP.",
+  "description": "A local-first, peer-to-peer issue tracker built on iroh + Loro CRDTs with a git-backed store. Exposes the full issue surface (create/edit/move/assign/label/comment, boards, lists, activity) over MCP.",
   "author": {
     "name": "onnixi",
     "email": "omar@onnixi.com"
