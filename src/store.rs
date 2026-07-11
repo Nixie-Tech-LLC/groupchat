@@ -57,8 +57,8 @@ impl Store {
         if git && !repo.join(".git").exists() {
             let _ = run_git(&repo, &["init", "--quiet"]);
             // Local identity so commits never fail on an unconfigured CI box.
-            let _ = run_git(&repo, &["config", "user.email", "groupchat@localhost"]);
-            let _ = run_git(&repo, &["config", "user.name", "groupchat"]);
+            let _ = run_git(&repo, &["config", "user.email", "lait@localhost"]);
+            let _ = run_git(&repo, &["config", "user.name", "lait"]);
         }
         Ok(Self { repo, git })
     }
@@ -195,9 +195,9 @@ impl Store {
             &self.repo,
             &[
                 "-c",
-                "user.email=groupchat@localhost",
+                "user.email=lait@localhost",
                 "-c",
-                "user.name=groupchat",
+                "user.name=lait",
                 "commit",
                 "--quiet",
                 "-m",

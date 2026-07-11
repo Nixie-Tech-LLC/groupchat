@@ -402,7 +402,7 @@ impl Tracker {
         match projects.len() {
             1 => Ok(projects.into_iter().next().unwrap()),
             0 => Err(anyhow!(
-                "no projects yet — create one first: `groupchat projects new <name> --key KEY`"
+                "no projects yet — create one first: `lait projects new <name> --key KEY`"
             )),
             _ => Err(anyhow!("more than one project — specify one with -p <KEY>")),
         }
@@ -1730,7 +1730,7 @@ mod tests {
         }
     }
 
-    /// Perf harness (run: `GC_PERF_N=5000 cargo test --release -p groupchat --lib
+    /// Perf harness (run: `GC_PERF_N=5000 cargo test --release -p lait --lib
     /// perf_seed_and_cold_load -- --ignored --nocapture`). Proves/refutes the
     /// scaling claims: cold-load is O(issues) (loads every doc), board/list reads
     /// are O(catalog) (must stay flat as issue count grows).

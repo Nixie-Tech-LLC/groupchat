@@ -1,5 +1,5 @@
 {
-  "name": "groupchat",
+  "name": "lait",
   "owner": {
     "name": "onnixi",
     "email": "omar@onnixi.com"
@@ -10,9 +10,9 @@
   },
   "plugins": [
     {
-      "name": "groupchat",
+      "name": "lait",
       "source": ".",
-      "description": "A peer-to-peer node built on iroh: a signed-gossip room with presence, exposed as connect/wait/who MCP tools — the foundation for a local-first P2P issue tracker. Requires the `groupchat` binary on PATH.",
+      "description": "A peer-to-peer node built on iroh: a signed-gossip room with presence, exposed as connect/wait/who MCP tools — the foundation for a local-first P2P issue tracker. Requires the `lait` binary on PATH.",
       "category": "developer-tools"
     }
   ]

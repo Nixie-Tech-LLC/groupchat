@@ -1,4 +1,4 @@
-# Cross-platform CI + supply-chain gate. Builds, lints, and tests groupchat on
+# Cross-platform CI + supply-chain gate. Builds, lints, and tests lait on
 # Linux, macOS, and Windows so the daemon's control channel + single-instance
 # lock stay portable. The Windows job is load-bearing — it fails the moment
 # anyone reintroduces a unix-only API (a Unix-domain socket, flock(2), os::fd, …)
@@ -79,8 +79,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export GROUPCHAT_HOME="$(mktemp -d)"
-          export GROUPCHAT_IDLE_SECS=0
+          export LAIT_HOME="$(mktemp -d)"
+          export LAIT_IDLE_SECS=0
           # Capture output into a variable rather than piping into `grep -q`: an
           # early-closing reader (grep -q, head) would send SIGPIPE to the CLI —
           # which now resets SIGPIPE to default for clean interactive piping — and

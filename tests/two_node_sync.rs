@@ -1,5 +1,5 @@
 //! P1 end-to-end: two real nodes converge live over iroh P2P (A§8), no central
-//! server. Pre-spawns two `groupchat` daemons on distinct `GROUPCHAT_HOME`s and
+//! server. Pre-spawns two `lait` daemons on distinct `LAIT_HOME`s and
 //! drives them **directly over the Layer-B control channel** (`control::request`)
 //! — never shelling out to the CLI, so a captured child process can't inherit a
 //! pipe and block. An issue created on one node must appear on the other, both
@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use groupchat::control::{request, Filter, Request, Response};
+use lait::control::{request, Filter, Request, Response};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_groupchat")
+    env!("CARGO_BIN_EXE_lait")
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -56,8 +56,8 @@ impl Drop for Daemon {
 fn spawn_daemon(home: &Path) -> Daemon {
     let mut child = Command::new(bin())
         .arg("daemon")
-        .env("GROUPCHAT_HOME", home)
-        .env("GROUPCHAT_IDLE_SECS", "0")
+        .env("LAIT_HOME", home)
+        .env("LAIT_IDLE_SECS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

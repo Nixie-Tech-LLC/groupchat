@@ -1,5 +1,5 @@
 [package]
-name = "groupchat"
+name = "lait"
 version = "0.3.2"
 edition = "2021"
 # MSRV: driven by iroh 1.0.0-rc.1, which requires rustc 1.91.
@@ -8,18 +8,18 @@ description = "A local-first, peer-to-peer, end-to-end-encrypted issue tracker b
 authors = ["onnixi <omar@onnixi.com>"]
 license = "MIT OR Apache-2.0"
 # Release host (cargo-dist builds/publishes binaries here). Source of record is the homepage.
-repository = "https://github.com/Nixie-Tech-LLC/groupchat"
-homepage = "https://gitlab.com/onnixi/groupchat"
+repository = "https://github.com/Nixie-Tech-LLC/lait"
+homepage = "https://gitlab.com/onnixi/lait"
 readme = "README.md"
 keywords = ["iroh", "p2p", "gossip", "crdt", "issue-tracker"]
 categories = ["command-line-utilities", "network-programming"]
 
 [lib]
-name = "groupchat"
+name = "lait"
 path = "src/lib.rs"
 
 [[bin]]
-name = "groupchat"
+name = "lait"
 path = "src/main.rs"
 
 [dependencies]

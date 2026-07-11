@@ -1,4 +1,4 @@
-//! The groupchat daemon: owns the iroh endpoint, the gossip room, presence, the
+//! The lait daemon: owns the iroh endpoint, the gossip room, presence, the
 //! Loro-CRDT tracker core ([`crate::tracker`]), and the local control server that
 //! CLI/TUI/MCP clients drive.
 //!
@@ -60,7 +60,7 @@ use crate::{
     tracker::{DirtySet, Tracker},
 };
 
-const PRESENCE_ALPN: &[u8] = b"groupchat/presence/0";
+const PRESENCE_ALPN: &[u8] = b"lait/presence/0";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -82,7 +82,7 @@ fn now_secs() -> u64 {
 /// up regardless of local client activity so peers can always pull its changes
 /// (DUR-3); only a solo/ephemeral node — one auto-spawned for a one-off CLI
 /// command that never met a peer — idles out after the window with no clients.
-/// A zero window disables idle-shutdown entirely (GROUPCHAT_IDLE_SECS=0).
+/// A zero window disables idle-shutdown entirely (LAIT_IDLE_SECS=0).
 fn should_idle_shutdown(
     active_conns: u64,
     idle_for: Duration,
@@ -93,7 +93,7 @@ fn should_idle_shutdown(
 }
 
 fn idle_window_from_env() -> Duration {
-    match std::env::var("GROUPCHAT_IDLE_SECS") {
+    match std::env::var("LAIT_IDLE_SECS") {
         Ok(s) => s
             .trim()
             .parse::<u64>()
@@ -742,7 +742,7 @@ impl Node {
             });
         }
         Ok(Response::err(
-            "expected a room ticket (from `groupchat invite`) or an endpoint id",
+            "expected a room ticket (from `lait invite`) or an endpoint id",
         ))
     }
 
@@ -933,9 +933,8 @@ impl Node {
                 let seeds = load_seeds(&self.home);
                 if seeds.is_empty() {
                     return Ok(Response::Text {
-                        text:
-                            "(no pinned seeds \u{2014} add one with `groupchat seed add <ticket>`)"
-                                .to_string(),
+                        text: "(no pinned seeds \u{2014} add one with `lait seed add <ticket>`)"
+                            .to_string(),
                     });
                 }
                 let presence = self.shared.presence.lock().unwrap();
@@ -1200,7 +1199,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
     // Identity is global by default (DUR-5); store (profile/repo/lock/socket) is
-    // this per-repo home. `$GROUPCHAT_HOME` collapses both back into `home`.
+    // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
     let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
     let profile = Profile::load(&home)?;
 
@@ -1268,7 +1267,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     // A seed never idles out (DUR-4): it must stay reachable to serve sync and
     // backfill history even with no local client and no peer currently online.
-    // Otherwise honour the configured idle window (GROUPCHAT_IDLE_SECS).
+    // Otherwise honour the configured idle window (LAIT_IDLE_SECS).
     let idle_window = if seed {
         Duration::ZERO
     } else {
@@ -1323,10 +1322,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .create_tokio()
         .context("bind control channel")?;
 
-    tracing::info!(
-        "groupchat daemon online as {my_id} in room '{}'",
-        profile.room
-    );
+    tracing::info!("lait daemon online as {my_id} in room '{}'", profile.room);
 
     let shutdown = node.shutdown.clone();
     loop {

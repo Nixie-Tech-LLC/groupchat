@@ -1,11 +1,11 @@
-//! groupchat: a local-first, peer-to-peer issue tracker.
+//! lait: a local-first, peer-to-peer issue tracker.
 //!
 //! One binary, three roles:
-//!   * `groupchat daemon` runs the node (endpoint, gossip room, presence, and —
+//!   * `lait daemon` runs the node (endpoint, gossip room, presence, and —
 //!     the tracker core — the Loro-CRDT catalog + issue documents, git-backed).
-//!   * `groupchat <cmd>` / `groupchat tui` are CLI/TUI clients driving the daemon
+//!   * `lait <cmd>` / `lait tui` are CLI/TUI clients driving the daemon
 //!     over a local IPC control channel.
-//!   * `groupchat mcp` exposes the same Layer-B façade as MCP tools for an agent.
+//!   * `lait mcp` exposes the same Layer-B façade as MCP tools for an agent.
 //!
 //! The crate is split lib + bin so integration tests, doctests, and the MCP/DTO
 //! parity check can exercise the same code the binary runs. See `docs/`.

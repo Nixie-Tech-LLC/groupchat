@@ -6,13 +6,13 @@
 //! the build gate if a tracker `Request` is added without a corresponding MCP
 //! tool, or if a `Response` DTO stops round-tripping (a silent contract break).
 
-use groupchat::control::Response;
-use groupchat::dto::{
+use lait::control::Response;
+use lait::dto::{
     ActivityEvent, BoardColumn, BoardView, IssueView, Priority, ProjectDto, Row, WorkflowState,
     SCHEMA_VERSION,
 };
-use groupchat::ids::{DocId, ProjectId, SystemUlidSource, WorkspaceId};
-use groupchat::mcp::{MCP_TOOL_NAMES, REQUIRED_TRACKER_COMMANDS};
+use lait::ids::{DocId, ProjectId, SystemUlidSource, WorkspaceId};
+use lait::mcp::{MCP_TOOL_NAMES, REQUIRED_TRACKER_COMMANDS};
 
 /// Every tracker command an agent must drive has exactly one MCP tool. Adding a
 /// `Request` variant to the tracker surface without wiring an MCP tool for it
@@ -79,7 +79,7 @@ fn response_dtos_round_trip() {
                 state: WorkflowState {
                     id: "backlog".into(),
                     name: "Backlog".into(),
-                    category: groupchat::dto::StatusCategory::Backlog,
+                    category: lait::dto::StatusCategory::Backlog,
                     color: "gray".into(),
                 },
                 rows: vec![row.clone()],
@@ -101,7 +101,7 @@ fn response_dtos_round_trip() {
             labels: vec![],
             label_names: vec!["bug".into()],
             comments: vec![],
-            created_by: groupchat::ids::UserId::from_key_string("a".repeat(64)),
+            created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
             created_at: 1000,
             provisional: false,
         })),
@@ -160,7 +160,7 @@ fn issue_response_status_field_survives_the_kind_tag() {
         labels: vec![],
         label_names: vec![],
         comments: vec![],
-        created_by: groupchat::ids::UserId::from_key_string("a".repeat(64)),
+        created_by: lait::ids::UserId::from_key_string("a".repeat(64)),
         created_at: 0,
         provisional: false,
     }));

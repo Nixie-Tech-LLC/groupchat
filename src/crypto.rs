@@ -138,7 +138,7 @@ pub fn open_sealed(my_seed: &[u8; 32], me: &UserId, sealed: &[u8]) -> Option<Vec
 /// Derive the box AEAD key from the DH shared secret + both public keys.
 fn box_key(shared: &[u8], eph_pub: &[u8], recip_pub: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"groupchat/sealedbox/0");
+    h.update(b"lait/sealedbox/0");
     h.update(shared);
     h.update(eph_pub);
     h.update(recip_pub);

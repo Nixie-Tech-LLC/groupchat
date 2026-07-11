@@ -1,14 +1,14 @@
-# Architecture & Plan — groupchat: a P2P issue tracker
+# Architecture & Plan — lait: a P2P issue tracker
 
 > **Status:** design draft, pre-build. Native Rust. Loro CRDT, git-backed store,
 > iroh P2P propagation. Built **functionality-first** (see [§13](#13-phased-build-plan)).
-> Supersedes the current chat-oriented `groupchat` code; keeps the name + iroh
+> Supersedes the current chat-oriented `lait` code; keeps the name + iroh
 > foundation. The sync/catalog/index design (§5–§10) is validated against Loro's real
 > API and Beelay's implementation (see [§15](#15-decision-log) for sources).
 
 ## 1. What this is
 
-`groupchat` becomes a **local-first, peer-to-peer issue tracker** — a decentralized,
+`lait` becomes a **local-first, peer-to-peer issue tracker** — a decentralized,
 rapid-feedback alternative to Linear that runs as a **native Rust node**. It is built in
 layers, each provable on its own:
 
@@ -24,7 +24,7 @@ Git is the **durable local store, never the sync transport.** This is *not* git-
 issues are Loro CRDT documents, propagated P2P over iroh; git holds each node's durable
 copy and its persisted view of the shared root of trust (the genesis keys, [§6](#6-git-backed-store--trust-root)).
 
-### Kept from today's groupchat
+### Kept from today's lait
 iroh endpoint + `EndpointId` (ed25519 identity) · iroh-gossip topic (→ per-workspace
 announce/presence) · direct QUIC streams on a custom ALPN (→ pairwise Loro sync) ·
 iroh-blobs (→ attachments/snapshots) · `SignedMessage` sign/verify primitive (→ signed
@@ -33,7 +33,7 @@ Realistically the domain layer (chat/receipts/calls) is dropped; what survives i
 iroh transport *patterns* and the identity/presence/blob plumbing.
 
 ### Dropped
-- **groupchat's "access control"** — a room is an *open* gossip topic; messages are
+- **lait's "access control"** — a room is an *open* gossip topic; messages are
   signed but unencrypted; "contacts/approval" only gate the *calls* feature (local,
   unauthenticated). No confidentiality, no real authz. Rebuilt from scratch ([§11](#11-access-control--e2ee-later)).
 - **Chat domain**, **iroh's role as anything but transport**, and **any browser/WebRTC** idea.
@@ -270,7 +270,7 @@ full encrypted-history replica is always reachable for backfill, which also miti
 "offline across a compaction boundary can't merge" risk.
 
 **Seed = a headless role of the same portable node, capable of client-side rooting.** A
-seed is *not* a separate server product: it is the ordinary `groupchat` binary run headless,
+seed is *not* a separate server product: it is the ordinary `lait` binary run headless,
 so it inherits the client's cross-platform portability (the control channel is a Unix socket
 on unix / a named pipe on Windows; TLS is the portable `ring` backend) and **any client node
 can be promoted to a seed**. Because it is a full node, it can *root* other clients: it is
@@ -286,9 +286,9 @@ rarely-co-online peers converge through), even though its *encrypted* blind-rela
 still land at P2.
 
 **Setting up a seed (CLI).** The seed role has two client-native halves, no separate server
-product. On the always-on box: `groupchat daemon --seed` — the ordinary daemon with
+product. On the always-on box: `lait daemon --seed` — the ordinary daemon with
 idle-shutdown disabled (DUR-4) so it stays reachable to serve sync/backfill with no local
-client attached. On a client: `groupchat seed add <ticket|endpoint-id>` — pins that peer into
+client attached. On a client: `lait seed add <ticket|endpoint-id>` — pins that peer into
 a **sticky `seeds.json` registry**, distinct from the opportunistic `peers.json` bootstrap
 cache (DUR-1). A ticket form also *adopts* the workspace and backfills (a fresh client
 establishes the whole workspace from the ticket alone); a bare id form pins a peer whose
@@ -324,7 +324,7 @@ holds the workspace key.** Built last, adapting a proven design:
 ## 12. Agent node & MCP (P4)
 
 The same node, headless, as a workspace **member** exposing an **MCP server** — the
-descendant of `groupchat mcp` — so agents file/update/watch/close issues natively. Agent
+descendant of `lait mcp` — so agents file/update/watch/close issues natively. Agent
 VMs double as durable seed peers.
 
 ## 13. Phased build plan
@@ -344,7 +344,7 @@ No P1 wire rework is needed at P2/P3: formats are forward-compatible from the st
 - **Which security design** to adapt at P3 (Beelay-ported / Keyhive-BeeKEM / Loro %ELO) —
   deferred; all research-grade.
 - **UI surface beyond TUI** (Tauri vs local-web) — decide before/at P4.
-- **Naming** — "groupchat" is kept (fits a rapid-feedback tool).
+- **Naming** — "lait" is kept (fits a rapid-feedback tool).
 - **Validate before building (from the substrate research):** (a) two peers that
   `shallow_snapshot` at *different* frontiers must still merge — confirm and test; (b)
   `find_id_spans_between` / catalog-diff cost at thousands of docs; (c) whether per-`(peerId)`
@@ -377,7 +377,7 @@ No P1 wire rework is needed at P2/P3: formats are forward-compatible from the st
   and is not a shared central truth; the membership graph syncs over iroh and is merely
   persisted in git, authenticated back to the genesis keys carried by the invite (§6). Not
   git-bug; issues are Loro docs propagated over iroh.
-- **Seed is a promotable client role, not a server** — the seed is the portable `groupchat`
+- **Seed is a promotable client role, not a server** — the seed is the portable `lait`
   binary run headless; any client can be one. It *roots* cold clients (ticket-advertised
   bootstrap + genesis/ACL/history backfill) so a new node needs only a ticket, while trust
   stays anchored in the genesis keys, never in the seed. Its always-on availability is what

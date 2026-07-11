@@ -78,7 +78,7 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
   TUI sync indicator + peers panel (U§8).
 - Seed: pull the always-on, promotable seed role forward — ticket-advertised bootstrap +
   backfill so a new client establishes the workspace from a ticket alone (A§10). Run-mode:
-  `groupchat daemon --seed` (idle-shutdown disabled, DUR-4). Client onboarding: `groupchat
+  `lait daemon --seed` (idle-shutdown disabled, DUR-4). Client onboarding: `lait
   seed add <ticket|id>` pins the seed into a sticky `seeds.json` registry (distinct from the
   opportunistic `peers.json`), unioned into the gossip bootstrap and eagerly pulled on every
   start so a client redials and backfills through its seed even with no other peer online;
@@ -143,7 +143,7 @@ Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (
 - **done** Release engineering: version bumped to **0.3.0**; `dist plan` produces
   all target OS/arches **incl. x86_64-pc-windows-msvc**, shell + PowerShell
   installers, and a per-target self-updater; the Windows `.zip` + updater +
-  checksum were **built and the packaged binary verified** (`groupchat 0.3.0`,
+  checksum were **built and the packaged binary verified** (`lait 0.3.0`,
   ran the tracker flow). `CHANGELOG.md` drafts the release notes.
 - **prepared, human-gated**: a `v0.3.0` tag is ready; pushing the public tag (which
   triggers the GitHub Release publish) is the single step left to a human.

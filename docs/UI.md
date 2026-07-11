@@ -1,4 +1,4 @@
-# UI — groupchat: CLI & TUI
+# UI — lait: CLI & TUI
 
 > **Status:** design draft, pre-build. The third design leg, companion to
 > [`ARCHITECTURE.md`](./ARCHITECTURE.md) (refs `A§`) and [`SCHEMA.md`](./SCHEMA.md)
@@ -50,8 +50,8 @@ same refactor-freedom the contract buys the CLI and MCP.
 
 ## 2. CLI command surface
 
-Invocation: `groupchat [--home DIR] [--json] [--no-color] <command> [args]`. `--home`
-selects the node (`$GROUPCHAT_HOME`); `--json` switches every command to the versioned DTO
+Invocation: `lait [--home DIR] [--json] [--no-color] <command> [args]`. `--home`
+selects the node (`$LAIT_HOME`); `--json` switches every command to the versioned DTO
 (§2.3); the daemon is auto-spawned on first use (existing `ensure_daemon`).
 
 ### 2.1 Command table
@@ -84,7 +84,7 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 
 - **Writes echo the resolved handle.** `new`/`edit`/`move`/… return `Response::Ref{reff}`
   so a script can capture the canonical handle (`iss_…` short prefix, §3) it just touched:
-  `id=$(groupchat new "fix login" -p ENG --json | jq -r .reff)`.
+  `id=$(lait new "fix login" -p ENG --json | jq -r .reff)`.
 - **No compare-and-swap (S§7.2).** There is no `--if-status open` flag and there never will
   be one; a `Response` is a snapshot with no cursor back into the doc, edits merge, and
   "close only if still open" is inexpressible. Stated here so nobody adds optimistic
@@ -148,7 +148,7 @@ is local, but the flag is designed now so the surfaces don't need reshaping late
 
 ## 4. TUI architecture & reactivity
 
-`groupchat tui` is a [ratatui](https://ratatui.rs) full-screen client. **[DECISION] ratatui**
+`lait tui` is a [ratatui](https://ratatui.rs) full-screen client. **[DECISION] ratatui**
 — it is the mature, portable (crossterm on all three OSes, matching the cross-platform bar
 in A§ decision log) Rust TUI substrate; no real alternative. It renders from Layer-B
 snapshots and stays live off the event stream.
@@ -320,7 +320,7 @@ appended, listed-but-not-belonging ignored** (S§5.5 render rule). Done column v
 rule, wall-clock desc (S§5.7).
 
 ```
- ENG · groupchat                                    [/] filter  [:] cmd  [?] help
+ ENG · lait                                    [/] filter  [:] cmd  [?] help
  ┌ Backlog ──────┐ ┌ In Progress ──┐ ┌ In Review ────┐ ┌ Done ─────────┐
  │ ENG-142 ·H·   │ │ ENG-140 ·U·▲  │ │ ENG-133 ·M·   │ │ ENG-131       │
  │ parse ticket… │ │ fix login rc… │ │ catalog diff… │ │ seed rooting  │
