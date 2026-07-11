@@ -35,10 +35,14 @@ re-issue with a more specific handle.
 - `history {reff}` — the issue's derived activity feed.
 - `activity {since}` — workspace-wide recent transitions; pass back `last` to follow.
 
-## Multi-node (P2P)
+## Multi-node & E2EE (P2P)
 Onboarding across nodes is one step: the host calls `invite_ticket` and shares it;
-the other side calls `connect`. `who` is a presence snapshot; `status` shows the
-workspace + issue/project counts.
+the other side calls `connect`. Workspace data is end-to-end encrypted, gated by a
+signed membership graph — a joiner sees only ciphertext until an admin admits it:
+- `member_add {who, admin?}` — seal the workspace key to a member (admin-only).
+- `member_remove {who}` — revoke + rotate the key (lazy revocation; admin-only).
+- `key_rotate` / `members` — rotate the key / list members and roles.
+`who` is a presence snapshot; `status` shows the workspace + issue/project counts.
 
 There is no compare-and-swap: an edit always applies and merges (a CRDT). Read the
 current state, act, and let it converge.

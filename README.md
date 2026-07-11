@@ -5,14 +5,15 @@ alternative to Linear that runs as a native Rust node, built on
 [iroh](https://www.iroh.computer/) (P2P QUIC + NAT traversal) and
 [Loro](https://loro.dev/) CRDTs, with a git-backed durable store.
 
-> **Status: P0 complete (single node).** A working, standalone, git-backed issue
-> tracker runs today: create/edit/move/assign/label/comment/close issues from a
-> CLI, a full-screen TUI, or an MCP agent, all driving one daemon that owns the
-> Loro documents. Live P2P sync (P1), the encrypted blind-relay seed (P2), and
-> E2EE membership/rotation (P3) are the next phases — the wire formats are
-> designed so they add on without reshaping P0. See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) for phase status and
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
+> **Status: P0–P3 complete, verified multi-node.** A working, standalone tracker
+> (create/edit/move/assign/label/comment/close issues from a CLI, a full-screen
+> TUI, or an MCP agent over one git-backed daemon), with **live P2P sync over
+> iroh** (no central server — two nodes converge in ~2s), a **portable seed** that
+> backfills a cold client from just a ticket, and **end-to-end encryption** gated
+> by a signed membership graph with add/remove + key rotation (a non-member sees
+> only ciphertext; removal + rotation enforces lazy revocation). Remaining: P4
+> release engineering + hardening. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
+> phase status and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
 > [`docs/SCHEMA.md`](docs/SCHEMA.md) / [`docs/UI.md`](docs/UI.md) for the design.
 
 ## What it is (the plan)
@@ -145,6 +146,7 @@ Registries + node:
 |---|---|
 | `projects [new <name> --key KEY \| ls]` | Manage the project registry |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
+| `members [add <userref> [--admin] \| remove <userref> \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); add seals the key, remove rotates it |
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
@@ -184,9 +186,32 @@ Or add it to `.mcp.json` by hand:
 Tools exposed: the full tracker surface — `issue_new`, `issue_edit`,
 `issue_move`, `assign`, `label`, `comment`, `issue_delete`, `issue_view`, `list`,
 `board`, `history`, `project_new`, `project_list`, `label_new`, `label_list`,
-`activity` — plus transport (`status`, `my_id`, `invite_ticket`, `join_room`,
-`connect`, `who`). Each returns the **same versioned JSON DTO** the CLI `--json`
-emits; a build-gate parity test keeps the agent and human surfaces in lock-step.
+`activity`, `member_add`, `member_remove`, `key_rotate`, `members` — plus
+transport (`status`, `my_id`, `invite_ticket`, `join_room`, `connect`, `who`).
+Each returns the **same versioned JSON DTO** the CLI `--json` emits; a build-gate
+parity test keeps the agent and human surfaces in lock-step.
+
+## Multi-node & end-to-end encryption
+
+```bash
+# host — create work, then share a ticket (carries the workspace + genesis)
+groupchat invite                        # → a base32 ticket; send it to a peer
+
+# peer — join from the ticket (adopts the workspace, backfills over sync)
+groupchat connect <TICKET> --nick bob
+groupchat id                            # → bob's key; send it to the host
+
+# host — admit bob (seals him the workspace key); now bob can decrypt + edit
+groupchat members add <BOB_KEY>
+groupchat members                       # admin you · member bob
+# later: revoke — rotates the key so bob can't read new content (lazy revocation)
+groupchat members remove <BOB_KEY>
+```
+
+Workspace data is E2EE: issues sync as ciphertext, and a node that isn't in the
+signed ACL (or has been removed) sees only ciphertext. Changes propagate live P2P
+over iroh with no central server; any always-on node advertised in a ticket acts
+as a portable seed that backfills cold clients.
 
 ## Running several nodes on one machine
 
