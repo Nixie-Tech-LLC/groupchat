@@ -933,9 +933,8 @@ impl Node {
                 let seeds = load_seeds(&self.home);
                 if seeds.is_empty() {
                     return Ok(Response::Text {
-                        text:
-                            "(no pinned seeds \u{2014} add one with `lait seed add <ticket>`)"
-                                .to_string(),
+                        text: "(no pinned seeds \u{2014} add one with `lait seed add <ticket>`)"
+                            .to_string(),
                     });
                 }
                 let presence = self.shared.presence.lock().unwrap();
@@ -1323,10 +1322,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .create_tokio()
         .context("bind control channel")?;
 
-    tracing::info!(
-        "lait daemon online as {my_id} in room '{}'",
-        profile.room
-    );
+    tracing::info!("lait daemon online as {my_id} in room '{}'", profile.room);
 
     let shutdown = node.shutdown.clone();
     loop {

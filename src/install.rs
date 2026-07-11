@@ -67,10 +67,7 @@ fn server_entry() -> Result<Value> {
     entry.insert("command".into(), json!(exe.to_string_lossy()));
     entry.insert("args".into(), json!(["mcp"]));
     if let Some(h) = std::env::var_os("LAIT_HOME") {
-        entry.insert(
-            "env".into(),
-            json!({ "LAIT_HOME": h.to_string_lossy() }),
-        );
+        entry.insert("env".into(), json!({ "LAIT_HOME": h.to_string_lossy() }));
     }
     Ok(Value::Object(entry))
 }

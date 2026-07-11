@@ -346,9 +346,7 @@ async fn run_update() -> Result<()> {
     };
     match cmd.status() {
         Ok(status) if status.success() => {
-            println!(
-                "lait updated. run any lait command to start the daemon on the new version."
-            );
+            println!("lait updated. run any lait command to start the daemon on the new version.");
             Ok(())
         }
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
