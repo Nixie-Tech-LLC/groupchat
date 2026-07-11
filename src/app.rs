@@ -148,7 +148,15 @@ pub enum Command {
     /// Print our endpoint id (the handle others use to reach us).
     Id,
     /// Run the node daemon in the foreground.
-    Daemon,
+    Daemon {
+        /// Run as an always-on seed: never idle-shut-down, so the node stays
+        /// reachable to serve sync and backfill history to peers even with no
+        /// local client attached and no peer currently online (DUR-4). Add it to
+        /// the workspace with `members add <its-id>` so it can decrypt and hold
+        /// the full history peers pull from.
+        #[arg(long)]
+        seed: bool,
+    },
     /// Run the MCP server over stdio (for agents).
     Mcp,
     /// Register groupchat's MCP server with an agent's config.
@@ -272,7 +280,7 @@ fn reset_sigpipe() {}
 /// Long-running service commands that must keep Rust's default (SIGPIPE ignored)
 /// so networked/stdio I/O returns EPIPE instead of dying on a signal.
 fn is_service_command(cmd: &Command) -> bool {
-    matches!(cmd, Command::Daemon | Command::Mcp)
+    matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
 pub async fn run() -> Result<()> {
@@ -487,14 +495,14 @@ pub async fn run() -> Result<()> {
             let key = load_or_create_identity(&home)?;
             println!("{}", key.public());
         }
-        Command::Daemon => {
+        Command::Daemon { seed } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| "groupchat=info,warn".into()),
                 )
                 .init();
-            node::run_daemon(home).await?;
+            node::run_daemon(home, seed).await?;
         }
         Command::Mcp => {
             mcp::run_mcp(&home).await?;

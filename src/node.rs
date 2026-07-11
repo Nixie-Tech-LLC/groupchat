@@ -16,7 +16,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -76,8 +76,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn should_idle_shutdown(active_conns: u64, idle_for: Duration, window: Duration) -> bool {
-    !window.is_zero() && active_conns == 0 && idle_for >= window
+/// Whether the daemon should idle-shut-down now. A node that is serving a mesh
+/// (`mesh_member` — it currently sees a peer, or has ever persisted one) stays
+/// up regardless of local client activity so peers can always pull its changes
+/// (DUR-3); only a solo/ephemeral node — one auto-spawned for a one-off CLI
+/// command that never met a peer — idles out after the window with no clients.
+/// A zero window disables idle-shutdown entirely (GROUPCHAT_IDLE_SECS=0).
+fn should_idle_shutdown(
+    active_conns: u64,
+    idle_for: Duration,
+    window: Duration,
+    mesh_member: bool,
+) -> bool {
+    !window.is_zero() && !mesh_member && active_conns == 0 && idle_for >= window
 }
 
 fn idle_window_from_env() -> Duration {
@@ -88,6 +99,31 @@ fn idle_window_from_env() -> Duration {
             .map(Duration::from_secs)
             .unwrap_or(IDLE_SHUTDOWN),
         Err(_) => IDLE_SHUTDOWN,
+    }
+}
+
+fn peers_path(home: &Path) -> PathBuf {
+    home.join("peers.json")
+}
+
+/// Load the persisted set of previously-seen peer endpoints, to seed the gossip
+/// bootstrap on (re)start (DUR-1). iroh discovery resolves a dialable address
+/// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
+/// daemon no longer re-enters the mesh with an empty bootstrap set and waits
+/// passively to be re-announced to. Our own id is filtered out.
+fn load_bootstrap_peers(home: &Path, me: EndpointId) -> Vec<EndpointId> {
+    let Ok(data) = std::fs::read_to_string(peers_path(home)) else {
+        return Vec::new();
+    };
+    let ids: Vec<EndpointId> = serde_json::from_str(&data).unwrap_or_default();
+    ids.into_iter().filter(|id| *id != me).collect()
+}
+
+/// Persist the set of currently-known peer endpoints (best-effort) so the next
+/// daemon start can bootstrap from them.
+fn save_known_peers(home: &Path, peers: &[EndpointId]) {
+    if let Ok(data) = serde_json::to_string(peers) {
+        let _ = std::fs::write(peers_path(home), data);
     }
 }
 
@@ -245,6 +281,8 @@ pub struct Node {
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
     syncing: Arc<Mutex<HashSet<EndpointId>>>,
+    /// This node's home dir — used to persist the bootstrap peer set (DUR-1).
+    home: PathBuf,
 }
 
 impl Node {
@@ -459,11 +497,16 @@ impl Node {
             let result = self.do_pull(peer).await;
             self.syncing.lock().unwrap().remove(&peer);
             match result {
-                Ok(dirty) if !dirty.is_empty() => {
-                    self.ring_doorbell(dirty);
-                    let _ = self.broadcast_announce().await;
+                Ok(dirty) => {
+                    if !dirty.is_empty() {
+                        self.ring_doorbell(dirty);
+                        let _ = self.broadcast_announce().await;
+                    }
+                    // We successfully reached this peer — persist it immediately so
+                    // even a short-lived daemon (up for less than a heartbeat) can
+                    // bootstrap from it on the next start (DUR-1).
+                    self.persist_known_peers();
                 }
-                Ok(_) => {}
                 Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
             }
         });
@@ -492,6 +535,21 @@ impl Node {
             catalog_head,
         })
         .await
+    }
+
+    /// Snapshot the peers we currently know (excluding ourselves) and persist
+    /// them as the next start's gossip bootstrap set (DUR-1). Best-effort.
+    fn persist_known_peers(&self) {
+        let peers: Vec<EndpointId> = {
+            let p = self.shared.presence.lock().unwrap();
+            p.keys()
+                .copied()
+                .filter(|id| *id != self.shared.my_id)
+                .collect()
+        };
+        if !peers.is_empty() {
+            save_known_peers(&self.home, &peers);
+        }
     }
 
     /// Our own presence state (UI.md §4.5): `away` when no client input within
@@ -567,8 +625,10 @@ impl Node {
                     }
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
-                        // mesh formed with this peer — pull to converge (A§8).
+                        // mesh formed with this peer — pull to converge (A§8) and
+                        // persist it right away for restart bootstrap (DUR-1).
                         self.clone().trigger_pull(id);
+                        self.persist_known_peers();
                     }
                     Event::NeighborDown(id) => {
                         self.clone().on_neighbor_down(id);
@@ -597,6 +657,9 @@ impl Node {
             // Piggyback a catalog-head announce on the heartbeat so a peer that
             // missed a live announce still converges within a heartbeat (A§8).
             let _ = self.broadcast_announce().await;
+            // Persist the peers we currently know so the next start bootstraps
+            // from them instead of waiting to be re-announced to (DUR-1).
+            self.persist_known_peers();
         }
     }
 
@@ -804,6 +867,25 @@ impl Node {
         *self.last_active.lock().unwrap() = Instant::now();
     }
 
+    /// Whether this node belongs to a shared workspace it should stay online to
+    /// serve (DUR-3). True if it currently tracks any peer, or has ever persisted
+    /// one (DUR-1 `peers.json`) — i.e. it has meshed with someone at least once.
+    /// A node that has never met a peer is solo/ephemeral and may idle out.
+    fn is_mesh_member(&self) -> bool {
+        if self
+            .shared
+            .presence
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .is_some()
+        {
+            return true;
+        }
+        !load_bootstrap_peers(&self.home, self.shared.my_id).is_empty()
+    }
+
     async fn idle_shutdown_loop(self: Arc<Self>) {
         if self.idle_window.is_zero() {
             return;
@@ -813,7 +895,7 @@ impl Node {
             interval.tick().await;
             let active = self.active_conns.load(Ordering::SeqCst);
             let idle_for = self.last_active.lock().unwrap().elapsed();
-            if should_idle_shutdown(active, idle_for, self.idle_window) {
+            if should_idle_shutdown(active, idle_for, self.idle_window, self.is_mesh_member()) {
                 tracing::info!("idle {idle_for:?} with no clients — shutting down");
                 self.shutdown.notify_one();
                 break;
@@ -934,8 +1016,9 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
-/// Build and run the daemon until a Stop request arrives.
-pub async fn run_daemon(home: PathBuf) -> Result<()> {
+/// Build and run the daemon until a Stop request arrives. When `seed` is set the
+/// node runs as an always-on seed and never idle-shuts-down (DUR-4).
+pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
     let secret_key = load_or_create_identity(&home)?;
@@ -944,12 +1027,12 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     // Tracker core (P0): open the git-backed store and load/create the workspace.
     let store = Store::open(&home)?;
     let me = UserId::from_key_string(secret_key.public().to_string());
-    let seed = secret_key.to_bytes();
+    let identity_seed = secret_key.to_bytes();
     let tracker = Tracker::open(
         store,
         me,
         profile.nick.clone(),
-        seed,
+        identity_seed,
         Box::new(SystemUlidSource),
     )?;
     let tracker = Arc::new(Mutex::new(tracker));
@@ -986,11 +1069,26 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     endpoint.online().await;
 
     let topic = topic_for_room(&profile.room);
+    // Seed gossip bootstrap from previously-seen peers so a restart actively
+    // rejoins the mesh instead of waiting to be re-announced to (DUR-1).
+    let bootstrap = load_bootstrap_peers(&home, my_id);
     let gtopic = gossip
-        .subscribe(topic, vec![])
+        .subscribe(topic, bootstrap)
         .await
         .map_err(|e| anyhow!("subscribe to room: {e}"))?;
     let (sender, receiver) = gtopic.split();
+
+    // A seed never idles out (DUR-4): it must stay reachable to serve sync and
+    // backfill history even with no local client and no peer currently online.
+    // Otherwise honour the configured idle window (GROUPCHAT_IDLE_SECS).
+    let idle_window = if seed {
+        Duration::ZERO
+    } else {
+        idle_window_from_env()
+    };
+    if seed {
+        tracing::info!("running as an always-on seed — idle-shutdown disabled");
+    }
 
     let node = Arc::new(Node {
         endpoint,
@@ -1003,11 +1101,12 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         recv_gen: AtomicU64::new(1),
         active_conns: AtomicU64::new(0),
         last_active: Mutex::new(Instant::now()),
-        idle_window: idle_window_from_env(),
+        idle_window,
         tracker,
         doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
         doorbell_notify: Arc::new(Notify::new()),
         syncing: Arc::new(Mutex::new(HashSet::new())),
+        home: home.clone(),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));
@@ -1050,6 +1149,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         }
     }
 
+    node.persist_known_peers();
     node.broadcast(Payload::Bye {
         nick: node.shared.nick.clone(),
     })
@@ -1070,14 +1170,19 @@ mod tests {
     #[test]
     fn idle_shutdown_only_when_unused_and_past_window() {
         let w = Duration::from_secs(60);
-        assert!(should_idle_shutdown(0, Duration::from_secs(61), w));
-        assert!(!should_idle_shutdown(0, Duration::from_secs(30), w));
-        assert!(!should_idle_shutdown(1, Duration::from_secs(600), w));
+        // A solo node (never meshed) idles out only when unused past the window.
+        assert!(should_idle_shutdown(0, Duration::from_secs(61), w, false));
+        assert!(!should_idle_shutdown(0, Duration::from_secs(30), w, false));
+        assert!(!should_idle_shutdown(1, Duration::from_secs(600), w, false));
         assert!(!should_idle_shutdown(
             0,
             Duration::from_secs(600),
-            Duration::ZERO
+            Duration::ZERO,
+            false
         ));
+        // DUR-3: a mesh member never idles out, even unused well past the window,
+        // so peers can always pull its changes.
+        assert!(!should_idle_shutdown(0, Duration::from_secs(600), w, true));
     }
 
     // Doorbell/Reset control-plane invariant (S§7.5, UI.md §4.1): a Subscribe
@@ -1103,5 +1208,27 @@ mod tests {
         assert!(!subscribe_should_reset(oldest - 1, oldest));
         // One older than the boundary (a genuine one-frame gap) → reset.
         assert!(subscribe_should_reset(oldest - 2, oldest));
+    }
+
+    // DUR-1: the bootstrap peer set round-trips through disk and never seeds the
+    // node with itself (dialing your own id is pointless and could self-loop).
+    #[test]
+    fn bootstrap_peers_persist_and_filter_self() {
+        let dir = std::env::temp_dir().join(format!("gc-peers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let me = SecretKey::from_bytes(&[1u8; 32]).public();
+        let peer = SecretKey::from_bytes(&[2u8; 32]).public();
+
+        // Nothing persisted yet → empty bootstrap (the old always-empty case).
+        assert!(load_bootstrap_peers(&dir, me).is_empty());
+
+        // Persist a set that includes ourselves; reload must drop self and keep
+        // the real peer, so a restart bootstraps from the peer.
+        save_known_peers(&dir, &[me, peer]);
+        assert_eq!(load_bootstrap_peers(&dir, me), vec![peer]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — durability & sync-liveness hardening
+
+Follow-up hardening from a durability audit of the local-first / iroh
+distribution layer (tracked as the `DUR` project inside groupchat itself):
+
+- **Crash- and power-loss-durable local writes (DUR-2).** `write_atomic` now
+  `fsync`s the temp file before the rename and `fsync`s the parent directory
+  after it (unix), closing the rename-without-`fsync` window where an already-
+  acked write could be lost on power loss. Atomicity is unchanged; a no-op on
+  Windows, where `MoveFileEx` durability is handled by the filesystem.
+- **Restart reconnection (DUR-1).** The daemon persists the peers it has met
+  (`peers.json`, written when the mesh forms) and seeds gossip bootstrap from
+  them on start, so a restarted node actively rejoins the mesh instead of waiting
+  to be re-announced to. Verified end-to-end: a node killed mid-workspace
+  restarts and reconverges to changes made while it was down.
+- **Stay online to serve sync (DUR-3).** A daemon that has ever meshed with a
+  peer no longer idle-shuts-down, so its changes stay pullable; only a solo,
+  never-meshed node (auto-spawned for a one-off command) still idles out.
+- **Always-on seed (DUR-4).** `groupchat daemon --seed` runs a node that never
+  idles — once added to the workspace with `members add`, it holds full history
+  and serves offline-to-offline handoff and GC-boundary backfill. The privacy-
+  preserving blind relay (ciphertext-only, untrusted host) is tracked separately.
+
+Still open (tracked in `DUR`): repo-bound stores (git-style `.groupchat`
+discovery) and the blind encrypted relay.
+
 ## v0.3.0 — the P2P, E2EE issue tracker (release candidate)
 
 groupchat becomes a working **local-first, peer-to-peer, end-to-end-encrypted
