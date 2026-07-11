@@ -1,4 +1,9 @@
 //! CLI client: builds control requests, auto-spawns the daemon, prints results.
+//!
+//! All three surfaces (CLI, TUI, MCP) are Layer-B clients of the daemon (UI.md
+//! §1); this one renders `Response` snapshots for a human shell, or the versioned
+//! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
+//! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
 use std::{io::Write, path::Path, process::Stdio, time::Duration};
 
@@ -6,15 +11,31 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{
     control::{request, Event, EventKind, Request, Response},
+    dto::{BoardView, IssueView, Priority, Row},
     proto::RoomTicket,
 };
+
+/// Output mode threaded from the global `--json` / `--no-color` flags.
+#[derive(Debug, Clone, Copy)]
+pub struct Out {
+    pub json: bool,
+    pub color: bool,
+}
+
+impl Default for Out {
+    fn default() -> Self {
+        Out {
+            json: false,
+            color: true,
+        }
+    }
+}
 
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
     if request(home, &Request::Status).await.is_ok() {
         return Ok(());
     }
-
     let exe = std::env::current_exe().context("locate own executable")?;
     std::process::Command::new(exe)
         .arg("daemon")
@@ -24,8 +45,6 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("spawn daemon")?;
-
-    // Wait for the daemon to come online (it binds a relay before serving).
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if request(home, &Request::Status).await.is_ok() {
@@ -41,22 +60,259 @@ pub async fn client(home: &Path, req: Request) -> Result<Response> {
     request(home, &req).await
 }
 
-/// Run a request and pretty-print the response for terminal users.
-pub async fn run(home: &Path, req: Request) -> Result<()> {
-    let resp = client(home, req).await?;
-    print_response(resp);
-    Ok(())
+/// Run a request, print the response, and exit with the right code (UI.md §2.3).
+pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
+    match client(home, req).await {
+        Ok(resp) => {
+            let code = print_response(&resp, out);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // daemon unreachable / spawn failure
+            eprintln!("error: {e:#}");
+            std::process::exit(3);
+        }
+    }
 }
 
-/// `invite` gets special display: print the bare token (for agents to paste into
-/// `connect`) AND the `groupchat://` link (for humans/chat apps), and best-effort
-/// copy the token to the clipboard so there's nothing to hand-select.
-pub async fn run_invite(home: &Path) -> Result<()> {
+/// Print a response; return the process exit code it implies.
+pub fn print_response(resp: &Response, out: Out) -> i32 {
+    if out.json {
+        let json = serde_json::to_string(resp).unwrap_or_else(|_| "{}".into());
+        println!("{json}");
+        return match resp {
+            Response::Error { message } => exit_code_for_error(message),
+            Response::Candidates { .. } => 2,
+            _ => 0,
+        };
+    }
+    match resp {
+        Response::Ok { message } => {
+            println!("{}", message.as_deref().unwrap_or("ok"));
+            0
+        }
+        Response::Ref { reff } => {
+            println!("{reff}");
+            0
+        }
+        Response::Issue(v) => {
+            print_issue(v, out);
+            0
+        }
+        Response::List { rows } => {
+            print_rows(rows, out);
+            0
+        }
+        Response::Board(b) => {
+            print_board(b, out);
+            0
+        }
+        Response::Activity { events, .. } => {
+            if events.is_empty() {
+                println!("(no activity)");
+            }
+            for e in events {
+                let changes = if e.changes.is_empty() {
+                    String::new()
+                } else {
+                    let cs: Vec<String> = e
+                        .changes
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{} {}→{}",
+                                c.field,
+                                c.from.as_deref().unwrap_or("∅"),
+                                c.to.as_deref().unwrap_or("∅")
+                            )
+                        })
+                        .collect();
+                    format!("  {}", cs.join(", "))
+                };
+                let warn = if e.collision { " ⚠" } else { "" };
+                println!("{} {} {}{}{}", e.reff, e.actor_nick, e.kind, changes, warn);
+            }
+            0
+        }
+        Response::Projects { projects } => {
+            if projects.is_empty() {
+                println!("(no projects — create one: `groupchat projects new <name> --key KEY`)");
+            }
+            for p in projects {
+                println!("{:<6} {}  ({})", p.key, p.name, p.id);
+            }
+            0
+        }
+        Response::Labels { labels } => {
+            if labels.is_empty() {
+                println!("(no labels)");
+            }
+            for l in labels {
+                println!("{:<16} {}  ({})", l.name, l.color, l.id);
+            }
+            0
+        }
+        Response::Candidates { candidates } => {
+            eprintln!("ambiguous ref — {} candidates:", candidates.len());
+            for c in candidates {
+                let alias = c
+                    .key_alias
+                    .as_deref()
+                    .map(|a| format!(" [{a}]"))
+                    .unwrap_or_default();
+                eprintln!("  {}{}  {}", c.reff, alias, c.title);
+            }
+            2
+        }
+        Response::Status(s) => {
+            println!("id:        {}", s.id);
+            println!("nick:      {}", s.nick);
+            println!("workspace: {}", s.workspace.as_deref().unwrap_or("(none)"));
+            println!("room:      {}", s.room);
+            println!("issues:    {}", s.issues);
+            println!("projects:  {}", s.projects);
+            println!("online:    {} peer(s)", s.online_peers);
+            0
+        }
+        Response::Text { text } => {
+            println!("{text}");
+            0
+        }
+        Response::Events { events, .. } => {
+            if events.is_empty() {
+                println!("(no new events)");
+            }
+            for e in events {
+                print_event(e);
+            }
+            0
+        }
+        Response::Who { peers } => {
+            let mut peers = peers.clone();
+            if peers.is_empty() {
+                println!("(no peers seen yet)");
+            }
+            peers.sort_by_key(|p| (!p.online, p.nick.clone()));
+            for p in peers {
+                let dot = match p.state.as_str() {
+                    "online" => "\u{25CF}",
+                    "away" => "\u{25D0}",
+                    _ => "\u{25CB}",
+                };
+                println!("{dot} {}  ({})", p.nick, p.id);
+            }
+            0
+        }
+        Response::Error { message } => {
+            eprintln!("error: {message}");
+            exit_code_for_error(message)
+        }
+    }
+}
+
+fn exit_code_for_error(message: &str) -> i32 {
+    let resolution_error = message.contains("no issue matches")
+        || message.contains("no project matches")
+        || message.contains("no user matches")
+        || message.contains("no label matches")
+        || message.contains("more than one project");
+    if resolution_error {
+        2
+    } else {
+        1
+    }
+}
+
+fn prio_badge(p: Priority) -> String {
+    format!("·{}·", p.badge())
+}
+
+fn print_rows(rows: &[Row], _out: Out) {
+    if rows.is_empty() {
+        println!("(no issues)");
+        return;
+    }
+    for r in rows {
+        let alias = r.key_alias.as_deref().unwrap_or(&r.reff);
+        let asg = if r.assignee_summary.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", r.assignee_summary)
+        };
+        let dim = if r.provisional { " (provisional)" } else { "" };
+        println!(
+            "{:<10} {} {:<12} {}{}{}",
+            alias,
+            prio_badge(r.priority),
+            r.status,
+            r.title,
+            asg,
+            dim
+        );
+    }
+}
+
+fn print_board(b: &BoardView, _out: Out) {
+    println!("{} · {}", b.project.key, b.project.name);
+    for col in &b.columns {
+        println!("\n┌ {} ({}) ", col.state.name, col.rows.len());
+        for r in &col.rows {
+            let alias = r.key_alias.as_deref().unwrap_or(&r.reff);
+            let asg = if r.assignee_summary.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", r.assignee_summary)
+            };
+            println!(
+                "│ {:<10} {} {}{}",
+                alias,
+                prio_badge(r.priority),
+                r.title,
+                asg
+            );
+        }
+    }
+}
+
+fn print_issue(v: &IssueView, _out: Out) {
+    let alias = v.key_alias.as_deref().unwrap_or(&v.reff);
+    println!("{}  {}", alias, v.title);
+    println!("{}", "─".repeat(60));
+    println!("id:       {}", v.reff);
+    println!("project:  {}", v.project_key.as_deref().unwrap_or("?"));
+    println!("status:   {}", v.status);
+    println!("priority: {}", v.priority.as_str());
+    if !v.assignees.is_empty() {
+        let names: Vec<String> = v.assignees.iter().map(|u| u.short()).collect();
+        println!("assignees: {}", names.join(", "));
+    }
+    if !v.label_names.is_empty() {
+        println!("labels:   {}", v.label_names.join(", "));
+    }
+    if v.provisional {
+        println!("(provisional — issue body not yet synced)");
+    }
+    if !v.description.is_empty() {
+        println!("\n{}", v.description);
+    }
+    if !v.comments.is_empty() {
+        println!("\n## Comments ({})", v.comments.len());
+        for c in &v.comments {
+            println!("{} · {}  {}", c.author.short(), c.ts, c.body);
+        }
+    }
+}
+
+/// `invite` display: bare token + link + best-effort clipboard.
+pub async fn run_invite(home: &Path, out: Out) -> Result<()> {
     let resp = client(home, Request::Invite).await?;
     let token = match resp {
         Response::Text { text } => text.trim().to_string(),
         other => {
-            print_response(other);
+            print_response(&other, out);
             return Ok(());
         }
     };
@@ -73,8 +329,6 @@ pub async fn run_invite(home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort copy to the OS clipboard. Tries macOS `pbcopy`, then Wayland
-/// `wl-copy`, then X11 `xclip`. Returns whether it succeeded; never errors.
 fn copy_to_clipboard(s: &str) -> bool {
     let candidates: [(&str, &[&str]); 3] = [
         ("pbcopy", &[]),
@@ -99,49 +353,6 @@ fn copy_to_clipboard(s: &str) -> bool {
     false
 }
 
-fn print_response(resp: Response) {
-    match resp {
-        Response::Ok { message } => {
-            if let Some(m) = message {
-                println!("{m}");
-            } else {
-                println!("ok");
-            }
-        }
-        Response::Text { text } => println!("{text}"),
-        Response::Status(s) => {
-            println!("id:      {}", s.id);
-            println!("nick:    {}", s.nick);
-            println!("room:    {}", s.room);
-            println!("online:  {} peer(s)", s.online_peers);
-        }
-        Response::Events { events, last } => {
-            for e in &events {
-                print_event(e);
-            }
-            if events.is_empty() {
-                println!("(no new events)");
-            } else {
-                println!("--- last seq {last} ---");
-            }
-        }
-        Response::Who { mut peers } => {
-            if peers.is_empty() {
-                println!("(no peers seen yet)");
-            }
-            peers.sort_by_key(|p| (!p.online, p.nick.clone()));
-            for p in peers {
-                let dot = if p.online { "\u{25CF}" } else { "\u{25CB}" };
-                println!("{dot} {}  ({})", p.nick, p.id);
-            }
-        }
-        Response::Error { message } => {
-            eprintln!("error: {message}");
-        }
-    }
-}
-
-/// Short machine-readable name for an event kind (also used as a hook env var).
 fn kind_str(k: &EventKind) -> &'static str {
     match k {
         EventKind::Join => "join",
@@ -150,7 +361,6 @@ fn kind_str(k: &EventKind) -> &'static str {
     }
 }
 
-/// Print one event the way `log`/`watch` show it.
 fn print_event(e: &Event) {
     let tag = match e.kind {
         EventKind::Join => "[join] ",
@@ -160,9 +370,6 @@ fn print_event(e: &Event) {
     println!("{tag}{}: {}", e.nick, e.text);
 }
 
-/// Run a user hook for an event: the event fields are exported as environment
-/// variables and the full event JSON is piped to the command's stdin. Detached
-/// so a slow hook never stalls the watch loop.
 fn run_hook(cmd: &str, e: &Event) {
     let json = serde_json::to_string(e).unwrap_or_default();
     let child = std::process::Command::new("sh")
@@ -181,7 +388,6 @@ fn run_hook(cmd: &str, e: &Event) {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(json.as_bytes());
             }
-            // Reap in the background so we don't block or leave a zombie.
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
@@ -190,7 +396,6 @@ fn run_hook(cmd: &str, e: &Event) {
     }
 }
 
-/// Fire a desktop notification for an event (best-effort, platform-native).
 fn desktop_notify(e: &Event) {
     let title = format!("groupchat: {}", e.nick);
     if cfg!(target_os = "macos") {
@@ -207,9 +412,7 @@ fn desktop_notify(e: &Event) {
     }
 }
 
-/// Foreground notification runner: block on `wait`, print each event, and for
-/// each event optionally run a hook command and/or raise a desktop notification.
-/// Loops forever (Ctrl-C to stop), reconnecting if the daemon restarts.
+/// Foreground presence-notification runner (the `watch` command).
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
@@ -218,8 +421,6 @@ pub async fn watch(
     timeout_ms: u64,
 ) -> Result<()> {
     ensure_daemon(home).await?;
-
-    // Default: start from "now" so we don't replay the whole backlog.
     let mut cursor = match since {
         Some(n) => n,
         None => match request(home, &Request::Log { since: 0 }).await? {
@@ -228,7 +429,6 @@ pub async fn watch(
         },
     };
     eprintln!("watching from seq {cursor} (Ctrl-C to stop)\u{2026}");
-
     loop {
         let resp = match request(
             home,
@@ -241,7 +441,6 @@ pub async fn watch(
         {
             Ok(r) => r,
             Err(e) => {
-                // Daemon may have restarted; re-ensure and keep going.
                 eprintln!("watch: {e}; reconnecting\u{2026}");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let _ = ensure_daemon(home).await;

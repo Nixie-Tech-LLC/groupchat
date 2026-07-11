@@ -85,7 +85,7 @@ impl GroupchatMcp {
                     return Err(McpError::internal_error(message.clone(), None));
                 }
                 let json = serde_json::to_string(&resp)
-                    .unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string());
+                    .unwrap_or_else(|_| "{\"kind\":\"ok\"}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
             Err(e) => Err(McpError::internal_error(format!("{e:#}"), None)),

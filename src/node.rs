@@ -1,10 +1,18 @@
-//! The groupchat daemon: owns the iroh endpoint, the gossip room, presence, and
-//! the local control server that CLI/MCP clients drive.
+//! The groupchat daemon: owns the iroh endpoint, the gossip room, presence, the
+//! Loro-CRDT tracker core ([`crate::tracker`]), and the local control server that
+//! CLI/TUI/MCP clients drive.
 //!
-//! This is the transport + identity + presence skeleton the issue tracker builds
-//! on (see `docs/ARCHITECTURE.md`). The chat/receipts/calls domain has been
-//! pruned away; what remains is the iroh foundation: a signed-gossip room for
-//! announce/presence, a liveness-probe ALPN, and the daemon/control plumbing.
+//! The iroh transport (signed-gossip room for announce/presence, a liveness
+//! probe ALPN, the daemon/control plumbing) is the P1 networking substrate. The
+//! P0 tracker rides on top: the daemon is the **only** owner of the Loro docs
+//! (UI.md §1), and every surface is a thin Layer-B client of it.
+//!
+//! **Doorbells (S§7.5, UI.md §4.1–§4.2).** A mutation produces a
+//! [`crate::tracker::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
+//! a per-session `seq`, pushes it onto a bounded ring, and wakes every parked
+//! [`Request::Subscribe`] stream. `seq` is never persisted; the first frame of
+//! every Subscribe is a `Reset`, which unifies first-connect / reconnect /
+//! restart / ring-overrun into one rebaseline path (UI.md §4.1).
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,32 +49,25 @@ use tokio::{
 use crate::{
     config::{acquire_daemon_lock, load_or_create_identity, Profile},
     control::{
-        control_name, Event as LogEvent, EventKind, PresenceEntry, Request, Response, StatusInfo,
+        control_name, Doorbell, Event as LogEvent, EventKind, PresenceEntry, Request, Response,
+        StatusInfo,
     },
+    ids::{SystemUlidSource, UserId},
     presence::PeerState,
     proto::{topic_for_room, Payload, RoomTicket, SignedMessage},
+    store::Store,
+    tracker::{DirtySet, Tracker},
 };
 
-/// ALPN for the lightweight liveness-probe protocol. A completed QUIC handshake
-/// is the entire signal — there is no payload.
 const PRESENCE_ALPN: &[u8] = b"groupchat/presence/0";
-/// How often we broadcast a presence heartbeat. This is only a keepalive for the
-/// gossip connection; presence itself is driven by neighbor events + direct
-/// probes (see `presence.rs`), not by whether these are delivered.
 const HEARTBEAT: Duration = Duration::from_secs(10);
-/// How long a direct liveness probe waits for a QUIC handshake before concluding
-/// the peer is gone.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often the reaper sweeps for stale peers.
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
-/// Drop an offline peer from the presence table entirely after this long.
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
-/// Default idle window before an unused daemon shuts itself down. Overridable
-/// via `GROUPCHAT_IDLE_SECS` (0 disables). Keeps per-session daemons from piling
-/// up, while never shutting one that has a client connected.
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
-/// How often the idle-shutdown loop checks for inactivity.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound on the doorbell ring — holds the last ~1000 *batches* (UI.md §4.2).
+const DOORBELL_RING: usize = 1000;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -75,13 +76,10 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether an idle daemon should shut down: no clients connected AND no activity
-/// within the window. A zero window disables idle shutdown entirely.
 fn should_idle_shutdown(active_conns: u64, idle_for: Duration, window: Duration) -> bool {
     !window.is_zero() && active_conns == 0 && idle_for >= window
 }
 
-/// Idle-shutdown window, overridable via `GROUPCHAT_IDLE_SECS` (0 disables).
 fn idle_window_from_env() -> Duration {
     match std::env::var("GROUPCHAT_IDLE_SECS") {
         Ok(s) => s
@@ -98,12 +96,9 @@ fn idle_window_from_env() -> Duration {
 pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
-    /// Neighbor-driven, probe-confirmed presence state (see `presence.rs`).
     pub presence: PeerState,
 }
 
-/// Accepts liveness probes (see `Node::probe_peer`). The completed QUIC
-/// handshake is the entire signal; the handler just lets the connection close.
 #[derive(Debug, Clone)]
 struct PresencePing;
 
@@ -114,9 +109,7 @@ impl ProtocolHandler for PresencePing {
     }
 }
 
-/// Append-only-ish ring buffer of presence/system events. Holds a `Notify` that
-/// is fired on every push so blocking waiters (`Request::Wait`) wake the instant
-/// a new event lands — event-based delivery instead of poll loops.
+/// Append-only-ish ring buffer of presence/system events (P1 transport surface).
 #[derive(Debug, Default)]
 pub struct EventLog {
     seq: u64,
@@ -125,12 +118,9 @@ pub struct EventLog {
 }
 
 impl EventLog {
-    /// A handle to the wake source, fired on every `push`. Cloneable and usable
-    /// without holding the log's mutex.
     pub fn notify(&self) -> Arc<Notify> {
         self.notify.clone()
     }
-
     pub fn push(&mut self, kind: EventKind, id: String, nick: String, text: String) {
         self.seq += 1;
         self.events.push_back(LogEvent {
@@ -144,10 +134,8 @@ impl EventLog {
         while self.events.len() > 1000 {
             self.events.pop_front();
         }
-        // Wake everyone blocked in Request::Wait.
         self.notify.notify_waiters();
     }
-
     pub fn since(&self, since: u64) -> (Vec<LogEvent>, u64) {
         let out: Vec<LogEvent> = self
             .events
@@ -160,7 +148,29 @@ impl EventLog {
     }
 }
 
-/// Cheaply-cloneable shared state.
+/// The doorbell ring — per-session `seq`, per-boot `epoch`, bounded batches.
+#[derive(Debug)]
+pub struct DoorbellRing {
+    epoch: u64,
+    seq: u64,
+    ring: VecDeque<Doorbell>,
+}
+
+impl DoorbellRing {
+    fn new(epoch: u64) -> Self {
+        Self {
+            epoch,
+            seq: 0,
+            ring: VecDeque::new(),
+        }
+    }
+    /// The oldest retained seq (for stale-cursor detection).
+    fn oldest(&self) -> u64 {
+        self.ring.front().map(|f| f.seq).unwrap_or(self.seq)
+    }
+}
+
+/// Cheaply-cloneable shared presence state.
 #[derive(Debug, Clone)]
 pub struct Shared {
     pub nick: String,
@@ -179,19 +189,18 @@ pub struct Node {
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
-    /// Bumped on every (re)subscribe so stale receive loops exit.
     recv_gen: AtomicU64,
-    /// Number of control connections currently open (0 ⇒ idle).
     active_conns: AtomicU64,
-    /// Last time a client connected or acted — drives idle-shutdown.
     last_active: Mutex<Instant>,
-    /// Idle window before self-shutdown (`Duration::ZERO` disables).
     idle_window: Duration,
+    /// The Loro-CRDT tracker core (P0). The daemon is its only owner.
+    tracker: Arc<Mutex<Tracker>>,
+    /// The doorbell ring + its wake source (S§7.5).
+    doorbell: Arc<Mutex<DoorbellRing>>,
+    doorbell_notify: Arc<Notify>,
 }
 
 impl Node {
-    /// Update presence for a peer and return the best display nick. Emits a
-    /// "is online" notification when a peer transitions from offline to online.
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
         let now = Instant::now();
         let came_online = {
@@ -235,7 +244,6 @@ impl Node {
         display
     }
 
-    /// Mark a peer offline and emit a "went offline"/"left" notification, once.
     fn mark_offline(&self, id: EndpointId, left: bool) {
         let visible = {
             let mut p = self.shared.presence.lock().unwrap();
@@ -249,10 +257,6 @@ impl Node {
         }
     }
 
-    /// Handle a gossip NeighborDown: drop the peer to Suspect (not offline) and
-    /// launch a direct liveness probe to decide whether it actually left. This
-    /// is what makes presence robust against Plumtree's tree reshuffling and the
-    /// 2-node lazy-push oscillation that used to flap peers offline every ~30s.
     fn on_neighbor_down(self: Arc<Self>, id: EndpointId) {
         let became_suspect = {
             let mut p = self.shared.presence.lock().unwrap();
@@ -266,9 +270,6 @@ impl Node {
         }
     }
 
-    /// Directly dial a suspect peer on the presence ALPN. A completed QUIC
-    /// handshake means it is alive and reachable regardless of the gossip tree
-    /// state; a failure within the timeout means it is gone.
     async fn probe_peer(self: Arc<Self>, id: EndpointId) {
         let alive =
             match tokio::time::timeout(PROBE_TIMEOUT, self.endpoint.connect(id, PRESENCE_ALPN))
@@ -292,8 +293,6 @@ impl Node {
         }
     }
 
-    /// Emit an "is online" presence event. The caller has already transitioned
-    /// the peer's state; this only notifies.
     fn announce_online(&self, id: EndpointId) {
         if id == self.shared.my_id {
             return;
@@ -307,7 +306,6 @@ impl Node {
         );
     }
 
-    /// Emit a "went offline"/"left" presence event. State is already updated.
     fn announce_offline(&self, id: EndpointId, left: bool) {
         let display = self.display_nick(&id);
         let text = if left {
@@ -322,16 +320,11 @@ impl Node {
             .push(EventKind::Presence, id.to_string(), display, text);
     }
 
-    /// Periodically mark stale-online peers offline and prune long-dead ones —
-    /// presence stays accurate without anyone managing it by hand.
     async fn reaper_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(REAP_INTERVAL);
         loop {
             interval.tick().await;
             let now = Instant::now();
-            // Only reap peers that went Suspect (NeighborDown) and stayed
-            // unconfirmed past the grace window. A plain connected peer is never
-            // reaped on a timer, no matter how quiet — that was the old bug.
             let stale: Vec<EndpointId> = {
                 let p = self.shared.presence.lock().unwrap();
                 p.iter()
@@ -348,7 +341,6 @@ impl Node {
         }
     }
 
-    /// Best display name for a peer: last-seen presence nick, else the short id.
     fn display_nick(&self, id: &EndpointId) -> String {
         self.shared
             .presence
@@ -380,7 +372,6 @@ impl Node {
         }
     }
 
-    /// Sign and broadcast a payload on the current topic.
     async fn broadcast(&self, payload: Payload) -> Result<()> {
         let bytes = SignedMessage::sign_and_encode(&self.secret_key, &payload)?;
         let sender = self.sender.lock().unwrap().clone();
@@ -391,12 +382,7 @@ impl Node {
         Ok(())
     }
 
-    /// (Re)subscribe to a topic, replacing the active sender/receiver. Waits
-    /// until the gossip mesh has formed (at least one neighbor) so that a
-    /// message broadcast right after joining is not dropped.
     async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
-        // We bootstrap off endpoint ids only; iroh discovery resolves a
-        // reachable address from each pubkey, so no explicit addresses needed.
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
             self.gossip.subscribe_and_join(topic, peers),
@@ -414,7 +400,7 @@ impl Node {
     async fn recv_loop(self: Arc<Self>, mut receiver: GossipReceiver, gen: u64) {
         loop {
             if self.recv_gen.load(Ordering::SeqCst) != gen {
-                break; // a newer subscription replaced us
+                break;
             }
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
@@ -427,10 +413,6 @@ impl Node {
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
                     }
-                    // A NeighborDown may mean the peer left, OR (in a larger
-                    // mesh) just that it is no longer one of our *direct* gossip
-                    // neighbors. Don't trust it outright: drop to Suspect and
-                    // confirm with a direct probe before declaring offline.
                     Event::NeighborDown(id) => {
                         self.clone().on_neighbor_down(id);
                     }
@@ -457,8 +439,64 @@ impl Node {
         }
     }
 
+    /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
+    fn ring_doorbell(&self, dirty: DirtySet) {
+        let mut d = self.doorbell.lock().unwrap();
+        d.seq += 1;
+        let frame = Doorbell {
+            epoch: d.epoch,
+            seq: d.seq,
+            reset: false,
+            dirty_by_project: dirty.dirty_by_project,
+            dirty_catalog: dirty.dirty_catalog,
+            activity_advanced: dirty.activity_advanced,
+        };
+        d.ring.push_back(frame);
+        while d.ring.len() > DOORBELL_RING {
+            d.ring.pop_front();
+        }
+        drop(d);
+        self.doorbell_notify.notify_waiters();
+    }
+
+    /// Dispatch a tracker request against the Loro core, ringing a doorbell for
+    /// any resulting dirty-set. The lock is held only for the synchronous handle
+    /// (never across an await).
+    fn dispatch_tracker(&self, req: Request) -> Response {
+        let (resp, dirty) = {
+            let mut t = self.tracker.lock().unwrap();
+            t.handle(req)
+        };
+        if let Some(dirty) = dirty {
+            self.ring_doorbell(dirty);
+        }
+        resp
+    }
+
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
         match req {
+            // ---- tracker (P0) ----
+            Request::IssueNew { .. }
+            | Request::IssueEdit { .. }
+            | Request::IssueMove { .. }
+            | Request::Assign { .. }
+            | Request::Label { .. }
+            | Request::Comment { .. }
+            | Request::IssueDelete { .. }
+            | Request::IssueView { .. }
+            | Request::List { .. }
+            | Request::Board { .. }
+            | Request::History { .. }
+            | Request::ProjectNew { .. }
+            | Request::ProjectList
+            | Request::LabelNew { .. }
+            | Request::LabelList
+            | Request::Activity { .. } => Ok(self.dispatch_tracker(req)),
+
+            // Subscribe is handled by the streaming path, not here.
+            Request::Subscribe { .. } => Ok(Response::err("subscribe is a streaming request")),
+
+            // ---- transport / presence ----
             Request::Status => {
                 let online_peers = self
                     .shared
@@ -468,11 +506,22 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
+                let (workspace, issues, projects) = {
+                    let t = self.tracker.lock().unwrap();
+                    (
+                        Some(t.workspace_id().to_string()),
+                        t.issue_count(),
+                        t.project_count(),
+                    )
+                };
                 Ok(Response::Status(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick.clone(),
                     room: self.shared.room.clone(),
                     online_peers,
+                    workspace,
+                    issues,
+                    projects,
                 }))
             }
             Request::Id => Ok(Response::Text {
@@ -484,8 +533,6 @@ impl Node {
                     host: self.shared.my_id,
                     host_nick: self.shared.nick.clone(),
                 };
-                // Return the bare token — clean for agents to pass to `connect`.
-                // The CLI presents the link form + clipboard for humans.
                 Ok(Response::Text {
                     text: ticket.to_string(),
                 })
@@ -519,24 +566,17 @@ impl Node {
                 Ok(Response::Events { events, last })
             }
             Request::Wait { since, timeout_ms } => {
-                // Event-based delivery: block until an event newer than `since`
-                // lands (woken by EventLog::push) or the timeout fires. No busy
-                // poll — the connection task simply parks until notified.
                 let timeout_ms = timeout_ms.clamp(0, 300_000);
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
                 let notify = self.shared.events.lock().unwrap().notify();
                 loop {
-                    // Register interest *before* re-checking so a push between
-                    // the check and the await can't be lost.
                     let notified = notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
-
                     let (events, last) = self.shared.events.lock().unwrap().since(since);
                     if !events.is_empty() {
                         return Ok(Response::Events { events, last });
                     }
-
                     tokio::select! {
                         _ = &mut notified => continue,
                         _ = tokio::time::sleep_until(deadline) => {
@@ -553,11 +593,15 @@ impl Node {
                     .lock()
                     .unwrap()
                     .iter()
-                    .map(|(id, p)| PresenceEntry {
-                        id: id.to_string(),
-                        nick: p.nick.clone(),
-                        online: p.presence.is_online(),
-                        last_seen_secs: p.last_seen.elapsed().as_secs(),
+                    .map(|(id, p)| {
+                        let online = p.presence.is_online();
+                        PresenceEntry {
+                            id: id.to_string(),
+                            nick: p.nick.clone(),
+                            state: if online { "online" } else { "offline" }.to_string(),
+                            online,
+                            last_seen_secs: p.last_seen.elapsed().as_secs(),
+                        }
                     })
                     .collect();
                 Ok(Response::Who { peers })
@@ -575,9 +619,6 @@ impl Node {
         }
     }
 
-    /// Count the connection for idle-shutdown, then handle it. Keeping the count
-    /// accurate is what lets a daemon nap only when truly unused — never while a
-    /// client (a `watch`/`wait`, or any in-flight request) is connected.
     async fn handle_conn(self: Arc<Self>, stream: LocalStream) {
         self.active_conns.fetch_add(1, Ordering::SeqCst);
         *self.last_active.lock().unwrap() = Instant::now();
@@ -586,8 +627,6 @@ impl Node {
         *self.last_active.lock().unwrap() = Instant::now();
     }
 
-    /// Shut the daemon down once it has been idle (no open connections and no
-    /// activity) for `idle_window`. Disabled when the window is zero.
     async fn idle_shutdown_loop(self: Arc<Self>) {
         if self.idle_window.is_zero() {
             return;
@@ -606,42 +645,130 @@ impl Node {
     }
 
     async fn handle_conn_inner(self: Arc<Self>, stream: LocalStream) {
-        let (read_half, mut write_half) = tokio::io::split(stream);
+        let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         if reader.read_line(&mut line).await.is_err() {
             return;
         }
-        let resp = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(req) => match self.dispatch(req).await {
-                Ok(r) => r,
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            },
-            Err(e) => Response::Error {
-                message: format!("bad request: {e}"),
-            },
+        let req = match serde_json::from_str::<Request>(line.trim()) {
+            Ok(req) => req,
+            Err(e) => {
+                let _ = write_line(write_half, &Response::err(format!("bad request: {e}"))).await;
+                return;
+            }
         };
-        let mut out = serde_json::to_string(&resp).unwrap_or_else(|_| {
-            "{\"status\":\"error\",\"message\":\"encode failure\"}".to_string()
-        });
-        out.push('\n');
-        let _ = write_half.write_all(out.as_bytes()).await;
-        let _ = write_half.flush().await;
+        // Subscribe is a streaming request: never returns until disconnect.
+        if let Request::Subscribe { since } = req {
+            self.stream_subscribe(write_half, since).await;
+            return;
+        }
+        let resp = match self.dispatch(req).await {
+            Ok(r) => r,
+            Err(e) => Response::err(format!("{e:#}")),
+        };
+        let _ = write_line(write_half, &resp).await;
     }
+
+    /// The streaming Subscribe loop (S§7.5, UI.md §4.1): emit a `Reset` first
+    /// frame that rebaselines the client to the current `seq`, then push every
+    /// new doorbell until the client hangs up or the daemon stops. Because the
+    /// first frame is always `Reset`, first-connect / reconnect / restart /
+    /// ring-overrun all collapse to one rebaseline path — the fix for the
+    /// pre-existing wait/watch deafness across the idle-shutdown.
+    async fn stream_subscribe(
+        self: Arc<Self>,
+        mut write_half: tokio::io::WriteHalf<LocalStream>,
+        _since: u64,
+    ) {
+        let (epoch, mut cursor) = {
+            let d = self.doorbell.lock().unwrap();
+            (d.epoch, d.seq)
+        };
+        // First frame: Reset — "rebaseline from a fresh snapshot".
+        let reset = Doorbell {
+            epoch,
+            seq: cursor,
+            reset: true,
+            ..Default::default()
+        };
+        if write_line_half(&mut write_half, &reset).await.is_err() {
+            return;
+        }
+
+        let shutdown = self.shutdown.clone();
+        loop {
+            let notified = self.doorbell_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            // Drain frames newer than the cursor. If the cursor has fallen off
+            // the back of the ring, send a Reset and rebaseline.
+            let (frames, oldest, latest_seq) = {
+                let d = self.doorbell.lock().unwrap();
+                let frames: Vec<Doorbell> =
+                    d.ring.iter().filter(|f| f.seq > cursor).cloned().collect();
+                (frames, d.oldest(), d.seq)
+            };
+            if cursor + 1 < oldest {
+                let reset = Doorbell {
+                    epoch,
+                    seq: latest_seq,
+                    reset: true,
+                    ..Default::default()
+                };
+                if write_line_half(&mut write_half, &reset).await.is_err() {
+                    return;
+                }
+                cursor = latest_seq;
+            } else {
+                for f in frames {
+                    cursor = f.seq;
+                    if write_line_half(&mut write_half, &f).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = &mut notified => continue,
+                _ = shutdown.notified() => return,
+            }
+        }
+    }
+}
+
+/// Serialize a response and write it as one newline-delimited frame.
+async fn write_line<T: serde::Serialize>(
+    mut write_half: tokio::io::WriteHalf<LocalStream>,
+    value: &T,
+) -> std::io::Result<()> {
+    write_line_half(&mut write_half, value).await
+}
+
+async fn write_line_half<T: serde::Serialize>(
+    write_half: &mut tokio::io::WriteHalf<LocalStream>,
+    value: &T,
+) -> std::io::Result<()> {
+    let mut out = serde_json::to_string(value)
+        .unwrap_or_else(|_| "{\"kind\":\"error\",\"message\":\"encode failure\"}".to_string());
+    out.push('\n');
+    write_half.write_all(out.as_bytes()).await?;
+    write_half.flush().await
 }
 
 /// Build and run the daemon until a Stop request arrives.
 pub async fn run_daemon(home: PathBuf) -> Result<()> {
-    // Single-instance guard: at most one daemon per home. Held for the whole
-    // daemon lifetime; released by the OS on exit/crash. A duplicate spawned
-    // during the startup race fails here and bails instead of clobbering the
-    // live daemon's socket.
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
     let secret_key = load_or_create_identity(&home)?;
     let profile = Profile::load(&home)?;
+
+    // Tracker core (P0): open the git-backed store and load/create the workspace.
+    let store = Store::open(&home)?;
+    let me = UserId::from_key_string(secret_key.public().to_string());
+    let tracker = Tracker::open(store, me, profile.nick.clone(), Box::new(SystemUlidSource))?;
+    let tracker = Arc::new(Mutex::new(tracker));
 
     let memory_lookup = MemoryLookup::new();
     let endpoint = Endpoint::builder(presets::N0)
@@ -666,11 +793,8 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         .accept(PRESENCE_ALPN, PresencePing)
         .spawn();
 
-    // Wait until we have a home relay so our advertised address is dialable.
     endpoint.online().await;
 
-    // Subscribe to our room topic. Bootstrap is empty here; peers join by
-    // ticket (`Join`/`Connect`), which dials the host directly.
     let topic = topic_for_room(&profile.room);
     let gtopic = gossip
         .subscribe(topic, vec![])
@@ -690,6 +814,9 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         active_conns: AtomicU64::new(0),
         last_active: Mutex::new(Instant::now()),
         idle_window: idle_window_from_env(),
+        tracker,
+        doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
+        doorbell_notify: Arc::new(Notify::new()),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));
@@ -697,18 +824,13 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     tokio::spawn(node.clone().reaper_loop());
     tokio::spawn(node.clone().idle_shutdown_loop());
 
-    // announce ourselves
     node.broadcast(Payload::Hello {
         nick: node.shared.nick.clone(),
     })
     .await
     .ok();
 
-    // control server — a local IPC channel (unix socket / windows named pipe)
     let control = control_name(&home)?;
-    // On unix the socket is a filesystem entry; clear any stale one a crashed
-    // daemon left behind so bind doesn't fail with AddrInUse. (No-op on Windows,
-    // where named pipes are reclaimed by the OS when the last handle closes.)
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::config::socket_path(&home));
     let listener = ListenerOptions::new()
@@ -737,9 +859,6 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         }
     }
 
-    // Tell the room we're going offline so peers update presence immediately
-    // instead of waiting for our heartbeat to lapse. Give gossip a moment to
-    // flush the message to neighbors before we tear the router down.
     node.broadcast(Payload::Bye {
         nick: node.shared.nick.clone(),
     })
@@ -760,13 +879,9 @@ mod tests {
     #[test]
     fn idle_shutdown_only_when_unused_and_past_window() {
         let w = Duration::from_secs(60);
-        // idle (no conns) and past the window → shut down
         assert!(should_idle_shutdown(0, Duration::from_secs(61), w));
-        // idle but not yet past the window → keep running
         assert!(!should_idle_shutdown(0, Duration::from_secs(30), w));
-        // a client is connected → never shut down, however long
         assert!(!should_idle_shutdown(1, Duration::from_secs(600), w));
-        // zero window disables idle shutdown
         assert!(!should_idle_shutdown(
             0,
             Duration::from_secs(600),

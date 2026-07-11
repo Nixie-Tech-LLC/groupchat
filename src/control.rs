@@ -1,9 +1,14 @@
-//! Local control protocol between the daemon and its clients (CLI + MCP).
+//! Layer B — the local control protocol (SCHEMA §7). Newline-delimited JSON over
+//! the cross-platform local IPC channel (a Unix-domain socket on unix, a named
+//! pipe on Windows; see [`control_name`]). One request → one response, plus the
+//! streaming [`Request::Subscribe`] mode that writes [`Doorbell`] frames until
+//! the client disconnects (S§7.5, UI.md §4.1).
 //!
-//! Transport is a local IPC channel — a Unix-domain socket on unix, a named pipe
-//! on Windows (see `control_name`) — carrying one newline-delimited JSON request,
-//! answered by one newline-delimited JSON response.
+//! This is an **imperative façade over a declarative CRDT**: a stable, versioned,
+//! hand-maintained projection of Layer A (S§1), never an auto-dump. `Ref`s and
+//! `UserRef`s arrive as plain strings and are resolved **daemon-side** (UI.md §3).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -14,9 +19,10 @@ use interprocess::local_socket::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// The OS name of the control channel for a home: a filesystem Unix-domain
-/// socket on unix, a named pipe on Windows. Daemon and clients derive it from
-/// the same home so they always agree on where to bind/connect.
+use crate::dto::{ActivityEvent, BoardView, Candidate, IssueView, LabelDto, ProjectDto, Row};
+
+/// The OS name of the control channel for a home (unix socket / Windows named
+/// pipe). Daemon and clients derive it from the same home so they agree.
 pub fn control_name(home: &Path) -> Result<Name<'static>> {
     #[cfg(unix)]
     {
@@ -28,52 +34,244 @@ pub fn control_name(home: &Path) -> Result<Name<'static>> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::GenericNamespaced;
-        // Named pipes don't live in the filesystem; name one per home so
-        // several `$GROUPCHAT_HOME` nodes on one machine stay distinct.
         format!("groupchat-{}.sock", crate::config::home_hash(home))
             .to_ns_name::<GenericNamespaced>()
             .context("build control pipe name")
     }
 }
 
-/// A request from a client to the daemon.
+/// A board position for `IssueMove` (UI.md §5.1 `--top/--bottom/--before/--after`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum BoardPos {
+    Top,
+    Bottom,
+    Before { reff: String },
+    After { reff: String },
+}
+
+/// List/board filter (UI.md §2.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Filter {
+    #[serde(default)]
+    pub mine: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Include done + tombstoned rows (UI.md §2.2).
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// A request from a client to the daemon (SCHEMA §7).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    /// Node + room status.
+    // ---- tracker (Layer-B façade over the issue model) ----
+    IssueNew {
+        title: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        assignees: Vec<String>,
+        #[serde(default)]
+        priority: Option<String>,
+        #[serde(default)]
+        labels: Vec<String>,
+        #[serde(default)]
+        body: Option<String>,
+    },
+    IssueEdit {
+        reff: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        priority: Option<String>,
+    },
+    IssueMove {
+        reff: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        pos: Option<BoardPos>,
+    },
+    Assign {
+        reff: String,
+        who: Vec<String>,
+        #[serde(default = "default_true")]
+        add: bool,
+    },
+    Label {
+        reff: String,
+        #[serde(default)]
+        add: Vec<String>,
+        #[serde(default)]
+        remove: Vec<String>,
+    },
+    Comment {
+        reff: String,
+        body: String,
+    },
+    IssueDelete {
+        reff: String,
+    },
+    IssueView {
+        reff: String,
+    },
+    List {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        filter: Filter,
+    },
+    Board {
+        project: String,
+    },
+    History {
+        reff: String,
+    },
+    ProjectNew {
+        name: String,
+        key: String,
+    },
+    ProjectList,
+    LabelNew {
+        name: String,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    LabelList,
+    Activity {
+        #[serde(default)]
+        since: u64,
+    },
+    /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
+    /// stream of [`Doorbell`] frames until the client disconnects.
+    Subscribe {
+        #[serde(default)]
+        since: u64,
+    },
+
+    // ---- transport / presence (kept from the skeleton; the P1 surface) ----
     Status,
-    /// Our endpoint id.
     Id,
-    /// Produce a base32 room ticket others can join with.
     Invite,
-    /// Join a room from a ticket and announce a join request.
-    Join { ticket: String },
-    /// One-step onboarding: join a room from a ticket and go live.
-    Connect { ticket: String },
-    /// Fetch presence/system events with seq greater than `since`.
-    Log { since: u64 },
-    /// Block until an event with seq greater than `since` arrives (event-based
-    /// delivery), or until `timeout_ms` elapses. Returns whatever is available.
-    Wait { since: u64, timeout_ms: u64 },
-    /// List known peers and their online status.
+    Join {
+        ticket: String,
+    },
+    Connect {
+        ticket: String,
+    },
+    /// Presence/system event log (P1 transport surface).
+    Log {
+        since: u64,
+    },
+    /// One-shot long-poll fallback to `Subscribe` (S§7.5).
+    Wait {
+        since: u64,
+        timeout_ms: u64,
+    },
     Who,
-    /// Shut the daemon down.
     Stop,
 }
 
-/// A response from the daemon to a client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Response {
-    Ok { message: Option<String> },
-    Status(StatusInfo),
-    Text { text: String },
-    Events { events: Vec<Event>, last: u64 },
-    Who { peers: Vec<PresenceEntry> },
-    Error { message: String },
+fn default_true() -> bool {
+    true
 }
 
-/// A presence/system log entry kept in the daemon's ring buffer.
+/// A response from the daemon (SCHEMA §7). A snapshot at a version — there is
+/// **no CAS token** (S§7.2). Internally tagged by `kind` (not `status`, which
+/// would collide with `IssueView.status` when the `Issue` variant is flattened).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Response {
+    Ok {
+        message: Option<String>,
+    },
+    /// A write echoes the resolved canonical handle (UI.md §2.2).
+    Ref {
+        reff: String,
+    },
+    Issue(Box<IssueView>),
+    List {
+        rows: Vec<Row>,
+    },
+    Board(Box<BoardView>),
+    Activity {
+        events: Vec<ActivityEvent>,
+        last: u64,
+    },
+    Projects {
+        projects: Vec<ProjectDto>,
+    },
+    Labels {
+        labels: Vec<LabelDto>,
+    },
+    /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2).
+    Candidates {
+        candidates: Vec<Candidate>,
+    },
+
+    // ---- transport / presence ----
+    Status(StatusInfo),
+    Text {
+        text: String,
+    },
+    Events {
+        events: Vec<Event>,
+        last: u64,
+    },
+    Who {
+        peers: Vec<PresenceEntry>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Response {
+    pub fn err(msg: impl Into<String>) -> Self {
+        Response::Error {
+            message: msg.into(),
+        }
+    }
+}
+
+/// The streamed frame — the repeated reply to [`Request::Subscribe`] (S§7.5).
+/// A **batched, project-keyed dirty-set**, never state (UI.md §4.2). The client
+/// re-reads the authoritative projection for each dirty scope; it never patches
+/// from a doorbell.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Doorbell {
+    /// Per-daemon-boot nonce; a change ⇒ restart ⇒ treat as `Reset` (UI.md §4.1).
+    pub epoch: u64,
+    /// Per-session cursor (S§2). Never persisted.
+    pub seq: u64,
+    /// `true` ⇒ ignore the rest and rebaseline from a fresh snapshot (S§7.5).
+    pub reset: bool,
+    /// Issue-row plane: which docs (by project) moved. Re-read these rows.
+    pub dirty_by_project: HashMap<String, Vec<String>>,
+    /// Catalog-structure plane (UI.md §4.2).
+    pub dirty_catalog: Vec<CatalogScope>,
+    /// New feed rows exist — pull via `Activity{since}` (S§7.5). Never streamed.
+    pub activity_advanced: bool,
+}
+
+/// A catalog-structure dirty scope (SCHEMA §7, UI.md §4.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CatalogScope {
+    Projects,
+    Labels,
+    Workflow,
+    Acl,
+    Boards { project: String },
+}
+
+/// A presence/system log entry kept in the daemon's ring buffer (P1 transport).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
@@ -87,11 +285,8 @@ pub struct Event {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// A peer joined (announced a join request).
     Join,
-    /// A peer's presence changed (came online / went offline / left).
     Presence,
-    /// A local system notice.
     System,
 }
 
@@ -99,6 +294,8 @@ pub enum EventKind {
 pub struct PresenceEntry {
     pub id: String,
     pub nick: String,
+    /// Three-state presence (UI.md §4.5): `online` | `away` | `offline`.
+    pub state: String,
     pub online: bool,
     pub last_seen_secs: u64,
 }
@@ -109,9 +306,12 @@ pub struct StatusInfo {
     pub nick: String,
     pub room: String,
     pub online_peers: usize,
+    pub workspace: Option<String>,
+    pub issues: usize,
+    pub projects: usize,
 }
 
-/// Send one request to the daemon and read one response.
+/// Send one request to the daemon and read one response (one-shot path).
 pub async fn request(home: &Path, req: &Request) -> Result<Response> {
     let name = control_name(home)?;
     let stream = Stream::connect(name).await.context("connect to daemon")?;
@@ -132,4 +332,45 @@ pub async fn request(home: &Path, req: &Request) -> Result<Response> {
         .context("read response")?;
     let resp: Response = serde_json::from_str(resp_line.trim()).context("decode response")?;
     Ok(resp)
+}
+
+/// A live doorbell subscription — the TUI's read side of a [`Request::Subscribe`]
+/// stream (UI.md §4.1). Holds the whole duplex stream (never split, so nothing
+/// leaks); the subscribe verb is write-once, then read-many.
+pub struct Subscription {
+    reader: BufReader<Stream>,
+}
+
+impl Subscription {
+    /// Read the next [`Doorbell`] frame. Returns `None` at EOF (daemon stopped).
+    pub async fn next(&mut self) -> Result<Option<Doorbell>> {
+        let mut line = String::new();
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .await
+            .context("read doorbell")?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let db: Doorbell = serde_json::from_str(line.trim()).context("decode doorbell")?;
+        Ok(Some(db))
+    }
+}
+
+/// Open a streaming [`Request::Subscribe`] connection (UI.md §4.1).
+pub async fn subscribe(home: &Path, since: u64) -> Result<Subscription> {
+    let name = control_name(home)?;
+    let mut stream = Stream::connect(name).await.context("connect to daemon")?;
+    let mut line =
+        serde_json::to_string(&Request::Subscribe { since }).context("encode subscribe")?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .context("write subscribe")?;
+    stream.flush().await.ok();
+    Ok(Subscription {
+        reader: BufReader::new(stream),
+    })
 }

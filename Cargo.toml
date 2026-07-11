@@ -14,11 +14,24 @@ readme = "README.md"
 keywords = ["iroh", "p2p", "gossip", "crdt", "issue-tracker"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lib]
+name = "groupchat"
+path = "src/lib.rs"
+
 [[bin]]
 name = "groupchat"
 path = "src/main.rs"
 
 [dependencies]
+# Loro CRDT — the storage/truth layer (Layer A). Issue docs + the catalog doc.
+loro = "=1.13.6"
+# randomness for ULID minting (app-minted DocId/ProjectId/… ids).
+getrandom = "0.3"
+
+# TUI (ratatui + crossterm) — the interactive board client. crossterm is the
+# portable backend (all three OSes), matching the cross-platform bar.
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 # iroh core + gossip (the room/announce transport). iroh-blobs returns at P2 for
 # snapshots/attachments. All pin iroh =1.0.0-rc.1.
 iroh = "=1.0.0-rc.1"
@@ -56,6 +69,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
+
+[dev-dependencies]
+# property-based convergence testing (random op sequences across N peers).
+proptest = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]
