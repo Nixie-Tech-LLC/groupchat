@@ -15,7 +15,7 @@
 //! restart / ring-overrun into one rebaseline path (UI.md §4.1).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -97,6 +97,9 @@ pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
     pub presence: PeerState,
+    /// Advertised three-state presence: `true` ⇒ up but AFK (UI.md §4.5). Only
+    /// meaningful while `presence.is_online()`.
+    pub away: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,29 @@ struct PresencePing;
 impl ProtocolHandler for PresencePing {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         connection.closed().await;
+        Ok(())
+    }
+}
+
+/// Accepts the P1 sync ALPN and serves a peer's catalog-first **pull**
+/// ([`crate::sync::serve`]). A pull never mutates our state, so this is
+/// read-only and rings no doorbell.
+#[derive(Clone)]
+struct SyncHandler {
+    tracker: Arc<Mutex<Tracker>>,
+}
+
+impl std::fmt::Debug for SyncHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SyncHandler")
+    }
+}
+
+impl ProtocolHandler for SyncHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        if let Err(e) = crate::sync::serve(connection, &self.tracker).await {
+            tracing::debug!("sync serve error: {e:#}");
+        }
         Ok(())
     }
 }
@@ -208,6 +234,8 @@ pub struct Node {
     /// The doorbell ring + its wake source (S§7.5).
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
+    /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
+    syncing: Arc<Mutex<HashSet<EndpointId>>>,
 }
 
 impl Node {
@@ -236,6 +264,7 @@ impl Node {
                             nick: nm,
                             last_seen: now,
                             presence: PeerState::new_online(now),
+                            away: false,
                         },
                     );
                     true
@@ -361,10 +390,18 @@ impl Node {
             .unwrap_or_else(|| id.fmt_short().to_string())
     }
 
-    async fn handle_payload(&self, from: EndpointId, payload: Payload) {
+    async fn handle_payload(self: &Arc<Self>, from: EndpointId, payload: Payload) {
         match payload {
-            Payload::Hello { nick } | Payload::Presence { nick } => {
+            Payload::Hello { nick } => {
                 self.touch(from, Some(nick));
+                // a peer just showed up — pull to backfill from it (A§10 bootstrap).
+                self.clone().trigger_pull(from);
+            }
+            Payload::Presence { nick, state } => {
+                self.touch(from, Some(nick));
+                if let Some(p) = self.shared.presence.lock().unwrap().get_mut(&from) {
+                    p.away = matches!(state, crate::proto::PresenceState::Away);
+                }
             }
             Payload::Bye { nick } => {
                 self.touch(from, Some(nick));
@@ -378,7 +415,84 @@ impl Node {
                     display.clone(),
                     format!("{display} joined the room"),
                 );
+                // a joiner wants our state — and may have state we lack; pull.
+                self.clone().trigger_pull(from);
             }
+            Payload::Announce {
+                workspace,
+                catalog_head,
+            } => {
+                self.touch(from, None);
+                let (our_ws, our_head) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.workspace_str(), t.catalog_head_bytes())
+                };
+                // Only pull when the peer's catalog head differs from ours — the
+                // A§8 trigger. Same head ⇒ nothing to do (storm suppression).
+                if workspace == our_ws && catalog_head != our_head {
+                    self.clone().trigger_pull(from);
+                }
+            }
+        }
+    }
+
+    /// Spawn a deduped sync pull from a peer (A§8). At most one in-flight pull
+    /// per peer; on success (something changed) ring a doorbell and re-announce
+    /// so peers that are behind us pull in turn.
+    fn trigger_pull(self: Arc<Self>, peer: EndpointId) {
+        if peer == self.shared.my_id {
+            return;
+        }
+        tokio::spawn(async move {
+            if !self.syncing.lock().unwrap().insert(peer) {
+                return; // already syncing this peer
+            }
+            let result = self.do_pull(peer).await;
+            self.syncing.lock().unwrap().remove(&peer);
+            match result {
+                Ok(dirty) if !dirty.is_empty() => {
+                    self.ring_doorbell(dirty);
+                    let _ = self.broadcast_announce().await;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
+            }
+        });
+    }
+
+    async fn do_pull(&self, peer: EndpointId) -> Result<crate::tracker::DirtySet> {
+        let conn = tokio::time::timeout(
+            Duration::from_secs(20),
+            self.endpoint.connect(peer, crate::sync::SYNC_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow!("connect to peer for sync timed out"))??;
+        let dirty = crate::sync::pull(&conn, &self.tracker).await?;
+        conn.close(0u32.into(), b"sync done");
+        Ok(dirty)
+    }
+
+    /// Broadcast our current catalog head so peers that are behind pull from us.
+    async fn broadcast_announce(&self) -> Result<()> {
+        let (workspace, catalog_head) = {
+            let t = self.tracker.lock().unwrap();
+            (t.workspace_str(), t.catalog_head_bytes())
+        };
+        self.broadcast(Payload::Announce {
+            workspace,
+            catalog_head,
+        })
+        .await
+    }
+
+    /// Our own presence state (UI.md §4.5): `away` when no client input within
+    /// the engagement window, else `online`. Input is tracked via `last_active`.
+    fn my_presence_state(&self) -> crate::proto::PresenceState {
+        const ENGAGED: Duration = Duration::from_secs(60);
+        if self.last_active.lock().unwrap().elapsed() <= ENGAGED {
+            crate::proto::PresenceState::Online
+        } else {
+            crate::proto::PresenceState::Away
         }
     }
 
@@ -407,6 +521,27 @@ impl Node {
         Ok(())
     }
 
+    /// Adopt a ticket's workspace (if we're empty, A§6/A§10), join its gossip
+    /// topic, announce, and eagerly pull from the host to backfill.
+    async fn adopt_and_join(self: &Arc<Self>, ticket: &RoomTicket) -> Result<()> {
+        if !ticket.workspace.is_empty() {
+            let _ = self
+                .tracker
+                .lock()
+                .unwrap()
+                .adopt_workspace(&ticket.workspace);
+        }
+        self.join_topic(ticket.topic(), vec![ticket.host]).await?;
+        self.broadcast(Payload::JoinRequest {
+            nick: self.shared.nick.clone(),
+        })
+        .await
+        .ok();
+        let _ = self.broadcast_announce().await;
+        self.clone().trigger_pull(ticket.host);
+        Ok(())
+    }
+
     async fn recv_loop(self: Arc<Self>, mut receiver: GossipReceiver, gen: u64) {
         loop {
             if self.recv_gen.load(Ordering::SeqCst) != gen {
@@ -422,6 +557,8 @@ impl Node {
                     }
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
+                        // mesh formed with this peer — pull to converge (A§8).
+                        self.clone().trigger_pull(id);
                     }
                     Event::NeighborDown(id) => {
                         self.clone().on_neighbor_down(id);
@@ -441,11 +578,15 @@ impl Node {
             if let Err(e) = self
                 .broadcast(Payload::Presence {
                     nick: self.shared.nick.clone(),
+                    state: self.my_presence_state(),
                 })
                 .await
             {
                 tracing::debug!("heartbeat broadcast failed: {e}");
             }
+            // Piggyback a catalog-head announce on the heartbeat so a peer that
+            // missed a live announce still converges within a heartbeat (A§8).
+            let _ = self.broadcast_announce().await;
         }
     }
 
@@ -472,15 +613,19 @@ impl Node {
     /// Dispatch a tracker request against the Loro core, ringing a doorbell for
     /// any resulting dirty-set. The lock is held only for the synchronous handle
     /// (never across an await).
-    fn dispatch_tracker(&self, req: Request) -> Response {
+    /// Dispatch a tracker request; ring a local doorbell for any dirty-set and
+    /// return `(response, did_change)`. A change means our catalog head moved, so
+    /// the caller announces it for P2P propagation (A§8).
+    fn dispatch_tracker(&self, req: Request) -> (Response, bool) {
         let (resp, dirty) = {
             let mut t = self.tracker.lock().unwrap();
             t.handle(req)
         };
+        let changed = dirty.is_some();
         if let Some(dirty) = dirty {
             self.ring_doorbell(dirty);
         }
-        resp
+        (resp, changed)
     }
 
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
@@ -501,7 +646,15 @@ impl Node {
             | Request::ProjectList
             | Request::LabelNew { .. }
             | Request::LabelList
-            | Request::Activity { .. } => Ok(self.dispatch_tracker(req)),
+            | Request::Activity { .. } => {
+                let (resp, changed) = self.dispatch_tracker(req);
+                if changed {
+                    // our catalog head moved — announce so peers pull (A§8).
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                }
+                Ok(resp)
+            }
 
             // Subscribe is handled by the streaming path, not here.
             Request::Subscribe { .. } => Ok(Response::err("subscribe is a streaming request")),
@@ -542,6 +695,7 @@ impl Node {
                     room: self.shared.room.clone(),
                     host: self.shared.my_id,
                     host_nick: self.shared.nick.clone(),
+                    workspace: self.tracker.lock().unwrap().workspace_str(),
                 };
                 Ok(Response::Text {
                     text: ticket.to_string(),
@@ -549,24 +703,14 @@ impl Node {
             }
             Request::Join { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.join_topic(ticket.topic(), vec![ticket.host]).await?;
-                self.broadcast(Payload::JoinRequest {
-                    nick: self.shared.nick.clone(),
-                })
-                .await
-                .ok();
+                self.adopt_and_join(&ticket).await?;
                 Ok(Response::Ok {
                     message: Some("joined room and sent join request".to_string()),
                 })
             }
             Request::Connect { ticket } => {
                 let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.join_topic(ticket.topic(), vec![ticket.host]).await?;
-                self.broadcast(Payload::JoinRequest {
-                    nick: self.shared.nick.clone(),
-                })
-                .await
-                .ok();
+                self.adopt_and_join(&ticket).await?;
                 Ok(Response::Ok {
                     message: Some("connected to room \u{2014} you're live".to_string()),
                 })
@@ -605,10 +749,19 @@ impl Node {
                     .iter()
                     .map(|(id, p)| {
                         let online = p.presence.is_online();
+                        // three-state (UI.md §4.5): reachable-and-engaged =
+                        // online; reachable-but-AFK = away; unreachable = offline.
+                        let state = if !online {
+                            "offline"
+                        } else if p.away {
+                            "away"
+                        } else {
+                            "online"
+                        };
                         PresenceEntry {
                             id: id.to_string(),
                             nick: p.nick.clone(),
-                            state: if online { "online" } else { "offline" }.to_string(),
+                            state: state.to_string(),
                             online,
                             last_seen_secs: p.last_seen.elapsed().as_secs(),
                         }
@@ -801,6 +954,12 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(PRESENCE_ALPN, PresencePing)
+        .accept(
+            crate::sync::SYNC_ALPN,
+            SyncHandler {
+                tracker: tracker.clone(),
+            },
+        )
         .spawn();
 
     endpoint.online().await;
@@ -827,6 +986,7 @@ pub async fn run_daemon(home: PathBuf) -> Result<()> {
         tracker,
         doorbell: Arc::new(Mutex::new(DoorbellRing::new(now_secs()))),
         doorbell_notify: Arc::new(Notify::new()),
+        syncing: Arc::new(Mutex::new(HashSet::new())),
     });
 
     tokio::spawn(node.clone().recv_loop(receiver, 1));

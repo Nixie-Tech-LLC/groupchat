@@ -36,11 +36,35 @@ pub enum Payload {
     Hello { nick: String },
     /// A request to be added to the room (surfaces for members to see).
     JoinRequest { nick: String },
-    /// Periodic liveness heartbeat for presence tracking.
-    Presence { nick: String },
+    /// Periodic liveness heartbeat for presence tracking. `state` carries the
+    /// three-state input-driven presence (online/away, UI.md §4.5); a missing
+    /// value from an older peer defaults to online.
+    Presence {
+        nick: String,
+        #[serde(default)]
+        state: PresenceState,
+    },
     /// Graceful "going offline" notice, broadcast on shutdown so peers can mark
     /// us offline immediately instead of waiting for the heartbeat to lapse.
     Bye { nick: String },
+    /// "My catalog head moved" — the P1 sync trigger (A§8). A peer that sees a
+    /// head different from what it holds pulls from us over the sync ALPN.
+    Announce {
+        workspace: String,
+        catalog_head: Vec<u8>,
+    },
+}
+
+/// Three-state presence carried on the wire (UI.md §4.5). Offline is conveyed by
+/// `Bye`/heartbeat lapse, not this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresenceState {
+    /// Interactive, reply-ready — input within the engagement window.
+    #[default]
+    Online,
+    /// Node up and syncing, human/agent not engaged.
+    Away,
 }
 
 /// A signed, postcard-encoded envelope broadcast over gossip.
@@ -93,6 +117,11 @@ pub struct RoomTicket {
     pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
+    /// The workspace id the joiner adopts (the genesis trust anchor, A§6/A§10).
+    /// A brand-new client establishes the whole workspace from nothing but this
+    /// ticket: it adopts the id, then backfills the catalog + docs over sync.
+    #[serde(default)]
+    pub workspace: String,
 }
 
 impl RoomTicket {
@@ -150,6 +179,7 @@ mod tests {
             room: "demo".into(),
             host: host_key(),
             host_nick: "alice".into(),
+            workspace: "ws_00000000000000000000000000".into(),
         }
     }
 

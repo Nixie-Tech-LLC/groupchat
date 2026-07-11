@@ -104,6 +104,8 @@ struct App {
     overlay: Overlay,
     modal: Option<Modal>,
     status: String,
+    /// Sync indicator (UI.md §8): online peer count from the last status poll.
+    peers_online: usize,
     quit: bool,
 }
 
@@ -124,7 +126,16 @@ impl App {
             overlay: Overlay::default(),
             modal: None,
             status: String::new(),
+            peers_online: 0,
             quit: false,
+        }
+    }
+
+    /// Refresh the ambient sync indicator (peers online) — polled on a timer so
+    /// the P1 status bar stays live without a doorbell for presence (UI.md §8).
+    async fn refresh_status(&mut self) {
+        if let Ok(Response::Status(s)) = self.req(Request::Status).await {
+            self.peers_online = s.online_peers;
         }
     }
 
@@ -287,15 +298,18 @@ async fn run_loop(
     sub: &mut Option<Subscription>,
     events: &mut EventStream,
 ) -> Result<()> {
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    app.refresh_status().await;
     loop {
         terminal.draw(|f| draw(f, app))?;
         if app.quit {
             return Ok(());
         }
 
-        // Wait for either a terminal event or a doorbell. If we have no live
-        // subscription, fall back to a periodic tick so the UI still refreshes.
+        // Wait for a terminal event, a doorbell, or a periodic status tick (the
+        // ambient sync indicator, which presence doesn't doorbell for).
         tokio::select! {
+            _ = tick.tick() => { app.refresh_status().await; }
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(CEvent::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -659,11 +673,18 @@ fn draw_header(f: &mut ratatui::Frame, app: &App, area: Rect) {
         View::Detail => "detail",
         View::Help => "help",
     };
+    // Sync indicator (UI.md §8): peers online / offline.
+    let (sync_txt, sync_color) = if app.peers_online > 0 {
+        (format!("⇅ {} peer(s)", app.peers_online), Color::Green)
+    } else {
+        ("○ offline".to_string(), Color::DarkGray)
+    };
     let line = Line::from(vec![
         Span::styled(proj, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("   [{view}]   ")),
+        Span::styled(sync_txt, Style::default().fg(sync_color)),
         Span::styled(
-            "[?] help  [1/2/3] board/list/activity  [c] new  [q] quit",
+            "   [?] help  [1/2/3] views  [c] new  [q] quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);

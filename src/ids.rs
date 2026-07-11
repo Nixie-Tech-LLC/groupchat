@@ -133,6 +133,17 @@ prefixed_id!(
 prefixed_id!(
     /// Issue document id — app-minted, content-independent, the key in
     /// `Catalog.docs`, the filename in git, and the routing key on the wire.
+    ///
+    /// ```
+    /// use groupchat::ids::{DocId, SystemUlidSource};
+    /// let id = DocId::mint(&SystemUlidSource);
+    /// assert!(id.as_str().starts_with("iss_"));
+    /// // a short, git-style handle is a genuine prefix of the full id
+    /// let short = id.short(7);
+    /// assert!(id.as_str().starts_with(&short));
+    /// // round-trips through parse()
+    /// assert_eq!(DocId::parse(id.as_str()), Some(id));
+    /// ```
     DocId, "iss_"
 );
 prefixed_id!(

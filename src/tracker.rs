@@ -59,9 +59,55 @@ impl DirtySet {
             activity_advanced: false,
         }
     }
+
+    /// Coalesce another dirty-set into this one (daemon-side doorbell batching,
+    /// UI.md §4.2): a whole sync-import transaction becomes one frame.
+    pub fn merge(&mut self, other: DirtySet) {
+        for (proj, docs) in other.dirty_by_project {
+            let e = self.dirty_by_project.entry(proj).or_default();
+            for d in docs {
+                if !e.contains(&d) {
+                    e.push(d);
+                }
+            }
+        }
+        for s in other.dirty_catalog {
+            if !self.dirty_catalog.contains(&s) {
+                self.dirty_catalog.push(s);
+            }
+        }
+        self.activity_advanced |= other.activity_advanced;
+    }
+
+    /// A dirty-set marking the catalog registries (projects/labels/workflow)
+    /// dirty — used when a sync imported a catalog diff whose structure moved.
+    pub fn catalog_structure() -> Self {
+        DirtySet {
+            dirty_by_project: HashMap::new(),
+            dirty_catalog: vec![
+                CatalogScope::Projects,
+                CatalogScope::Labels,
+                CatalogScope::Workflow,
+            ],
+            activity_advanced: false,
+        }
+    }
+
+    /// Whether this dirty-set carries anything worth ringing a doorbell for.
+    pub fn is_empty(&self) -> bool {
+        self.dirty_by_project.is_empty() && self.dirty_catalog.is_empty() && !self.activity_advanced
+    }
 }
 
 const ACTIVITY_RING: usize = 1000;
+
+/// One issue doc a puller must fetch during catalog-first sync (A§8): the
+/// `doc_id` plus the puller's local version vector for it (empty ⇒ fetch all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocNeed {
+    pub doc_id: String,
+    pub vv: Vec<u8>,
+}
 
 /// The issue-tracking core.
 pub struct Tracker {
@@ -1066,6 +1112,164 @@ impl Tracker {
     /// The current activity high-water (for doorbell `activity_advanced` clients).
     pub fn activity_high_water(&self) -> u64 {
         self.activity_seq
+    }
+
+    // ---- P1 sync (A§8 catalog-first). The network layer (node/sync) calls these
+    // under the tracker lock; all QUIC IO happens outside the lock. ----
+
+    /// The workspace id as a string (sync handshake guard).
+    pub fn workspace_str(&self) -> String {
+        self.workspace_id.to_string()
+    }
+
+    /// The catalog's oplog version vector, wire-encoded (sync handshake).
+    pub fn catalog_vv_bytes(&self) -> Vec<u8> {
+        self.catalog.oplog_vv().encode()
+    }
+
+    /// The catalog head digest, wire form (gossip announce, A§8).
+    pub fn catalog_head_bytes(&self) -> Vec<u8> {
+        crate::catalog::head_hash(&self.catalog.head())
+    }
+
+    /// Whether this node's workspace is still empty (no projects, no docs) — a
+    /// freshly-minted workspace that may adopt a peer's on join.
+    pub fn is_empty_workspace(&self) -> bool {
+        self.catalog.projects_list().is_empty() && self.catalog.doc_ids().is_empty()
+    }
+
+    /// Adopt a workspace id from a join ticket (A§6/A§10): re-root an *empty*
+    /// workspace onto the ticket's genesis so its catalog can then converge with
+    /// the founder's over sync. Never clobbers a workspace that already holds
+    /// real data. Returns whether an adoption happened.
+    pub fn adopt_workspace(&mut self, ws: &str) -> Result<bool> {
+        let Some(ws_id) = WorkspaceId::parse(ws) else {
+            return Ok(false);
+        };
+        if ws_id == self.workspace_id || !self.is_empty_workspace() {
+            return Ok(false);
+        }
+        let catalog = CatalogDoc::create(&ws_id)?;
+        catalog.doc().commit();
+        self.store.write_genesis(&Genesis {
+            workspace_id: ws_id.clone(),
+            founding_admins: vec![], // founder keys arrive with the P3 ACL graph
+        })?;
+        self.store.save_catalog(&catalog)?;
+        self.workspace_id = ws_id;
+        self.catalog = catalog;
+        self.rebuild_aliases();
+        self.store.commit("adopt workspace from ticket");
+        Ok(true)
+    }
+
+    /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks.
+    pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
+        self.catalog.export_from(&vv)
+    }
+
+    /// **Provider side.** Export a single issue doc's updates from `peer_vv`,
+    /// or `None` if we don't hold that doc.
+    pub fn export_doc_from(&mut self, doc_id: &str, peer_vv: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(id) = DocId::parse(doc_id) else {
+            return Ok(None);
+        };
+        match self.issue(&id)? {
+            Some(issue) => {
+                let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
+                Ok(Some(issue.export_from(&vv)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// **Puller side.** Import the provider's catalog update, recompute rows for
+    /// docs we hold (writer-direction on import, S§3.1), and return the set of
+    /// issue docs we must fetch: those we lack, or whose catalog `head` no longer
+    /// matches our local issue-doc head (A§8 "the rows whose head moved").
+    pub fn import_catalog_and_compute_needs(&mut self, update: &[u8]) -> Result<Vec<DocNeed>> {
+        self.catalog.import(update)?;
+        self.catalog.doc().commit();
+        let mut needs = Vec::new();
+        let mut healed = false;
+        for doc_id in self.catalog.doc_ids() {
+            // Ensure the issue doc is loaded (if we hold it) so we can compare
+            // its *real* head against the just-imported catalog row.
+            let held = self.issue(&doc_id)?.is_some();
+            if held {
+                // Writer-direction self-heal (S§3.1): the imported catalog's
+                // `head`/row fields LWW-merged to a peer's value, but OUR issue
+                // doc is the truth for our row — recompute it from the issue doc.
+                let issue = self.issues.get(&doc_id).unwrap();
+                let local_head = crate::catalog::head_hash(&issue.head());
+                let cat_head = self
+                    .catalog
+                    .row(&doc_id)
+                    .map(|r| r.head)
+                    .unwrap_or_default();
+                if local_head != cat_head {
+                    // heads differ: either we're behind (fetch) — record the need
+                    // with our VV — or we're ahead; recomputing the row is correct
+                    // either way, and a redundant fetch of an up-to-date doc is a
+                    // cheap empty diff.
+                    needs.push(DocNeed {
+                        doc_id: doc_id.as_str().to_string(),
+                        vv: issue.oplog_vv().encode(),
+                    });
+                }
+                self.catalog.upsert_row(issue)?;
+                healed = true;
+            } else {
+                needs.push(DocNeed {
+                    doc_id: doc_id.as_str().to_string(),
+                    vv: Vec::new(), // we lack it → request a full snapshot/update
+                });
+            }
+        }
+        if healed {
+            self.catalog.doc().commit();
+        }
+        self.rebuild_aliases();
+        self.store.save_catalog(&self.catalog)?;
+        Ok(needs)
+    }
+
+    /// **Puller side.** Import a fetched issue-doc update (creating the doc if
+    /// new), persist it, and recompute its catalog row from the issue doc
+    /// (writer-direction, S§3.1). Returns a dirty-set for a coalesced doorbell.
+    pub fn import_doc(&mut self, doc_id: &str, bytes: &[u8]) -> Result<Option<DirtySet>> {
+        let Some(id) = DocId::parse(doc_id) else {
+            return Ok(None);
+        };
+        // ensure a doc exists to import into (new docs arrive as a snapshot).
+        if !self.issues.contains_key(&id) {
+            let doc = loro::LoroDoc::new();
+            doc.import(bytes)
+                .map_err(|e| anyhow!("import new issue doc: {e}"))?;
+            self.issues.insert(id.clone(), IssueDoc::from_doc(doc));
+        } else {
+            self.issues
+                .get(&id)
+                .unwrap()
+                .import(bytes)
+                .map_err(|e| anyhow!("import issue update: {e}"))?;
+        }
+        // persist + recompute the row from the issue doc (disjoint field borrows).
+        let issue = self.issues.get(&id).unwrap();
+        self.store.save_issue(issue)?;
+        self.catalog.upsert_row(issue)?;
+        self.catalog.doc().commit();
+        let project_id = issue.project_id();
+        self.store.save_catalog(&self.catalog)?;
+        self.rebuild_aliases();
+        // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
+        let reff = self.aliases.canonical_for(&id);
+        self.push_activity(Some(&id), &reff, "synced", vec![], "");
+        match project_id {
+            Some(p) => Ok(Some(DirtySet::issue(&p, &id))),
+            None => Ok(None),
+        }
     }
 
     // ---- test/inspection helpers (used by integration invariant tests) ----

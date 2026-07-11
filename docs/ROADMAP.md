@@ -56,7 +56,18 @@ Loro data model + catalog + git store + fast TUI + Layer-B façade + MCP.
   + CRDT convergence proptests (LWW / map-union / movable-list / docs grow-set).
 - **done** e2e smoke on the real binary, wired into CI per-OS.
 
-## P1 — iroh live P2P sync + seed + three-state presence — **todo**
+## P1 — iroh live P2P sync + seed + three-state presence — **in progress**
+
+Done so far: the **catalog-first pull** sync protocol (`sync.rs`, custom ALPN) —
+one Catalog VV-diff → changed-`head` set → per-doc VV-diff, multiplexed and
+deadlock-free; gossip `Announce{workspace, catalog_head}` as the trigger, with
+pull-on-neighbor-up + heartbeat re-announce; ticket-carried **workspace adoption**
+so a new client roots from nothing but a ticket (A§6/A§10) and backfills; daemon
+doorbell batching (one coalesced frame per sync-import); three-state presence
+(`Payload::Presence{nick,state}`, input-driven online/away; `who` reports it); the
+TUI ambient sync indicator (peers online). **Verified live: two real nodes converge
+both directions over iroh in ~2s, no central server** (manual + `tests/two_node_sync.rs`).
+Remaining: promotable seed role hardening, TUI peers panel, RIBLT escape-hatch (deferred).
 
 - Catalog-first sync: gossip announce `{workspaceId, catalogHead}`; on a head change,
   exchange a Catalog VV-diff → the changed-`DocMeta.head` set → per-doc VV-diffs

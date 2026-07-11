@@ -108,6 +108,18 @@ impl IssueDoc {
         self.doc.oplog_frontiers()
     }
 
+    /// This doc's oplog version vector (for per-doc VV-diff sync, A§8).
+    pub fn oplog_vv(&self) -> loro::VersionVector {
+        self.doc.oplog_vv()
+    }
+
+    /// Export only the ops a peer at `from` lacks (`export(updates(from))`, A§8).
+    pub fn export_from(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+        self.doc
+            .export(ExportMode::updates(from))
+            .map_err(|e| anyhow!("export issue updates: {e}"))
+    }
+
     fn root(&self) -> loro::LoroMap {
         self.doc.get_map(ROOT)
     }

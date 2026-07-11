@@ -111,6 +111,18 @@ impl CatalogDoc {
         self.doc.oplog_frontiers()
     }
 
+    /// The catalog's oplog version vector (for the catalog-first VV-diff, A§8).
+    pub fn oplog_vv(&self) -> loro::VersionVector {
+        self.doc.oplog_vv()
+    }
+
+    /// Export only the catalog ops a peer at `from` lacks (A§8 phase 1).
+    pub fn export_from(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+        self.doc
+            .export(ExportMode::updates(from))
+            .map_err(|e| anyhow!("export catalog updates: {e}"))
+    }
+
     fn root(&self) -> LoroMap {
         self.doc.get_map(ROOT)
     }

@@ -35,5 +35,6 @@ pub mod presence;
 pub mod proto;
 pub mod registry;
 pub mod store;
+pub mod sync;
 pub mod tracker;
 pub mod tui;

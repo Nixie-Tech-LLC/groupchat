@@ -20,6 +20,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Issue priority (SCHEMA §5). Stored inside the issue doc as a lowercase
 /// string leaf and projected here.
+///
+/// ```
+/// use groupchat::dto::Priority;
+/// assert_eq!(Priority::parse("urgent"), Some(Priority::Urgent));
+/// assert_eq!(Priority::parse("h"), Some(Priority::High)); // one-letter alias
+/// assert!(Priority::Urgent > Priority::Low);              // orders low→high
+/// assert_eq!(serde_json::to_string(&Priority::High).unwrap(), "\"high\"");
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {
