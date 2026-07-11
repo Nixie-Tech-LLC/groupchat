@@ -1,4 +1,4 @@
-//! MCP server (stdio) exposing the groupchat tracker as agent tools (A§12).
+//! MCP server (stdio) exposing the lait tracker as agent tools (A§12).
 //!
 //! Each tool is a thin wrapper over the **same** Layer-B `Request`/`Response`
 //! the CLI uses (UI.md §1), so an agent drives the local daemon natively and
@@ -229,10 +229,10 @@ pub struct ConnectArgs {
 }
 
 #[derive(Clone)]
-pub struct GroupchatMcp {
+pub struct LaitMcp {
     home: PathBuf,
     #[allow(dead_code)]
-    tool_router: ToolRouter<GroupchatMcp>,
+    tool_router: ToolRouter<LaitMcp>,
 }
 
 fn parse_position(s: &str) -> Option<BoardPos> {
@@ -254,7 +254,7 @@ fn parse_position(s: &str) -> Option<BoardPos> {
 }
 
 #[tool_router]
-impl GroupchatMcp {
+impl LaitMcp {
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
@@ -528,7 +528,7 @@ impl GroupchatMcp {
 }
 
 #[tool_handler]
-impl ServerHandler for GroupchatMcp {
+impl ServerHandler for LaitMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
@@ -547,7 +547,7 @@ impl ServerHandler for GroupchatMcp {
 
 /// Run the MCP server over stdio until the client disconnects.
 pub async fn run_mcp(home: &Path) -> Result<()> {
-    let service = GroupchatMcp::new(home.to_path_buf()).serve(stdio()).await?;
+    let service = LaitMcp::new(home.to_path_buf()).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

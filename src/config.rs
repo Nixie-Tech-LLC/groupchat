@@ -1,10 +1,10 @@
 //! On-disk state: identity and room/profile settings.
 //!
 //! Two locations (DUR-5): a **global identity** (the `secret.key`, under the
-//! platform config dir) and a **per-repo workspace store** (the `.groupchat/`
+//! platform config dir) and a **per-repo workspace store** (the `.lait/`
 //! dir discovered git-style by walking up from the cwd). One identity spans every
 //! repo-bound store, like a single `git` `user.email` across many repos.
-//! `$GROUPCHAT_HOME` collapses both into one self-contained dir (tests, `--home`,
+//! `$LAIT_HOME` collapses both into one self-contained dir (tests, `--home`,
 //! advanced setups).
 
 use std::{
@@ -18,12 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::registry::{agents_base, Registry, SessionMap};
 
-/// The base config directory (ignoring `$GROUPCHAT_HOME`) — where the named
+/// The base config directory (ignoring `$LAIT_HOME`) — where the named
 /// identity registry (`agents/`) and the session map live.
 pub fn config_root() -> Result<PathBuf> {
-    let dir = match std::env::var_os("GROUPCHAT_CONFIG_ROOT") {
+    let dir = match std::env::var_os("LAIT_CONFIG_ROOT") {
         Some(p) => PathBuf::from(p),
-        None => directories::ProjectDirs::from("dev", "nixi", "groupchat")
+        None => directories::ProjectDirs::from("dev", "nixi", "lait")
             .context("could not determine config directory")?
             .config_dir()
             .to_path_buf(),
@@ -41,9 +41,9 @@ pub fn registry() -> Result<(Registry, PathBuf)> {
 }
 
 /// The per-repo workspace store directory name, discovered git-style.
-const STORE_DIR: &str = ".groupchat";
+const STORE_DIR: &str = ".lait";
 
-/// Walk up from `start` for an existing `.groupchat/` workspace store, so a
+/// Walk up from `start` for an existing `.lait/` workspace store, so a
 /// command run anywhere inside a repo binds that repo's store (like `git`
 /// finding `.git`). Returns the store dir, or `None` if none exists above `start`.
 fn find_store_dir(start: &Path) -> Option<PathBuf> {
@@ -95,7 +95,7 @@ fn ensure_store_gitignore(store: &Path) {
     if !p.exists() {
         let _ = fs::write(
             &p,
-            "# groupchat local store — per-node, synced over P2P, do not commit\n*\n",
+            "# lait local store — per-node, synced over P2P, do not commit\n*\n",
         );
     }
 }
@@ -120,15 +120,15 @@ fn seed_repo_profile(store: &Path) {
 }
 
 /// Resolve the **workspace store** directory for this invocation (the per-repo
-/// `.groupchat/`). Precedence:
+/// `.lait/`). Precedence:
 ///   1. an explicit named identity (`resume`/`--as`) — a self-contained home
 ///      under the identity registry.
-///   2. `$GROUPCHAT_HOME` — explicit, self-contained override (identity + store
+///   2. `$LAIT_HOME` — explicit, self-contained override (identity + store
 ///      in one dir): `--home`, tests, advanced setups.
-///   3. `$GROUPCHAT_STORE` — internal pin passed to the daemon we spawn so it
+///   3. `$LAIT_STORE` — internal pin passed to the daemon we spawn so it
 ///      binds the exact store the CLI resolved, independent of its cwd.
-///   4. git-style discovery: walk up from the cwd for a `.groupchat/` and use it;
-///      otherwise auto-create `.groupchat/` in the cwd.
+///   4. git-style discovery: walk up from the cwd for a `.lait/` and use it;
+///      otherwise auto-create `.lait/` in the cwd.
 ///
 /// The identity key is resolved separately ([`identity_dir`]) — global by
 /// default, so one identity spans every repo-bound store.
@@ -139,12 +139,12 @@ pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
         fs::create_dir_all(&home)?;
         return Ok(home);
     }
-    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+    if let Some(p) = std::env::var_os("LAIT_HOME") {
         let dir = PathBuf::from(p);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
     }
-    let store = if let Some(p) = std::env::var_os("GROUPCHAT_STORE") {
+    let store = if let Some(p) = std::env::var_os("LAIT_STORE") {
         let dir = PathBuf::from(p);
         fs::create_dir_all(&dir)?;
         canonical(&dir)
@@ -166,11 +166,11 @@ pub fn resolve_home(explicit: Option<&str>) -> Result<PathBuf> {
 }
 
 /// The directory holding this node's identity `secret.key`. A self-contained
-/// home (`$GROUPCHAT_HOME`) keeps the key beside its store; otherwise the key is
+/// home (`$LAIT_HOME`) keeps the key beside its store; otherwise the key is
 /// **global** (under [`config_root`]) so one identity spans every repo-bound
 /// store — like one `git` `user.email` across many repos.
 pub fn identity_dir() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+    if let Some(p) = std::env::var_os("LAIT_HOME") {
         let dir = PathBuf::from(p);
         fs::create_dir_all(&dir)?;
         return Ok(dir);
@@ -179,13 +179,13 @@ pub fn identity_dir() -> Result<PathBuf> {
 }
 
 /// The store this invocation WOULD bind if it already exists — WITHOUT creating
-/// one. For commands like `update` that must not spawn a stray `.groupchat/` just
+/// one. For commands like `update` that must not spawn a stray `.lait/` just
 /// to look for a running daemon.
 pub fn existing_home() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GROUPCHAT_HOME") {
+    if let Some(p) = std::env::var_os("LAIT_HOME") {
         return Some(PathBuf::from(p));
     }
-    if let Some(p) = std::env::var_os("GROUPCHAT_STORE") {
+    if let Some(p) = std::env::var_os("LAIT_STORE") {
         return Some(canonical(&PathBuf::from(p)));
     }
     let cwd = std::env::current_dir().ok()?;
@@ -211,7 +211,7 @@ pub fn bind_session(name: &str) -> Result<PathBuf> {
 }
 
 /// A short, stable hex token derived from a home path. Used to name the control
-/// channel uniquely per home (so several `$GROUPCHAT_HOME` nodes on one machine
+/// channel uniquely per home (so several `$LAIT_HOME` nodes on one machine
 /// never collide) — as a filesystem socket name on unix and a named-pipe name on
 /// Windows. Both the daemon and its clients hash the same home, so they agree.
 pub fn home_hash(home: &Path) -> String {
@@ -273,7 +273,7 @@ pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     // flock(2) on unix and LockFileEx on Windows — same guarantee, portably.
     file.try_lock_exclusive().map_err(|_| {
         anyhow!(
-            "another groupchat daemon is already running for this home ({})",
+            "another lait daemon is already running for this home ({})",
             home.display()
         )
     })?;
@@ -285,14 +285,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_store_dir_walks_up_to_the_nearest_groupchat() {
+    fn find_store_dir_walks_up_to_the_nearest_lait() {
         let root = std::env::temp_dir().join(format!("gc-disc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
         let nested = repo.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
 
-        // No `.groupchat/` anywhere above `nested`.
+        // No `.lait/` anywhere above `nested`.
         assert_eq!(find_store_dir(&nested), None);
 
         // Create the store at the repo root; discovery from a deep subdir and
@@ -330,14 +330,14 @@ mod tests {
     #[test]
     fn socket_path_stays_under_the_unix_limit() {
         // Short home: socket lives in the home, as before.
-        let short = PathBuf::from("/Users/moon/Library/Application Support/dev.nixi.groupchat");
+        let short = PathBuf::from("/Users/moon/Library/Application Support/dev.nixi.lait");
         assert_eq!(socket_path(&short), short.join("control.sock"));
 
         // Long per-agent home (longer username) that would blow past macOS's
         // 104-byte sun_path limit — must fall back to a short, bindable path.
         let long = PathBuf::from(
             "/Users/savannahmoongoldstein/Library/Application Support/\
-             dev.nixi.groupchat/agents/agent-6c8502",
+             dev.nixi.lait/agents/agent-6c8502",
         );
         assert!(
             long.join("control.sock").as_os_str().len() > 104,

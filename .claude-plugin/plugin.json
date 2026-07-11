@@ -1,19 +1,19 @@
 {
-  "name": "groupchat",
-  "displayName": "Groupchat",
+  "name": "lait",
+  "displayName": "Lait",
   "version": "0.2.2",
   "description": "A local-first, peer-to-peer issue tracker built on iroh + Loro CRDTs with a git-backed store. Exposes the full issue surface (create/edit/move/assign/label/comment, boards, lists, activity) over MCP.",
   "author": {
     "name": "onnixi",
     "email": "omar@onnixi.com"
   },
-  "homepage": "https://gitlab.com/onnixi/groupchat",
-  "repository": "https://github.com/ItsOhmar/groupchat",
+  "homepage": "https://gitlab.com/onnixi/lait",
+  "repository": "https://github.com/ItsOhmar/lait",
   "license": "MIT OR Apache-2.0",
   "keywords": ["mcp", "p2p", "iroh", "gossip", "issue-tracker"],
   "mcpServers": {
-    "groupchat": {
-      "command": "groupchat",
+    "lait": {
+      "command": "lait",
       "args": ["mcp"]
     }
   },

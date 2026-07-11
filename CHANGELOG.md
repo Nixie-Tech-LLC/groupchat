@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — renamed `groupchat` → `lait`
+
+Project rename. The binary, library, package, MCP server, and all identifiers are
+now `lait`. This is a **clean break** (pre-1.0): env vars are `LAIT_*` (was
+`GROUPCHAT_*`), the per-repo store directory is `.lait/` (was `.groupchat/`), the
+config/identity root moves accordingly, the invite link scheme is `lait://join/`,
+and the wire ALPNs + crypto domain-separation tags are re-tagged under `lait/…`.
+A `lait` node therefore does not interoperate with a `groupchat` node, and an
+existing `.groupchat/` store is not adopted — re-found the workspace from a fresh
+`lait` invite. The GitHub repository moved to `Nixie-Tech-LLC/lait` (old URLs
+redirect).
+
 ## v0.3.2 — durability & sync-liveness hardening
 
 Follow-up hardening from a durability audit of the local-first / iroh

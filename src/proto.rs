@@ -130,9 +130,9 @@ impl RoomTicket {
         topic_for_room(&self.room)
     }
 
-    /// The `groupchat://` link form of this ticket, for humans/chat apps.
+    /// The `lait://` link form of this ticket, for humans/chat apps.
     pub fn link(&self) -> String {
-        format!("groupchat://join/{self}")
+        format!("lait://join/{self}")
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -154,10 +154,10 @@ impl fmt::Display for RoomTicket {
 impl FromStr for RoomTicket {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        // Accept a bare token or a `groupchat://join/<token>` link, and tolerate
+        // Accept a bare token or a `lait://join/<token>` link, and tolerate
         // stray whitespace/newlines a terminal may have wrapped in on copy.
         let s = s.trim();
-        let token = s.strip_prefix("groupchat://join/").unwrap_or(s);
+        let token = s.strip_prefix("lait://join/").unwrap_or(s);
         let cleaned: String = token.chars().filter(|c| !c.is_whitespace()).collect();
         let bytes = data_encoding::BASE32_NOPAD
             .decode(cleaned.to_ascii_uppercase().as_bytes())
@@ -204,10 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_groupchat_link_form() {
+    fn parses_lait_link_form() {
         let t = sample();
         let link = t.link();
-        assert!(link.starts_with("groupchat://join/"));
+        assert!(link.starts_with("lait://join/"));
         let back: RoomTicket = link.parse().unwrap();
         assert_eq!(back.host, host_key());
     }

@@ -36,7 +36,7 @@ pub fn control_name(home: &Path) -> Result<Name<'static>> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::GenericNamespaced;
-        format!("groupchat-{}.sock", crate::config::home_hash(home))
+        format!("lait-{}.sock", crate::config::home_hash(home))
             .to_ns_name::<GenericNamespaced>()
             .context("build control pipe name")
     }

@@ -1,10 +1,10 @@
 //! End-to-end control-plane tests for the doorbell / `Reset` invariants
 //! (UI.md §4.1, §4.3, SCHEMA §7.5).
 //!
-//! These drive the **real** daemon binary (`CARGO_BIN_EXE_groupchat daemon`)
+//! These drive the **real** daemon binary (`CARGO_BIN_EXE_lait daemon`)
 //! over the actual local IPC control channel — a Unix-domain socket on unix, a
-//! named pipe on Windows — using the crate's own [`groupchat::control`] client.
-//! Each test gets a fresh `GROUPCHAT_HOME` and `GROUPCHAT_IDLE_SECS=0`, so the
+//! named pipe on Windows — using the crate's own [`lait::control`] client.
+//! Each test gets a fresh `LAIT_HOME` and `LAIT_IDLE_SECS=0`, so the
 //! daemon never naps out from under the subscription.
 //!
 //! The daemon binds an iroh endpoint and waits for a relay to come online before
@@ -20,9 +20,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use groupchat::control::{request, subscribe, Request, Response};
+use lait::control::{request, subscribe, Request, Response};
 
-/// A throwaway `GROUPCHAT_HOME` that deletes itself on drop.
+/// A throwaway `LAIT_HOME` that deletes itself on drop.
 struct TempHome {
     path: PathBuf,
 }
@@ -66,11 +66,11 @@ impl Daemon {
     /// control channel. Errors if it never comes online within the budget (e.g.
     /// no network for the iroh relay handshake).
     async fn spawn(home: &Path) -> anyhow::Result<Self> {
-        let exe = env!("CARGO_BIN_EXE_groupchat");
+        let exe = env!("CARGO_BIN_EXE_lait");
         let child = Command::new(exe)
             .arg("daemon")
-            .env("GROUPCHAT_HOME", home)
-            .env("GROUPCHAT_IDLE_SECS", "0")
+            .env("LAIT_HOME", home)
+            .env("LAIT_IDLE_SECS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::tracker::{DirtySet, Tracker};
 
 /// The ALPN for the pairwise Loro-sync protocol.
-pub const SYNC_ALPN: &[u8] = b"groupchat/sync/0";
+pub const SYNC_ALPN: &[u8] = b"lait/sync/0";
 
 /// A single sync frame. Postcard-encoded, length-prefixed on the stream.
 #[derive(Debug, Serialize, Deserialize)]

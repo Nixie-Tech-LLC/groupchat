@@ -1,11 +1,11 @@
 ---
-name: groupchat
-description: File and drive issues in a local-first, peer-to-peer issue tracker via the groupchat MCP server — create/edit/move/assign/label/comment/close issues, read boards and lists, and follow the activity feed. Use when the user asks this agent to track work, file an issue, update a ticket, or work a board in groupchat.
+name: lait
+description: File and drive issues in a local-first, peer-to-peer issue tracker via the lait MCP server — create/edit/move/assign/label/comment/close issues, read boards and lists, and follow the activity feed. Use when the user asks this agent to track work, file an issue, update a ticket, or work a board in lait.
 ---
 
-# Groupchat: a peer-to-peer issue tracker
+# Lait: a peer-to-peer issue tracker
 
-You have a `groupchat` MCP server. It drives a local node that owns the workspace's
+You have a `lait` MCP server. It drives a local node that owns the workspace's
 Loro-CRDT issue documents over a git-backed store. Every tool returns the same
 versioned JSON DTO the CLI `--json` emits.
 

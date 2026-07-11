@@ -1,4 +1,4 @@
-//! `groupchat install-mcp`: register the MCP server with an agent's config in
+//! `lait install-mcp`: register the MCP server with an agent's config in
 //! one explicit step, instead of hand-editing JSON. Merges into the target
 //! client's `mcpServers` block without clobbering other servers.
 
@@ -59,23 +59,23 @@ fn config_path(client: Client, scope: Scope) -> Result<PathBuf> {
 }
 
 /// Build the `mcpServers` entry for this binary: an absolute path so it runs
-/// even when `groupchat` isn't on PATH, carrying GROUPCHAT_HOME if it's set.
+/// even when `lait` isn't on PATH, carrying LAIT_HOME if it's set.
 fn server_entry() -> Result<Value> {
-    let exe = std::env::current_exe().context("locate groupchat binary")?;
+    let exe = std::env::current_exe().context("locate lait binary")?;
     let exe = exe.canonicalize().unwrap_or(exe);
     let mut entry = Map::new();
     entry.insert("command".into(), json!(exe.to_string_lossy()));
     entry.insert("args".into(), json!(["mcp"]));
-    if let Some(h) = std::env::var_os("GROUPCHAT_HOME") {
+    if let Some(h) = std::env::var_os("LAIT_HOME") {
         entry.insert(
             "env".into(),
-            json!({ "GROUPCHAT_HOME": h.to_string_lossy() }),
+            json!({ "LAIT_HOME": h.to_string_lossy() }),
         );
     }
     Ok(Value::Object(entry))
 }
 
-/// Register (or update) the groupchat MCP server in `client`'s config. With
+/// Register (or update) the lait MCP server in `client`'s config. With
 /// `print`, returns the would-be file contents instead of writing.
 pub fn install_mcp(
     client: Client,

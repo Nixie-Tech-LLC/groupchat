@@ -19,10 +19,10 @@
 use loro::{ExportMode, LoroDoc};
 use proptest::prelude::*;
 
-use groupchat::catalog::CatalogDoc;
-use groupchat::dto::Priority;
-use groupchat::ids::{DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
-use groupchat::issue::{IssueDoc, NewIssue};
+use lait::catalog::CatalogDoc;
+use lait::dto::Priority;
+use lait::ids::{DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
+use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
 /// replicas differ.

@@ -1,4 +1,4 @@
-# Schema — groupchat data shapes
+# Schema — lait data shapes
 
 > **Status:** design draft, pre-build. Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md);
 > section refs like (A§5) point there. Defines the concrete data shapes across three

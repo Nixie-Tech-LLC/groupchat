@@ -38,12 +38,12 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
     }
     let exe = std::env::current_exe().context("locate own executable")?;
     // Pin the resolved store for the spawned daemon so it binds the exact same
-    // store regardless of its cwd (DUR-5). GROUPCHAT_HOME, when set (self-
+    // store regardless of its cwd (DUR-5). LAIT_HOME, when set (self-
     // contained / --home / resume), is inherited from our env and takes
     // precedence, so this is a no-op in that mode.
     std::process::Command::new(exe)
         .arg("daemon")
-        .env("GROUPCHAT_STORE", home)
+        .env("LAIT_STORE", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -143,7 +143,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         }
         Response::Projects { projects } => {
             if projects.is_empty() {
-                println!("(no projects — create one: `groupchat projects new <name> --key KEY`)");
+                println!("(no projects — create one: `lait projects new <name> --key KEY`)");
             }
             for p in projects {
                 println!("{:<6} {}  ({})", p.key, p.name, p.id);
@@ -333,12 +333,12 @@ pub async fn run_invite(home: &Path, out: Out) -> Result<()> {
     let link = token
         .parse::<RoomTicket>()
         .map(|t| t.link())
-        .unwrap_or_else(|_| format!("groupchat://join/{token}"));
+        .unwrap_or_else(|_| format!("lait://join/{token}"));
     let copied = copy_to_clipboard(&token);
     println!("{token}");
     println!("{link}");
     if copied {
-        println!("(copied to clipboard — paste into `groupchat connect`)");
+        println!("(copied to clipboard — paste into `lait connect`)");
     }
     Ok(())
 }
@@ -389,12 +389,12 @@ fn run_hook(cmd: &str, e: &Event) {
     let child = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
-        .env("GROUPCHAT_EVENT_SEQ", e.seq.to_string())
-        .env("GROUPCHAT_EVENT_KIND", kind_str(&e.kind))
-        .env("GROUPCHAT_EVENT_NICK", &e.nick)
-        .env("GROUPCHAT_EVENT_ID", &e.id)
-        .env("GROUPCHAT_EVENT_TEXT", &e.text)
-        .env("GROUPCHAT_EVENT_TS", e.ts.to_string())
+        .env("LAIT_EVENT_SEQ", e.seq.to_string())
+        .env("LAIT_EVENT_KIND", kind_str(&e.kind))
+        .env("LAIT_EVENT_NICK", &e.nick)
+        .env("LAIT_EVENT_ID", &e.id)
+        .env("LAIT_EVENT_TEXT", &e.text)
+        .env("LAIT_EVENT_TS", e.ts.to_string())
         .stdin(Stdio::piped())
         .spawn();
     match child {
@@ -411,7 +411,7 @@ fn run_hook(cmd: &str, e: &Event) {
 }
 
 fn desktop_notify(e: &Event) {
-    let title = format!("groupchat: {}", e.nick);
+    let title = format!("lait: {}", e.nick);
     if cfg!(target_os = "macos") {
         let script = format!("display notification {:?} with title {:?}", e.text, title);
         let _ = std::process::Command::new("osascript")

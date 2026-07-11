@@ -1,4 +1,4 @@
-//! The `groupchat tui` full-screen board client (UI.md §4–§6). A [ratatui]
+//! The `lait tui` full-screen board client (UI.md §4–§6). A [ratatui]
 //! client over the daemon's control socket — never an embedded node (UI.md §1).
 //!
 //! It opens two logical channels over the one socket: the **command channel**
@@ -724,7 +724,7 @@ fn effective_title(app: &App, row: &Row) -> String {
 fn draw_board(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(b) = &app.board else {
         f.render_widget(
-            Paragraph::new("(no project — create one with the CLI: `groupchat projects new`)"),
+            Paragraph::new("(no project — create one with the CLI: `lait projects new`)"),
             area,
         );
         return;

@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use groupchat::control::{request, Filter, Request, Response};
+use lait::control::{request, Filter, Request, Response};
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_groupchat")
+    env!("CARGO_BIN_EXE_lait")
 }
 
 fn rt() -> tokio::runtime::Runtime {
@@ -70,8 +70,8 @@ fn spawn(home: &Path, seed: bool) -> Proc {
         cmd.arg("--seed");
     }
     let child = cmd
-        .env("GROUPCHAT_HOME", home)
-        .env("GROUPCHAT_IDLE_SECS", "0")
+        .env("LAIT_HOME", home)
+        .env("LAIT_IDLE_SECS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

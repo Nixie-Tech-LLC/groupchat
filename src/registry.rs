@@ -1,7 +1,7 @@
 //! Named identity registry + reentry selection.
 //!
 //! Each agent is a persistent, private identity living in its own home under a
-//! base directory (default `~/.groupchat/agents/<name>/`). Separate homes mean
+//! base directory (default `~/.lait/agents/<name>/`). Separate homes mean
 //! separate `secret.key`s, logs, and daemon processes — OS-level isolation, so
 //! one agent can't read another.
 //!

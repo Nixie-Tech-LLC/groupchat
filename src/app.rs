@@ -23,12 +23,12 @@ use crate::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "groupchat",
+    name = "lait",
     version,
     about = "A local-first, peer-to-peer issue tracker"
 )]
 pub struct Cli {
-    /// Select the node's home directory (overrides $GROUPCHAT_HOME).
+    /// Select the node's home directory (overrides $LAIT_HOME).
     #[arg(long, global = true)]
     home: Option<String>,
     /// Emit the versioned JSON DTO instead of human output (UI.md §2.3).
@@ -161,13 +161,13 @@ pub enum Command {
     },
     /// Run the MCP server over stdio (for agents).
     Mcp,
-    /// Register groupchat's MCP server with an agent's config.
+    /// Register lait's MCP server with an agent's config.
     InstallMcp {
         #[arg(long, value_enum, default_value_t = Client::Claude)]
         client: Client,
         #[arg(long, value_enum)]
         scope: Option<Scope>,
-        #[arg(long, default_value = "groupchat")]
+        #[arg(long, default_value = "lait")]
         name: String,
         #[arg(long)]
         print: bool,
@@ -221,7 +221,7 @@ pub enum Command {
     Agents,
     /// Resume (or create) a named identity for this session.
     Resume { name: String },
-    /// Update groupchat in place via the bundled self-updater (`groupchat-update`).
+    /// Update lait in place via the bundled self-updater (`lait-update`).
     Update,
     /// Stop the running daemon.
     Stop,
@@ -250,7 +250,7 @@ pub enum LabelsCmd {
 #[derive(Subcommand, Debug)]
 pub enum SeedCmd {
     /// Pin a seed and adopt its workspace. Accepts a room ticket (from
-    /// `groupchat invite` on the seed — adopts + backfills) or a bare endpoint id
+    /// `lait invite` on the seed — adopts + backfills) or a bare endpoint id
     /// (pin only, for a workspace you already share).
     Add {
         /// A room ticket or an endpoint id.
@@ -285,7 +285,7 @@ pub enum MembersCmd {
 
 /// Parse arguments and run.
 /// Restore the default `SIGPIPE` disposition on unix. Rust ignores `SIGPIPE` by
-/// default, which turns a closed downstream pipe (`groupchat board | head`,
+/// default, which turns a closed downstream pipe (`lait board | head`,
 /// `| grep -q`, `| less` then quit) into a panic on the next stdout write
 /// (`failed printing to stdout: Broken pipe`) instead of a clean exit. Resetting
 /// to `SIG_DFL` makes the process terminate normally when the reader goes away —
@@ -313,23 +313,23 @@ fn is_service_command(cmd: &Command) -> bool {
     matches!(cmd, Command::Daemon { .. } | Command::Mcp)
 }
 
-/// Locate the bundled self-updater binary (`groupchat-update`) next to our own
+/// Locate the bundled self-updater binary (`lait-update`) next to our own
 /// executable, where the cargo-dist installer places it. `None` if it isn't
 /// there (e.g. a `cargo install` build, which ships no updater).
 fn locate_updater() -> Option<PathBuf> {
     let name = if cfg!(windows) {
-        "groupchat-update.exe"
+        "lait-update.exe"
     } else {
-        "groupchat-update"
+        "lait-update"
     };
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join(name);
     candidate.exists().then_some(candidate)
 }
 
-/// `groupchat update`: run the bundled self-updater in place. Best-effort stops a
+/// `lait update`: run the bundled self-updater in place. Best-effort stops a
 /// running daemon first (so it isn't left on stale code, and — on Windows — isn't
-/// holding the binary open), then runs `groupchat-update`, which self-replaces the
+/// holding the binary open), then runs `lait-update`, which self-replaces the
 /// installed binary from the latest GitHub release.
 async fn run_update() -> Result<()> {
     if let Some(home) = config::existing_home() {
@@ -342,22 +342,22 @@ async fn run_update() -> Result<()> {
 
     let mut cmd = match locate_updater() {
         Some(path) => std::process::Command::new(path),
-        None => std::process::Command::new("groupchat-update"),
+        None => std::process::Command::new("lait-update"),
     };
     match cmd.status() {
         Ok(status) if status.success() => {
             println!(
-                "groupchat updated. run any groupchat command to start the daemon on the new version."
+                "lait updated. run any lait command to start the daemon on the new version."
             );
             Ok(())
         }
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(anyhow!(
-            "self-updater `groupchat-update` not found — it ships with the install \
+            "self-updater `lait-update` not found — it ships with the install \
              script, not with `cargo install`. Reinstall via the installer (see the \
              releases page) to enable in-place updates."
         )),
-        Err(e) => Err(anyhow!("failed to run groupchat-update: {e:#}")),
+        Err(e) => Err(anyhow!("failed to run lait-update: {e:#}")),
     }
 }
 
@@ -386,10 +386,10 @@ pub async fn run() -> Result<()> {
         }
         Command::Resume { name } => {
             let home = config::bind_session(name)?;
-            // A named identity is a self-contained home: pin it as GROUPCHAT_HOME
+            // A named identity is a self-contained home: pin it as LAIT_HOME
             // so the daemon we spawn uses it for both identity and store, not the
             // global identity + repo-discovered store (DUR-5).
-            std::env::set_var("GROUPCHAT_HOME", &home);
+            std::env::set_var("LAIT_HOME", &home);
             load_or_create_identity(&home)?;
             println!("resumed identity '{name}'");
             return crate::cli::run(&home, Request::Status, out).await;
@@ -399,7 +399,7 @@ pub async fn run() -> Result<()> {
 
     // Home resolution honours an explicit --home over the session registry.
     if let Some(h) = &args.home {
-        std::env::set_var("GROUPCHAT_HOME", h);
+        std::env::set_var("LAIT_HOME", h);
     }
     // `update` swaps the binary; it must not resolve/create a workspace store.
     if matches!(args.command, Command::Update) {
@@ -585,7 +585,7 @@ pub async fn run() -> Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "groupchat=info,warn".into()),
+                        .unwrap_or_else(|_| "lait=info,warn".into()),
                 )
                 .init();
             node::run_daemon(home, seed).await?;

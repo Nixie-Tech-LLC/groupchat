@@ -74,11 +74,11 @@ preempt = effective >= Interrupt
 - **t0–t2 are cooperative.** Agents follow the room by looping on `wait` /
   `chat_wait` (or `watch`). Tiers shape what happens at loop boundaries:
   `direct` prints a 🔔, `needs_ack` additionally obligates an `ack`.
-- **t3 is preemptive (opt-in).** `groupchat watch` gains a tier policy: a
+- **t3 is preemptive (opt-in).** `lait watch` gains a tier policy: a
   `--on-interrupt <cmd>` hook fires only for `interrupt`-tier (preempt) events,
   so it can signal the agent process / drop a control file / push — the channel
-  that reaches a heads-down agent. Hooks receive `GROUPCHAT_EVENT_TIER`,
-  `GROUPCHAT_EVENT_MSG_ID`, and `GROUPCHAT_EVENT_PREEMPT` alongside the existing
+  that reaches a heads-down agent. Hooks receive `LAIT_EVENT_TIER`,
+  `LAIT_EVENT_MSG_ID`, and `LAIT_EVENT_PREEMPT` alongside the existing
   vars.
 
 ## Escalation (sender side)
@@ -94,7 +94,7 @@ A background loop checks deadlines:
 - For `interrupt` tier → re-broadcast the message (with `notify_anyway`) on a
   backoff, up to a bounded number of retries, until acked.
 
-`groupchat receipts [seq]` reconciles the outbox against `who`:
+`lait receipts [seq]` reconciles the outbox against `who`:
 `agent2 ✓delivered ✓seen ✓acked · agent3 ✓delivered —seen —acked`.
 
 ## Sequence

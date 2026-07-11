@@ -69,7 +69,7 @@ pub struct SignedOp {
 /// `SignedOp`, so this does not change the op's wire shape.
 fn signing_payload(op: &[u8], author: &UserId, parents: &[String], workspace_id: &str) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"groupchat/aclop/1");
+    h.update(b"lait/aclop/1");
     h.update(op);
     h.update(author.as_str().as_bytes());
     let mut ps = parents.to_vec();
