@@ -165,22 +165,31 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             for m in members {
                 let you = if m.me { "  (you)" } else { "" };
-                println!("{:<7} {}{}", m.role, m.key.short(), you);
+                let name = if m.alias.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", m.alias)
+                };
+                println!("{:<7} {}{}{}", m.role, m.key.short(), name, you);
             }
             0
         }
         Response::JoinRequests { requests } => {
             if requests.is_empty() {
                 println!("(no pending join requests)");
+            } else {
+                // The key is authenticated; the nick is a self-asserted claim.
+                // Approve BY KEY after confirming the short id out-of-band.
+                eprintln!("approve by key/prefix — nick is an unverified claim:");
             }
             for r in requests {
-                let nick = if r.nick.is_empty() {
-                    "(unknown)"
-                } else {
-                    &r.nick
-                };
                 let short: String = r.key.chars().take(12).collect();
-                println!("{:<16} {}", nick, short);
+                let claim = if r.nick.is_empty() {
+                    String::new()
+                } else {
+                    format!("  (claims \"{}\")", r.nick)
+                };
+                println!("{}{}", short, claim);
             }
             0
         }

@@ -223,7 +223,8 @@ fn two_nodes_converge_over_iroh() {
                 &a.home,
                 Request::MemberAdd {
                     who: b_id,
-                    admin: false
+                    admin: false,
+                    as_name: None
                 }
             ),
             Response::Ok { .. }

@@ -1,8 +1,9 @@
 //! Invite/remote ergonomics end-to-end (WS1+WS2+WS3): two real nodes exercise the
 //! join-request approval flow — `members requests` surfaces an announced joiner,
-//! and `members approve <nick>` resolves that nick to a key through the
-//! presence-fed directory and seals them the workspace key. Also asserts the
-//! `seed`/`remote` list is a structured DTO. Drives daemons over the Layer-B
+//! and `members approve` is **key-first**: it resolves only by authenticated
+//! id-prefix / key (never the joiner's self-asserted nick), seals them the
+//! workspace key, and attaches a trusted local petname via `--as`. Also asserts
+//! the `seed`/`remote` list is a structured DTO. Drives daemons over the Layer-B
 //! control channel, same as `two_node_sync.rs` (never shells the CLI).
 
 use std::path::{Path, PathBuf};
@@ -106,7 +107,7 @@ fn poll_title(home: &Path, needle: &str, tries: u32) -> bool {
 }
 
 #[test]
-fn approve_join_request_by_nick_and_seed_list_is_structured() {
+fn approve_join_request_key_first_and_seed_list_is_structured() {
     let a_home = tmp_home("a");
     let b_home = tmp_home("b");
     // Give B a distinct, deterministic nick so we can approve it by name — on one
@@ -186,20 +187,55 @@ fn approve_join_request_by_nick_and_seed_list_is_structured() {
     }
     assert!(saw, "A never saw B's join request in `members requests`");
 
-    // WS1+WS2: approve BY NICK — resolves "bob" -> B's key via the pending dir.
+    // Security: the joiner's self-asserted nick is NOT a valid approval ref — an
+    // unauthenticated name must never select who gets sealed the workspace key.
     assert!(
         matches!(
-            req(&a.home, Request::MemberApprove { who: "bob".into() }),
-            Response::Ok { .. }
+            req(
+                &a.home,
+                Request::MemberApprove {
+                    who: "bob".into(),
+                    as_name: None,
+                }
+            ),
+            Response::Error { .. }
         ),
-        "A: approve bob by nick"
+        "approving by the self-asserted wire nick must be rejected (key-first only)"
     );
 
-    // B converges (decrypts A's issue) — proves approve-by-nick actually added B.
+    // WS1+WS2: approve KEY-FIRST — by B's authenticated id — attaching a trusted
+    // local petname in the same step.
+    assert!(
+        matches!(
+            req(
+                &a.home,
+                Request::MemberApprove {
+                    who: b_id.clone(),
+                    as_name: Some("bob".into()),
+                }
+            ),
+            Response::Ok { .. }
+        ),
+        "A: approve B by key + alias"
+    );
+
+    // B converges (decrypts A's issue) — proves the approval actually added B.
     assert!(
         poll_title(&b.home, "shared from A", 40),
-        "B did not converge after approve-by-nick (membership never sealed?)"
+        "B did not converge after approval (membership never sealed?)"
     );
+
+    // The local petname is now attached to B's authenticated key and surfaces in
+    // `members` — the trusted replacement for the spoofable wire nick.
+    match req(&a.home, Request::Members) {
+        Response::Members { members } => assert!(
+            members
+                .iter()
+                .any(|m| m.key.as_str() == b_id && m.alias == "bob"),
+            "approved member should carry the local alias 'bob'"
+        ),
+        other => panic!("A: members returned {other:?}"),
+    }
 
     // Approved member is no longer pending.
     if let Response::JoinRequests { requests } = req(&a.home, Request::MemberRequests) {

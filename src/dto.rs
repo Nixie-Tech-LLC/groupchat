@@ -276,6 +276,10 @@ pub struct MemberDto {
     pub role: String,
     /// Whether this is us.
     pub me: bool,
+    /// Local petname you've assigned to this key (empty if none). A private,
+    /// never-synced label — the trusted half of the local-petname identity model.
+    #[serde(default)]
+    pub alias: String,
 }
 
 /// A pending join request: someone who announced a join (via `connect`/`join`)

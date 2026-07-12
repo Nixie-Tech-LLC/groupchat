@@ -2,17 +2,26 @@
 
 ## Unreleased — invite & remote ergonomics
 
-- **User-refs resolve by nick and id-prefix.** `<userref>` now accepts a nick or a
-  key id-prefix (≥4 hex) in addition to `@me` / a full 64-hex key, resolved daemon
-  -side against a presence-fed directory (members + live presence + recent join
-  requests). Ambiguity returns a candidate list (UI.md §3.2). This lands the nick
-  resolution UI.md §3.1 / SCHEMA §7 already specified. Applies to `members
-  add/remove`, `assign`, and `new -a`.
-- **Join-request approval.** `lait members requests` lists people who ran
-  `connect`/`join` but aren't members yet (nick + short key); `lait members approve
-  <nick|prefix|key>` seals them the workspace key — no more copying a 64-hex id out
-  of `who --json`. The joiner's short key is now also shown on `lait log` join
-  lines. Both surface as MCP tools (`member_requests`, `member_approve`).
+- **User-refs resolve by local alias and id-prefix.** `<userref>` now accepts a
+  key id-prefix (≥4 hex) or a **local alias** (petname) in addition to `@me` / a
+  full 64-hex key, resolved daemon-side against a directory of known keys (members
+  + live presence + recent join requests). Names come only from your private alias
+  store — a self-asserted wire nick is **never** a resolution input, so it can't
+  select a key at a trust boundary. Ambiguity returns a candidate list (UI.md
+  §3.2). Applies to `members add/remove`, `assign`, and `new -a`.
+- **Local petnames (identity, git-style).** The strong identity is the ed25519 key
+  (what the signed ACL is keyed on); a friendly name is a **local alias** you
+  attach to a key, stored in `aliases.json`, never broadcast, never part of the
+  ACL. Set one with `lait members alias <key|prefix> <name>`, or inline while
+  adding/approving via `--as <name>`. `members ls` shows the alias next to each
+  key. (MCP: `member_alias`, plus `alias` on `member_add`/`member_approve`.)
+- **Join-request approval (key-first).** `lait members requests` lists people who
+  ran `connect`/`join` but aren't members yet, showing the **authenticated short
+  key** and the joiner's nick only as an unverified *claim*. `lait members approve
+  <prefix|key> [--as <name>]` seals them the workspace key — resolving strictly by
+  key (confirm the short id out-of-band; an unauthenticated nick must never select
+  who gets the key). The joiner's short key is also shown on `lait log` join lines.
+  Both surface as MCP tools (`member_requests`, `member_approve`).
 - **`remote` alias for `seed`.** `lait remote add/ls/rm` is a git-like alias of the
   seed registry. `seed ls` / `remote ls` now emit a structured DTO (id, nick,
   workspace, state, online) so `--json` is scriptable.

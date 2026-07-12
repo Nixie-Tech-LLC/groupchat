@@ -156,6 +156,9 @@ pub enum Request {
         who: String,
         #[serde(default)]
         admin: bool,
+        /// Optional local petname to attach to the resolved key (never synced).
+        #[serde(default)]
+        as_name: Option<String>,
     },
     MemberRemove {
         who: String,
@@ -164,10 +167,20 @@ pub enum Request {
     Members,
     /// List pending join requests (announced joiners not yet members, UI.md §8).
     MemberRequests,
-    /// Approve a pending join request by nick / id-prefix / key — sugar over
-    /// `MemberAdd` scoped to the pending set.
+    /// Approve a pending join request **by id-prefix / key** — sugar over
+    /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
+    /// deliberately not a resolution input (it is unauthenticated); `as_name`
+    /// lets the approver attach a trusted local petname at the same time.
     MemberApprove {
         who: String,
+        #[serde(default)]
+        as_name: Option<String>,
+    },
+    /// Set (or clear, with an empty name) a **local petname** for a key. Local to
+    /// this node, never broadcast, never part of the signed ACL.
+    MemberAlias {
+        who: String,
+        name: String,
     },
     /// Streaming doorbells for the TUI (S§7.5). Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.

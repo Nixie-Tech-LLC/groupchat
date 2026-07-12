@@ -222,11 +222,11 @@ pub fn resolve_project(catalog: &CatalogDoc, input: &str) -> Option<ProjectDto> 
     catalog.project_by_key(input)
 }
 
-/// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Nick/prefix resolution
-/// is presence-fed and lives in [`resolve_user_dir`], which the daemon calls with
-/// a directory it assembles from members + presence + join requests. This 2-arg
-/// form is the directory-free fallback used inside the tracker, where a ref has
-/// already been resolved to `@me`/a full key by the node layer.)
+/// Resolve a `<userref>`: `@me`, or a full ed25519 key. (Alias/prefix resolution
+/// lives in [`resolve_user_dir`], which the daemon calls with a directory it
+/// assembles from members + presence + join requests, named by the local alias
+/// store. This 2-arg form is the directory-free fallback used inside the tracker,
+/// where a ref has already been resolved to `@me`/a full key by the node layer.)
 pub fn resolve_user(input: &str, me: &UserId) -> Option<UserId> {
     let input = input.trim();
     if input == "@me" || input == "me" {
@@ -235,18 +235,21 @@ pub fn resolve_user(input: &str, me: &UserId) -> Option<UserId> {
     UserId::parse(input)
 }
 
-/// A known identity for user-ref resolution: an ed25519 key plus its advisory
-/// nick (from live presence, a join request, or our own profile). The nick may be
-/// empty when only the key is known — e.g. an ACL member we've never seen online;
-/// such an entry is still resolvable by key or id-prefix, just not by nick.
+/// A known identity for user-ref resolution: an ed25519 key plus a locally-set
+/// **alias** (petname), if any. The `nick` field carries that trusted local
+/// alias — never a self-asserted wire nick, which is deliberately kept out of
+/// resolution. It is empty when we know only the key (an ACL member we've never
+/// aliased); such an entry is still resolvable by key or id-prefix, just not by
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownUser {
     pub key: UserId,
+    /// A locally-assigned alias (petname). Empty ⇒ resolvable only by key/prefix.
     pub nick: String,
 }
 
-/// Outcome of resolving a `<userref>` against the presence-fed directory — the
-/// user-plane twin of [`RefResolution`]. Ambiguity is first-class (UI.md §3.2).
+/// Outcome of resolving a `<userref>` against the directory — the user-plane twin
+/// of [`RefResolution`]. Ambiguity is first-class (UI.md §3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserResolution {
     One(UserId),
@@ -259,12 +262,13 @@ pub enum UserResolution {
 const USER_PREFIX_MIN: usize = 4;
 
 /// Resolve a `<userref>` (UI.md §3.1) against a directory: `@me`/`me`; a full
-/// 64-hex ed25519 key; an advisory **nick** (case-insensitive, exact); or a
-/// **key id-prefix** (≥ [`USER_PREFIX_MIN`] hex chars). Nick and prefix are
-/// matched against `dir` (members + live presence + recent join requests). A
-/// full key always resolves even when absent from `dir`. Multiple distinct hits
-/// return `Many` so the caller can show a candidate list (UI.md §3.2). Nick is
-/// tried before prefix; the first stage to hit wins.
+/// 64-hex ed25519 key; a locally-set **alias** (case-insensitive, exact); or a
+/// **key id-prefix** (≥ [`USER_PREFIX_MIN`] hex chars). Alias and prefix are
+/// matched against `dir`, whose names come only from the local alias store — a
+/// self-asserted wire nick is never a resolution input. A full key always
+/// resolves even when absent from `dir`. Multiple distinct hits return `Many` so
+/// the caller can show a candidate list (UI.md §3.2). Alias is tried before
+/// prefix; the first stage to hit wins.
 pub fn resolve_user_dir(input: &str, me: &UserId, dir: &[KnownUser]) -> UserResolution {
     let input = input.trim();
     if input.is_empty() {

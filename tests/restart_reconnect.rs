@@ -202,7 +202,8 @@ fn restarted_daemon_rejoins_from_persisted_peers() {
                 &a_home,
                 Request::MemberAdd {
                     who: b_id,
-                    admin: false
+                    admin: false,
+                    as_name: None
                 }
             ),
             Response::Ok { .. }

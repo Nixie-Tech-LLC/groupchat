@@ -77,6 +77,7 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "members",
     "member_requests",
     "member_approve",
+    "member_alias",
     // transport / presence
     "status",
     "my_id",
@@ -206,11 +207,14 @@ pub struct ActivityArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberAddArgs {
-    /// A user ref: `@me` or a 64-hex ed25519 key.
+    /// A user ref: `@me`, a local alias, a key id-prefix, or a 64-hex ed25519 key.
     pub who: String,
     /// Grant the admin role.
     #[serde(default)]
     pub admin: bool,
+    /// Optional local petname to attach to the resolved key (never synced).
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -220,8 +224,20 @@ pub struct MemberRemoveArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemberApproveArgs {
-    /// A pending requester: a nick, a key id-prefix, or a full 64-hex key.
+    /// A pending requester: a key id-prefix or a full 64-hex key. The joiner's
+    /// self-asserted nick is not accepted — it is unauthenticated.
     pub who: String,
+    /// Optional local petname to attach to the approved key (never synced).
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemberAliasArgs {
+    /// A user ref: a key id-prefix, a full key, or an existing alias.
+    pub who: String,
+    /// The petname to assign (empty string clears it).
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -466,6 +482,7 @@ impl LaitMcp {
         self.run(Request::MemberAdd {
             who: a.who,
             admin: a.admin,
+            as_name: a.alias,
         })
         .await
     }
@@ -496,13 +513,31 @@ impl LaitMcp {
     }
 
     #[tool(
-        description = "Approve a pending join request by nick / id-prefix / key (admin-only); seals them the workspace key."
+        description = "Approve a pending join request by id-prefix / key (admin-only); seals them the workspace key. The joiner's nick is not a valid ref (unauthenticated) — pass `alias` to name them locally."
     )]
     async fn member_approve(
         &self,
         Parameters(a): Parameters<MemberApproveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::MemberApprove { who: a.who }).await
+        self.run(Request::MemberApprove {
+            who: a.who,
+            as_name: a.alias,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Set (or clear, with an empty name) a local petname for a key. Local to this device, never synced or part of the signed ACL."
+    )]
+    async fn member_alias(
+        &self,
+        Parameters(a): Parameters<MemberAliasArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberAlias {
+            who: a.who,
+            name: a.name,
+        })
+        .await
     }
 
     // ---- transport / presence ----

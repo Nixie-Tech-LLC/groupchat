@@ -205,7 +205,8 @@ fn seed_pin_adopts_then_survives_restart() {
                 &seed_home,
                 Request::MemberAdd {
                     who: b_id,
-                    admin: false
+                    admin: false,
+                    as_name: None
                 }
             ),
             Response::Ok { .. }

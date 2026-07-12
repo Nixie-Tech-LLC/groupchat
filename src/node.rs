@@ -207,6 +207,52 @@ fn remove_seed(home: &Path, needle: &str) -> usize {
     removed
 }
 
+/// Path to the local **alias** store — your private key→petname map (the trusted
+/// half of the local-petname identity model). Never synced; a name you set here
+/// is trusted because *you* set it, unlike the self-asserted wire nick.
+fn aliases_path(home: &Path) -> PathBuf {
+    home.join("aliases.json")
+}
+
+/// A local alias: a petname you attached to an authenticated ed25519 key. Local
+/// to this node, never broadcast, never part of the signed ACL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AliasRecord {
+    /// The member's ed25519 key (64-hex) — the authenticated identity.
+    key: String,
+    /// The petname you assigned.
+    name: String,
+}
+
+/// Load the local alias store (best-effort; empty when absent or corrupt).
+fn load_aliases(home: &Path) -> Vec<AliasRecord> {
+    let Ok(data) = std::fs::read_to_string(aliases_path(home)) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+/// Persist the local alias store (best-effort).
+fn save_aliases(home: &Path, aliases: &[AliasRecord]) {
+    if let Ok(data) = serde_json::to_string_pretty(aliases) {
+        let _ = std::fs::write(aliases_path(home), data);
+    }
+}
+
+/// Set (or, with an empty `name`, clear) the local petname for `key`. Keyed by
+/// the full ed25519 key — the authenticated identity, never a wire nick.
+fn upsert_alias(home: &Path, key: &str, name: &str) {
+    let mut aliases = load_aliases(home);
+    aliases.retain(|a| a.key != key);
+    if !name.is_empty() {
+        aliases.push(AliasRecord {
+            key: key.to_string(),
+            name: name.to_string(),
+        });
+    }
+    save_aliases(home, &aliases);
+}
+
 /// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
 /// `--json` render them through the same disambiguation path as issue refs
 /// (UI.md §3.2): `reff` = short key, `key_alias` = nick (if any), `title` = full
@@ -841,49 +887,46 @@ impl Node {
         UserId::from_key_string(self.shared.my_id.to_string())
     }
 
-    /// Assemble the user-ref resolution directory (UI.md §3.1) from every place a
-    /// key↔nick pairing is known: our own profile, the live presence map, recent
-    /// join requests in the event log, and the signed ACL members. Deduped by
-    /// key, preferring a non-empty nick. This is what turns `members add alice`
-    /// and `assign ENG-1 c3ab21` into real keys.
+    /// Assemble the user-ref resolution directory (UI.md §3.1). Keys are gathered
+    /// from every place we've seen one — our own id, the live presence map, recent
+    /// join requests, and the signed ACL members — so any of them resolves by
+    /// `@me` / full key / id-prefix. **Names come only from the local alias store**
+    /// (a petname you set), never from the self-asserted wire nick: an
+    /// unauthenticated name must never resolve to a key. A key with no alias is
+    /// still resolvable, just not by name. This is what turns `members add bob`
+    /// (after `--as bob`) and `assign ENG-1 c3ab21` into real keys.
     fn user_directory(&self) -> Vec<KnownUser> {
-        fn add(map: &mut HashMap<UserId, String>, key: UserId, nick: String) {
-            let e = map.entry(key).or_default();
-            if e.is_empty() && !nick.is_empty() {
-                *e = nick;
-            }
-        }
-        let mut map: HashMap<UserId, String> = HashMap::new();
-        add(&mut map, self.my_userid(), self.shared.nick.clone());
+        let mut keys: HashSet<UserId> = HashSet::new();
+        keys.insert(self.my_userid());
         {
             let presence = self.shared.presence.lock().unwrap();
-            for (id, peer) in presence.iter() {
-                add(
-                    &mut map,
-                    UserId::from_key_string(id.to_string()),
-                    peer.nick.clone(),
-                );
+            for id in presence.keys() {
+                keys.insert(UserId::from_key_string(id.to_string()));
             }
         }
         {
             let (events, _) = self.shared.events.lock().unwrap().since(0);
             for e in &events {
                 if e.kind == EventKind::Join {
-                    add(
-                        &mut map,
-                        UserId::from_key_string(e.id.clone()),
-                        e.nick.clone(),
-                    );
+                    keys.insert(UserId::from_key_string(e.id.clone()));
                 }
             }
         }
         {
             for (key, _role, _me) in self.tracker.lock().unwrap().members() {
-                add(&mut map, key, String::new());
+                keys.insert(key);
             }
         }
-        map.into_iter()
-            .map(|(key, nick)| KnownUser { key, nick })
+        let aliases = load_aliases(&self.home);
+        keys.into_iter()
+            .map(|key| {
+                let nick = aliases
+                    .iter()
+                    .find(|a| a.key == key.as_str())
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default();
+                KnownUser { key, nick }
+            })
             .collect()
     }
 
@@ -918,8 +961,8 @@ impl Node {
         out
     }
 
-    /// Resolve the user-refs carried by a request (nick / id-prefix → full key)
-    /// against the presence-fed directory, before the tracker sees them. Returns
+    /// Resolve the user-refs carried by a request (local-alias / id-prefix → full
+    /// key) against the directory, before the tracker sees them. Returns
     /// the rewritten request, or an early `Response` (not-found / ambiguous) to
     /// send back verbatim. Only the ref-bearing requests are touched; everything
     /// else passes through untouched (and without building the directory).
@@ -945,9 +988,14 @@ impl Node {
             }
         };
         Ok(match req {
-            Request::MemberAdd { who, admin } => Request::MemberAdd {
+            Request::MemberAdd {
+                who,
+                admin,
+                as_name,
+            } => Request::MemberAdd {
                 who: resolve(&who)?,
                 admin,
+                as_name,
             },
             Request::MemberRemove { who } => Request::MemberRemove {
                 who: resolve(&who)?,
@@ -1031,10 +1079,8 @@ impl Node {
             | Request::LabelNew { .. }
             | Request::LabelList
             | Request::Activity { .. }
-            | Request::MemberAdd { .. }
             | Request::MemberRemove { .. }
-            | Request::KeyRotate
-            | Request::Members => {
+            | Request::KeyRotate => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
                     // our catalog head moved — announce so peers pull (A§8).
@@ -1044,38 +1090,112 @@ impl Node {
                 Ok(resp)
             }
 
+            // Add a member, then attach the optional local petname to the resolved
+            // key (`who` is already a full key — `resolve_refs_in` ran first). The
+            // alias is set only after the ACL op actually took (`changed`).
+            Request::MemberAdd {
+                who,
+                admin,
+                as_name,
+            } => {
+                let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
+                    who: who.clone(),
+                    admin,
+                    as_name: None,
+                });
+                if changed {
+                    if let Some(name) = as_name.as_deref() {
+                        upsert_alias(&self.home, &who, name.trim());
+                    }
+                    let me = self.clone();
+                    tokio::spawn(async move { me.broadcast_announce().await.ok() });
+                }
+                Ok(resp)
+            }
+
+            // Members list, with local petnames overlaid onto the projection.
+            Request::Members => {
+                let (resp, _) = self.dispatch_tracker(Request::Members);
+                Ok(match resp {
+                    Response::Members { mut members } => {
+                        let aliases = load_aliases(&self.home);
+                        for m in &mut members {
+                            if let Some(a) = aliases.iter().find(|a| a.key == m.key.as_str()) {
+                                m.alias = a.name.clone();
+                            }
+                        }
+                        Response::Members { members }
+                    }
+                    other => other,
+                })
+            }
+
+            // Set (or clear) a local petname for any known key. Resolves `who`
+            // against the full directory (alias / id-prefix / key), then records
+            // the name locally — never synced, never a signed op.
+            Request::MemberAlias { who, name } => {
+                let dir = self.user_directory();
+                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
+                    UserResolution::One(u) => {
+                        let name = name.trim();
+                        upsert_alias(&self.home, u.as_str(), name);
+                        let msg = if name.is_empty() {
+                            format!("cleared alias for {}", u.short())
+                        } else {
+                            format!("{name} = {}", u.short())
+                        };
+                        Ok(Response::Ok { message: Some(msg) })
+                    }
+                    UserResolution::Zero => {
+                        Ok(Response::err(format!("no user matches '{who}'")))
+                    }
+                    UserResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: user_candidates(&c),
+                    }),
+                }
+            }
+
             // ---- join-request approval (built on the ACL member ops) ----
             Request::MemberRequests => Ok(Response::JoinRequests {
                 requests: self.pending_join_requests(),
             }),
-            Request::MemberApprove { who } => {
+            Request::MemberApprove { who, as_name } => {
                 let pending = self.pending_join_requests();
                 if pending.is_empty() {
                     return Ok(Response::err("no pending join requests to approve"));
                 }
-                // Resolve strictly against the pending set — approving is scoped to
-                // people who actually asked in.
+                // Key-first: resolve strictly by id-prefix / full key against the
+                // pending set. Empty nicks here mean the joiner's self-asserted name
+                // is NOT a resolution input — an unauthenticated nick must never
+                // select who gets sealed the workspace key. The approver attaches a
+                // *trusted* local petname via `as_name`.
                 let dir: Vec<KnownUser> = pending
                     .iter()
                     .map(|r| KnownUser {
                         key: UserId::from_key_string(r.key.clone()),
-                        nick: r.nick.clone(),
+                        nick: String::new(),
                     })
                     .collect();
                 match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
                     UserResolution::One(u) => {
+                        let key = u.as_str().to_string();
                         let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
-                            who: u.as_str().to_string(),
+                            who: key.clone(),
                             admin: false,
+                            as_name: None,
                         });
                         if changed {
+                            if let Some(name) = as_name.as_deref() {
+                                upsert_alias(&self.home, &key, name.trim());
+                            }
                             let me = self.clone();
                             tokio::spawn(async move { me.broadcast_announce().await.ok() });
                         }
                         Ok(resp)
                     }
                     UserResolution::Zero => Ok(Response::err(format!(
-                        "no pending join request matches '{who}'"
+                        "no pending join request matches '{who}' — approve by key or \
+                         id-prefix (see `lait members requests`)"
                     ))),
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
