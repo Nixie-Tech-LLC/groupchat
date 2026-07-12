@@ -16,19 +16,20 @@ This directory holds the packaging definitions cargo-dist does **not** generate.
 | Shell / PowerShell installer | — | cargo-dist | none |
 | `cargo install lait` | `[package]` in `Cargo.toml` | crates.io | `cargo publish` (needs a crates.io token) |
 | `cargo binstall lait` | `[package.metadata.binstall]` in `Cargo.toml` | cargo-binstall | none — reads the GitHub release |
-| Homebrew | `dist-workspace.toml` (`tap`, `homebrew` installer) | cargo-dist | create the tap repo + `HOMEBREW_TAP_TOKEN` (below) |
-| Scoop (Windows) | `packaging/scoop/lait.json` | this repo | create a Scoop bucket repo (below) |
-| winget (Windows) | `packaging/winget/*.yaml` | this repo | PR to `microsoft/winget-pkgs` (below) |
+| Homebrew | `dist-workspace.toml` (`homebrew` installer) + `publish-homebrew.yml` | cargo-dist builds `lait.rb`; our workflow pushes it | `homebrew-tap` repo + app creds (below) |
+| Scoop (Windows) | `packaging/scoop/lait.json` + `publish-scoop.yml` | this repo | `scoop-bucket` repo + app creds (below) |
+| winget (Windows) | `packaging/winget/*.yaml` + `publish-winget.yml` | this repo | PR to `microsoft/winget-pkgs` (below) |
 | Docker seed node | `Dockerfile`, `docker-compose.yml` | this repo | optional: push to a registry |
 
 ## Homebrew
 
-cargo-dist generates `lait.rb` and, on release, pushes it to the tap named by
-`tap = "Nixie-Tech-LLC/homebrew-tap"` in `dist-workspace.toml`.
-
-One-time: create the public repo **`github.com/Nixie-Tech-LLC/homebrew-tap`**, then
-add a repo/org secret **`HOMEBREW_TAP_TOKEN`** (a PAT with `contents:write` on that
-tap) so the release job can push the formula. After the first successful release:
+`dist-workspace.toml` sets the `homebrew` installer, so cargo-dist generates
+`lait.rb` (targeting `tap = "Nixie-Tech-LLC/homebrew-tap"`) and uploads it as a
+release asset. It does **not** push — `publish-homebrew.yml` does, minting a
+tap-scoped token from the `integration-runners` app and committing the formula to
+`homebrew-tap/Formula/lait.rb`. One-time: the public repo
+**`github.com/Nixie-Tech-LLC/homebrew-tap`** must exist and the app secrets (below)
+must be set. Then:
 
 ```sh
 brew install nixie-tech-llc/tap/lait
@@ -86,21 +87,30 @@ Publishing also gives docs.rs API docs for free.
   and a single consistent winget identifier. It deliberately does **not** check
   the version/hash (those don't exist until a release builds them).
 - **CD** runs on `release: published`:
-  - Homebrew — `release.yml` (cargo-dist) pushes the formula to the tap.
+  - Homebrew — `publish-homebrew.yml` downloads the cargo-dist-generated `lait.rb`
+    release asset and commits it to `homebrew-tap/Formula/lait.rb`.
   - Scoop — `publish-scoop.yml` stamps `lait.json` with the release version +
-    SHA256 and pushes it to `scoop-bucket`.
+    SHA256 and pushes it to `scoop-bucket/bucket/lait.json`.
   - winget — `publish-winget.yml` submits to `microsoft/winget-pkgs` via
     `winget-releaser`.
-  - Each CD job **soft-skips** if its secret is unset, so a release never goes red
-    before the tokens are configured.
+  - Each CD job **soft-skips** if its credentials are unset, so a release never
+    goes red before they are configured.
 
-### Required repository/org secrets
+### Auth model
+
+Homebrew + Scoop pushes use a **short-lived token minted at run time from the org
+GitHub App `integration-runners`** (`actions/create-github-app-token`, scoped to
+the single target repo) — no long-lived PAT to rotate or leak. The app's creds are
+stored once as repo secrets:
 
 | Secret | Used by | What it is |
 |---|---|---|
-| `HOMEBREW_TAP_TOKEN` | cargo-dist (`release.yml`) | PAT with `contents:write` on `homebrew-tap` |
-| `SCOOP_BUCKET_TOKEN` | `publish-scoop.yml` | PAT with `contents:write` on `scoop-bucket` |
-| `WINGET_TOKEN` | `publish-winget.yml` | classic PAT with `public_repo`, from an account that forked `microsoft/winget-pkgs` |
+| `RUNNERS_APP_ID` | `publish-homebrew.yml`, `publish-scoop.yml` | the `integration-runners` GitHub App id (from OpenBao `secret/github-app-arc`) |
+| `RUNNERS_APP_PRIVATE_KEY` | same | that app's PEM private key |
+| `WINGET_TOKEN` | `publish-winget.yml` | classic PAT with `public_repo`, from an account that forked `microsoft/winget-pkgs` (winget can't use the org app — it needs a user-namespace fork) |
+
+The `integration-runners` app needs **`contents: write`** on the org for the tap /
+bucket pushes (in addition to its runner permissions).
 
 ## Version bumps at a glance
 

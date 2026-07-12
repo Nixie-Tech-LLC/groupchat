@@ -2,9 +2,9 @@
 # push it to the org Scoop bucket (github.com/Nixie-Tech-LLC/scoop-bucket), so
 # `scoop install lait` picks up the new version.
 #
-# Homebrew is handled by cargo-dist in release.yml; this covers the Windows
-# Scoop path. Needs a `SCOOP_BUCKET_TOKEN` secret (a PAT with contents:write on
-# the bucket repo). Without it the job soft-skips, so it never blocks a release.
+# Auth is a short-lived token minted from the org GitHub App (integration-runners)
+# scoped to just scoop-bucket — no long-lived PAT. App creds live in the repo
+# secrets RUNNERS_APP_ID / RUNNERS_APP_PRIVATE_KEY; without them the job soft-skips.
 name: Publish Scoop manifest
 
 on:
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. v0.4.1)"
+        description: "Release tag to publish (e.g. v0.4.2)"
         required: true
 
 permissions:
@@ -24,22 +24,31 @@ jobs:
     name: update scoop-bucket
     runs-on: ubuntu-latest
     env:
-      BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+      APP_ID: ${{ secrets.RUNNERS_APP_ID }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Gate on app credentials
+        id: gate
+        shell: bash
+        run: |
+          if [ -n "${APP_ID:-}" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::RUNNERS_APP_ID not set — skipping Scoop publish."; echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Resolve tag + version
         id: ver
+        if: steps.gate.outputs.ok == 'true'
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ github.event.release.tag_name || inputs.tag }}"
           [ -n "$tag" ] || { echo "::error::no release tag available"; exit 1; }
-          echo "tag=$tag"           >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}"   >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - name: Fetch the Windows zip SHA256 from the release
         id: hash
+        if: steps.gate.outputs.ok == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,6 +62,7 @@ jobs:
           echo "sha256=$hash" >> "$GITHUB_OUTPUT"
 
       - name: Stamp packaging/scoop/lait.json
+        if: steps.gate.outputs.ok == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -66,24 +76,31 @@ jobs:
           ' "$f" > "$tmp" && mv "$tmp" "$f"
           jq empty "$f" && cat "$f"
 
+      - name: Mint a bucket-scoped token
+        id: token
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RUNNERS_APP_ID }}
+          private-key: ${{ secrets.RUNNERS_APP_PRIVATE_KEY }}
+          owner: Nixie-Tech-LLC
+          repositories: scoop-bucket
+
       - name: Push to scoop-bucket
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          BUCKET_TOKEN: ${{ steps.token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${BUCKET_TOKEN:-}" ]; then
-            echo "::notice::SCOOP_BUCKET_TOKEN not set — skipping Scoop publish."
-            exit 0
-          fi
           git clone --depth 1 \
             "https://x-access-token:${BUCKET_TOKEN}@github.com/Nixie-Tech-LLC/scoop-bucket" bucket
           mkdir -p bucket/bucket
           cp packaging/scoop/lait.json bucket/bucket/lait.json
           cd bucket
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "integration-runners[bot]"
+          git config user.email "integration-runners[bot]@users.noreply.github.com"
           git add bucket/lait.json
-          if git diff --cached --quiet; then
-            echo "manifest already up to date"; exit 0
-          fi
+          if git diff --cached --quiet; then echo "manifest already up to date"; exit 0; fi
           git commit -m "lait ${{ steps.ver.outputs.version }}"
           git push
