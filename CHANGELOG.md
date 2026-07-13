@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.7 — guided-join onboarding & instant-at-scale edits
+
+- **Guided-join onboarding that names the one thing that's wrong.** A first
+  invite silently passes ~10 gates (right directory, daemon up, membership
+  sealed, a peer reachable, catalog converged) that otherwise all fail as the
+  same empty board. A new verifier projects live daemon state into an ordered
+  gate list (workspace / daemon / membership / peer / synced) and names the
+  single actionable blocker, identically on every surface: `lait doctor` (alias
+  `verify`) — run automatically as a tail on `lait join`, which also flags a
+  store/workspace mismatch; an MCP `doctor` tool; and a TUI Doctor panel (`d`)
+  with a joined-workspace selector (`w`). Gates are founder-aware: an admin, or
+  an already-synced member, with no peers online isn't blocked.
+- **The directory trap is closed.** Running commands from the wrong directory no
+  longer auto-creates a decoy `.lait/` store: a join records `store path ->
+  workspace` in a `workspaces.json` registry, and read-only commands (including
+  `tui`) refuse to conjure an empty store when you've already joined a workspace
+  — pointing you back at the real one instead.
+- **Edits stay instant with thousands of issues.** Two edit-path costs that grew
+  with issue count are gone. The alias/handle table is now maintained
+  incrementally — O(log N) per change instead of an O(N²) rebuild on every edit
+  and sync — and git snapshots are coalesced onto a periodic checkpoint off the
+  mutation path instead of a `git add -A` per keystroke (durability is
+  unchanged: every write is still fsync'd). In a 2,000-issue workspace, per-edit
+  work dropped ~13x and the on-disk store shrank ~30x.
+
 ## v0.4.6 — one-step invites & self-updater fix
 
 - **A default invite admits the joiner automatically — no `members approve`.**
