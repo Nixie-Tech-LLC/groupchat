@@ -1,0 +1,132 @@
+# Dev / nightly channel: on every merge to `main`, build prebuilt binaries and
+# publish them to a single ROLLING GitHub prerelease tagged `dev`, re-pointed at
+# the latest main each run. This never touches the stable channels — it is a
+# separate workflow (name "Dev Release"), so the publish-*.yml workflows (which
+# trigger on the "Release" workflow) never fire, and the prerelease flag keeps it
+# off "Latest release". No crates.io, no package managers, no version-bump commits.
+#
+# Binaries are stamped `X.Y.Z-dev+<sha> (<date>)` via build.rs so a nightly is
+# unmistakable from a tagged release (`lait --version`).
+name: Dev Release
+
+on:
+  push:
+    branches: [main]
+
+# A newer merge supersedes an in-flight dev build — the latest main always wins.
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stamp the dev-build identity for build.rs (short sha + UTC date). Persists
+      # to the cargo build step via $GITHUB_ENV.
+      - name: Stamp build info
+        shell: bash
+        run: |
+          echo "LAIT_BUILD_SHA=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "LAIT_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dev-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          bin="lait"; [ "$RUNNER_OS" = "Windows" ] && bin="lait.exe"
+          stage="lait-dev-$target"
+          mkdir -p "$stage"
+          cp "target/$target/release/$bin" "$stage/"
+          cp README.md LICENSE-APACHE LICENSE-MIT "$stage/" 2>/dev/null || true
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$stage.zip" "$stage" >/dev/null
+            asset="$stage.zip"
+          else
+            tar czf "$stage.tar.gz" "$stage"
+            asset="$stage.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish rolling `dev` prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short=8 HEAD)"
+          built="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          # Build the release notes line-by-line into a file (robust across the
+          # YAML/bash boundary — no heredoc indentation pitfalls).
+          {
+            echo "Rolling **development** build from the latest \`main\` (commit \`$sha\`, built $built)."
+            echo
+            echo "⚠️ **Not a stable release** — bleeding edge, for testing only. For stable, use the [latest release](https://github.com/Nixie-Tech-LLC/lait/releases/latest) or a package manager (\`brew install nixie-tech-llc/tap/lait\`, \`cargo binstall lait\`, …)."
+            echo
+            echo "The binary reports its version as \`X.Y.Z-dev+$sha\`. Grab an asset below, or:"
+            echo '```'
+            echo "gh release download dev -R Nixie-Tech-LLC/lait"
+            echo '```'
+          } > notes.md
+          # Re-point the rolling tag + recreate the prerelease so its assets are
+          # always the latest main. Tolerate a first run where `dev` doesn't exist.
+          gh release delete dev --cleanup-tag --yes || true
+          gh release create dev \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "dev (latest main)" \
+            --notes-file notes.md \
+            dist/*

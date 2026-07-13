@@ -23,7 +23,9 @@ use crate::{
 #[derive(Parser, Debug)]
 #[command(
     name = "lait",
-    version,
+    // `LAIT_VERSION_LONG` is stamped by build.rs: a clean semver for releases, or
+    // a `-dev+<sha> (<date>)` suffix for dev-channel/nightly builds.
+    version = env!("LAIT_VERSION_LONG"),
     about = "A local-first, peer-to-peer issue tracker"
 )]
 pub struct Cli {
