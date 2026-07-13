@@ -286,13 +286,41 @@ pub enum Response {
     },
     Error {
         message: String,
+        // Named `error_kind`, not `kind`: the enum's internal tag is `kind`
+        // (`#[serde(tag = "kind")]`), so a variant field of that name collides.
+        #[serde(default)]
+        error_kind: ErrorKind,
     },
 }
 
+/// Classifies a [`Response::Error`] so the process exit code (UI.md §2.3) is
+/// derived from a **typed kind**, never by string-matching the human message.
+/// `NotFound` (a ref / registry entry didn't resolve) maps to exit `2` alongside
+/// the ambiguous [`Response::Candidates`] outcome; everything else is a plain
+/// error → exit `1`. Kept minimal on purpose: "many candidates" already has its
+/// own response variant, so the only extra rung the message layer needs is
+/// "resolved to nothing."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    #[default]
+    Error,
+    NotFound,
+}
+
 impl Response {
+    /// A generic failure — usage, validation, internal (exit `1`).
     pub fn err(msg: impl Into<String>) -> Self {
         Response::Error {
             message: msg.into(),
+            error_kind: ErrorKind::Error,
+        }
+    }
+    /// A ref / registry lookup that resolved to **nothing** (exit `2`, UI.md §3.2).
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Response::Error {
+            message: msg.into(),
+            error_kind: ErrorKind::NotFound,
         }
     }
 }

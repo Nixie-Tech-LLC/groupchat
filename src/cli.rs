@@ -10,7 +10,7 @@ use std::{io::Write, path::Path, process::Stdio, time::Duration};
 use anyhow::{anyhow, Context, Result};
 
 use crate::{
-    control::{request, Event, EventKind, Request, Response},
+    control::{request, ErrorKind, Event, EventKind, Request, Response},
     dto::{BoardView, IssueView, Priority, Row},
     proto::RoomTicket,
 };
@@ -138,7 +138,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         let json = serde_json::to_string(resp).unwrap_or_else(|_| "{}".into());
         println!("{json}");
         return match resp {
-            Response::Error { message } => exit_code_for_error(message),
+            Response::Error { error_kind, .. } => exit_code_for_kind(*error_kind),
             Response::Candidates { .. } => 2,
             _ => 0,
         };
@@ -341,23 +341,18 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
-        Response::Error { message } => {
+        Response::Error { message, error_kind } => {
             eprintln!("error: {message}");
-            exit_code_for_error(message)
+            exit_code_for_kind(*error_kind)
         }
     }
 }
 
-fn exit_code_for_error(message: &str) -> i32 {
-    let resolution_error = message.contains("no issue matches")
-        || message.contains("no project matches")
-        || message.contains("no user matches")
-        || message.contains("no label matches")
-        || message.contains("more than one project");
-    if resolution_error {
-        2
-    } else {
-        1
+/// Exit code from the typed error kind (UI.md §2.3), not from the message text.
+fn exit_code_for_kind(kind: ErrorKind) -> i32 {
+    match kind {
+        ErrorKind::NotFound => 2,
+        ErrorKind::Error => 1,
     }
 }
 
@@ -794,6 +789,29 @@ mod tests {
         assert_eq!(paint(false, ansi::RED, "hi"), "hi");
         let on = paint(true, ansi::RED, "hi");
         assert!(on.starts_with(ansi::RED) && on.ends_with(ansi::RESET) && on.contains("hi"));
+    }
+
+    #[test]
+    fn exit_code_is_derived_from_typed_kind_not_prose() {
+        // A resolution miss → exit 2, regardless of the (rewordable) message.
+        assert_eq!(exit_code_for_kind(ErrorKind::NotFound), 2);
+        assert_eq!(exit_code_for_kind(ErrorKind::Error), 1);
+        // The constructors carry the kind, and it survives a DTO round-trip so a
+        // --json consumer / MCP agent sees the same classification.
+        let nf = Response::not_found("no issue matches 'ENG-9x'");
+        let json = serde_json::to_string(&nf).unwrap();
+        assert!(json.contains("\"error_kind\":\"not_found\""));
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Error { error_kind, .. } => assert_eq!(error_kind, ErrorKind::NotFound),
+            other => panic!("round-trip changed variant: {other:?}"),
+        }
+        // A legacy error object with no error_kind field defaults to Error (exit 1).
+        let legacy: Response =
+            serde_json::from_str(r#"{"kind":"error","message":"boom"}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            Response::Error { error_kind: ErrorKind::Error, .. }
+        ));
     }
 
     #[test]

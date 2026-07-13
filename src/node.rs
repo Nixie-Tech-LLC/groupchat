@@ -1021,7 +1021,7 @@ impl Node {
         let resolve = |who: &str| -> std::result::Result<String, Response> {
             match resolve_user_dir(who, &me, &dir) {
                 UserResolution::One(u) => Ok(u.as_str().to_string()),
-                UserResolution::Zero => Err(Response::err(format!("no user matches '{who}'"))),
+                UserResolution::Zero => Err(Response::not_found(format!("no user matches '{who}'"))),
                 UserResolution::Many(c) => Err(Response::Candidates {
                     candidates: user_candidates(&c),
                 }),
@@ -1186,7 +1186,7 @@ impl Node {
                         };
                         Ok(Response::Ok { message: Some(msg) })
                     }
-                    UserResolution::Zero => Ok(Response::err(format!("no user matches '{who}'"))),
+                    UserResolution::Zero => Ok(Response::not_found(format!("no user matches '{who}'"))),
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
                     }),
@@ -1231,7 +1231,7 @@ impl Node {
                         }
                         Ok(resp)
                     }
-                    UserResolution::Zero => Ok(Response::err(format!(
+                    UserResolution::Zero => Ok(Response::not_found(format!(
                         "no pending join request matches '{who}' — approve by key or \
                          id-prefix (see `lait members requests`)"
                     ))),
@@ -1333,7 +1333,7 @@ impl Node {
             Request::SeedRemove { who } => {
                 let n = remove_seed(&self.home, who.trim());
                 if n == 0 {
-                    Ok(Response::err("no pinned seed matched that id/nick"))
+                    Ok(Response::not_found("no pinned seed matched that id/nick"))
                 } else {
                     Ok(Response::Ok {
                         message: Some(format!("unpinned {n} seed(s)")),

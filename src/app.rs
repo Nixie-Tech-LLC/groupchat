@@ -406,7 +406,22 @@ async fn run_update() -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
-    let args = Cli::parse();
+    // `try_parse` (not `parse`) so a usage/parse error exits `1` — the documented
+    // code (UI.md §2.3) — instead of clap's default `2`, which collides with
+    // `2 = ref not found / ambiguous`. `--help`/`--version` still exit `0`.
+    let args = match Cli::try_parse() {
+        Ok(a) => a,
+        Err(e) => {
+            e.print().ok();
+            let code = match e.kind() {
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => 0,
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+    };
     if !is_service_command(&args.command) {
         reset_sigpipe();
     }
