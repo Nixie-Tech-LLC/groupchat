@@ -209,13 +209,13 @@ Registries + node:
 |---|---|
 | `projects [new <name> --key KEY \| ls]` | Manage the project registry |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
-| `members [add <userref> [--admin] \| remove <userref> \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); add seals the key, remove rotates it |
+| `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
 | `invite` · `join` · `members requests` · `members approve` | Invite a teammate; they `join`; you approve their pending request |
 | `who` · `wait` · `watch` | Peers online · block for one event · follow the event stream |
-| `agents` / `resume <name>` | Manage per-session identities |
+| `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
 Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`
 usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.

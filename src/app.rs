@@ -195,12 +195,12 @@ pub enum Command {
         #[arg(long)]
         nick: Option<String>,
     },
-    /// Manage pinned always-on **seed** peers — the P2P "remote". A seed is a
-    /// sticky bootstrap + backfill anchor your node always dials, so you converge
-    /// even when no laptop peer is online. It is not a trust authority (genesis/
-    /// ACL still gate every op, A§10). Set one up with `daemon --seed` on the box.
-    #[command(visible_alias = "remote")]
-    Seed {
+    /// Manage pinned **remotes** — always-on peers your node always dials for
+    /// bootstrap + backfill, so you converge even when no laptop peer is online.
+    /// A remote is not a trust authority (genesis/ACL still gate every op, A§10);
+    /// stand one up with `daemon --seed` on an always-on box. (Alias: `seed`.)
+    #[command(alias = "seed")]
+    Remote {
         #[command(subcommand)]
         cmd: SeedCmd,
     },
@@ -229,9 +229,11 @@ pub enum Command {
     },
     /// List peers and their online status.
     Who,
-    /// List your identities (each agent/session is its own private identity).
-    Agents,
-    /// Resume (or create) a named identity for this session.
+    /// List your profiles — each is a separate private identity with its own key
+    /// and store (e.g. one per agent/session). (Alias: `agents`.)
+    #[command(alias = "agents")]
+    Profiles,
+    /// Switch to (or create) a named profile for this session.
     Resume { name: String },
     /// Update lait in place from the latest GitHub release (native self-update).
     Update,
@@ -269,18 +271,18 @@ pub enum LabelsCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum SeedCmd {
-    /// Pin a seed and adopt its workspace. Accepts a room ticket (from
-    /// `lait invite` on the seed — adopts + backfills) or a bare endpoint id
+    /// Pin a remote and adopt its workspace. Accepts an invite link (from
+    /// `lait invite` on the remote — adopts + backfills) or a bare endpoint id
     /// (pin only, for a workspace you already share).
     Add {
-        /// A room ticket or an endpoint id.
+        /// An invite link or an endpoint id.
         target: String,
     },
-    /// List pinned seeds and whether each is currently reachable.
+    /// List pinned remotes and whether each is currently reachable.
     Ls,
-    /// Unpin a seed by endpoint id (or id-prefix) or nick.
+    /// Unpin a remote by endpoint id (or id-prefix) or name.
     Rm {
-        /// Endpoint id (or prefix) or nick to unpin.
+        /// Endpoint id (or prefix) or name to unpin.
         who: String,
     },
 }
@@ -289,39 +291,41 @@ pub enum SeedCmd {
 pub enum MembersCmd {
     /// Add a member (admin-only). Seals the workspace key to them.
     Add {
-        /// A user ref: @me, a local alias you've set, a key id-prefix, or a full
-        /// 64-hex key. (A self-asserted wire nick is NOT accepted — name people
-        /// yourself with `--as` / `members alias`.)
+        /// A user ref: @me, a local name you've set, a key id-prefix, or a full
+        /// 64-hex key. (A self-asserted wire name is NOT accepted — name people
+        /// yourself with `--as` / `members name`.)
         who: String,
         #[arg(long)]
         admin: bool,
-        /// Attach a local petname to this key as you add them (never synced).
+        /// Attach a local name to this key as you add them (never synced).
         #[arg(long = "as", value_name = "NAME")]
         as_name: Option<String>,
     },
     /// Remove a member (admin-only) and rotate the workspace key.
     Remove {
-        /// A user ref: @me, a local alias, a key id-prefix, or a full 64-hex key.
+        /// A user ref: @me, a local name, a key id-prefix, or a full 64-hex key.
         who: String,
     },
-    /// List pending join requests (people who ran `connect`/`join`, not yet added).
+    /// List pending join requests (people who ran `join`, not yet added).
     Requests,
     /// Approve a pending join request **by id-prefix / key** (admin-only). The
-    /// joiner's advertised nick is shown only as an unverified hint — confirm the
+    /// joiner's advertised name is shown only as an unverified hint — confirm the
     /// short key out-of-band, then approve it and name them with `--as`.
     Approve {
         /// A pending requester: a key id-prefix or a full 64-hex key.
         who: String,
-        /// Attach a local petname to this key as you approve them (never synced).
+        /// Attach a local name to this key as you approve them (never synced).
         #[arg(long = "as", value_name = "NAME")]
         as_name: Option<String>,
     },
-    /// Set (or clear, with an empty name) a local petname for a member/key. Local
-    /// to this device, never broadcast, never part of the signed ACL.
-    Alias {
-        /// A user ref: a key id-prefix, a full key, or an existing alias.
+    /// Set (or clear, with an empty name) a local **name** for a member/key —
+    /// your private label, never broadcast, never part of the signed ACL.
+    /// (Alias: `alias`.)
+    #[command(alias = "alias")]
+    Name {
+        /// A user ref: a key id-prefix, a full key, or an existing name.
         who: String,
-        /// The petname to assign (omit or pass "" to clear).
+        /// The name to assign (omit or pass "" to clear).
         #[arg(default_value = "")]
         name: String,
     },
@@ -455,7 +459,7 @@ pub async fn run() -> Result<()> {
 
     // Registry-level commands that operate across identities.
     match &args.command {
-        Command::Agents => {
+        Command::Profiles => {
             let names = config::list_identities()?;
             if out.json {
                 println!(
@@ -693,7 +697,7 @@ pub async fn run() -> Result<()> {
             Some(MembersCmd::Approve { who, as_name }) => {
                 crate::cli::run(&home, Request::MemberApprove { who, as_name }, out).await?
             }
-            Some(MembersCmd::Alias { who, name }) => {
+            Some(MembersCmd::Name { who, name }) => {
                 crate::cli::run(&home, Request::MemberAlias { who, name }, out).await?
             }
             Some(MembersCmd::RotateKey) => crate::cli::run(&home, Request::KeyRotate, out).await?,
@@ -742,7 +746,7 @@ pub async fn run() -> Result<()> {
             }
             crate::cli::run(&home, Request::Join { ticket }, out).await?
         }
-        Command::Seed { cmd } => match cmd {
+        Command::Remote { cmd } => match cmd {
             SeedCmd::Add { target } => {
                 crate::cli::run(&home, Request::SeedAdd { arg: target }, out).await?
             }
@@ -760,7 +764,7 @@ pub async fn run() -> Result<()> {
             timeout_ms,
         } => crate::cli::watch(&home, since, exec, notify, timeout_ms).await?,
         Command::Who => crate::cli::run(&home, Request::Who, out).await?,
-        Command::Agents
+        Command::Profiles
         | Command::Resume { .. }
         | Command::Update
         | Command::Completions { .. }
