@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — invite & remote ergonomics
+## v0.4.5 — invite & remote ergonomics
 
 - **User-refs resolve by local alias and id-prefix.** `<userref>` now accepts a
   key id-prefix (≥4 hex) or a **local alias** (petname) in addition to `@me` / a
