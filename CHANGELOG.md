@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — one-step invites (auto-approval)
+## v0.4.6 — one-step invites & self-updater fix
 
 - **A default invite admits the joiner automatically — no `members approve`.**
   `lait invite` now embeds a **signed, single-use pass** in the ticket (Pattern A):
@@ -25,9 +25,6 @@
   `status` message now state which mode is in effect.
 - Wire note: `RoomTicket` and the gossip `JoinRequest` gained an optional invite
   field — a coordinated format bump (nodes should run the same version).
-
-## v0.4.6 — self-updater fix
-
 - **`lait update` now extracts the binary from cargo-dist archives.** The native
   in-place updater looked for a bare `lait` at the archive root, but release
   tarballs nest the binary under a `lait-<target-triple>/` directory, so every
