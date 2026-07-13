@@ -129,6 +129,22 @@ completions and a man page come from the binary itself
 (`lait completions <shell>`, `lait man`). For an always-on **seed node**, see the
 [Docker setup](docker-compose.yml).
 
+### Nightly / dev builds
+
+Every merge to `main` publishes prebuilt binaries to a rolling **[`dev`
+prerelease](https://github.com/Nixie-Tech-LLC/lait/releases/tag/dev)** (Linux x64,
+macOS arm64/x64, Windows x64) — bleeding edge, for dogfooding the latest `main`.
+It's a GitHub *prerelease*, so it never shows as "Latest" and never touches the
+package managers or crates.io.
+
+```bash
+# grab the current dev build for your platform
+gh release download dev -R Nixie-Tech-LLC/lait
+```
+
+A dev binary reports its commit so it's unmistakable from a tagged release:
+`lait --version` → `lait 0.4.5-dev+<sha> (<date>)`.
+
 ## Quickstart (the tracker)
 
 ```bash
