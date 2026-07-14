@@ -1,12 +1,14 @@
 # UI — lait: CLI & TUI
 
-> **Status:** design draft, pre-build. The third design leg, companion to
+> **Status:** implemented (v0.4.8); this is the design of record, kept in sync with
+> the shipped surfaces. The third design leg, companion to
 > [`ARCHITECTURE.md`](./ARCHITECTURE.md) (refs `A§`) and [`SCHEMA.md`](./SCHEMA.md)
 > (refs `S§`). Covers the two human surfaces of the tracker — the **CLI** and the
-> **TUI** — plus the agent surface (MCP) they share a contract with. Scoped to a
-> **P0-complete** design (single node, git-backed, no network); P1/P3/P4 surfaces are
-> **named and slotted, not built** (§8), matching the phasing in A§13. Live decisions
-> are flagged **[DECISION]** with the chosen default in bold, same as S§.
+> **TUI** — plus the agent surface (MCP) they share a contract with. The full
+> **P0-complete** surface (single node, git-backed) is built, and the P1/P3 surfaces
+> it slotted (§8 — live sync/presence, membership) have since landed; P4 polish is the
+> remaining work. Decisions are flagged **[DECISION]** with the shipped default in bold,
+> same as S§.
 
 ## 1. Scope & the one-façade rule
 
@@ -43,10 +45,10 @@ same refactor-freedom the contract buys the CLI and MCP.
 4. **Same nouns everywhere.** A `Ref` means the same thing in the CLI, the TUI command
    palette, and an MCP tool argument (§3).
 
-> Today's `src/control.rs` still carries the **chat-era** `Request`/`Response` enum
-> (`Status/Invite/Join/Connect/Log/Wait/Who/Stop`). This document specifies the **tracker**
-> Layer B (the S§7 enum) that supersedes it; the transport/presence verbs survive as the
-> P1 networking surface (§8). Where a verb is new it is marked **[new]**.
+> `src/control.rs` now carries the **tracker** Layer B specified here (the S§7 enum):
+> the issue verbs, the membership/ACL verbs, `Subscribe`, and `Diagnose`. The chat-era
+> transport/presence verbs (`Status/Invite/Join/Connect/Log/Wait/Who/Stop`) survive
+> alongside as the P1 networking surface (§8).
 
 ## 2. CLI command surface
 
@@ -70,21 +72,29 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | `assign <ref> <userref…> [--remove]` | `Assign` | Add/remove assignees (present-key set, S§5.2). |
 | `label <ref> [+LABEL…] [-LABEL…]` | `Label` | Add (`+`) / remove (`-`) labels on an issue. |
 | `comment <ref> [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). No arg → open `$EDITOR`. |
+| `delete <ref>` | `IssueDelete` | Tombstone an issue (S§5.6); it stays in `docs` for history/backfill, `ls`/`board` hide it. |
 | `history <ref>` | `History` | The issue's derived activity/time-travel feed (free from Loro op history, A§5). |
 | `projects [new <name> --key KEY \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). |
 | `labels [new <name> --color C \| ls]` | `LabelNew`/`LabelList` | Manage the label registry (`Catalog.labels`). |
+| `members [add\|remove\|requests\|approve\|name\|rotate-key\|ls]` | `MemberAdd`/`MemberRemove`/… | Manage E2EE membership (the signed ACL, S§6): `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local alias (§8, P3). |
 | `activity [--since N]` | `Activity` | Workspace-wide recent transitions (ex-`log`; ring-buffer `seq`). |
 | `wait [--since N] [--timeout-ms M]` | `Wait` | Block until the next event; prints it. The scripting primitive. |
-| `watch [--since N] [--exec CMD] [--notify]` | `Wait`-loop | Follow forever; run a hook / desktop-notify per event (existing). |
-| `tui` | — **[new]** | Launch the full-screen board (§4). |
-| `status` · `stop` | `Status`/`Stop` | Node status; stop the daemon. |
-| `invite` · `join` · `connect` · `who` · `id` | (P1 transport) | Kept from the skeleton; the networking surface (§8, A§8). |
+| `watch [--since N] [--exec CMD] [--notify]` | `Wait`-loop | Follow forever; run a hook / desktop-notify per event. |
+| `tui` | — | Launch the full-screen board (§4). |
+| `doctor` (alias `verify`) | `Diagnose` | Guided-join verifier: names the one onboarding gate that's blocking ([`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). Auto-tails `join`. |
+| `workspaces` | — | List joined workspaces + their store paths (the directory-trap fix, [`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). |
+| `profiles` (alias `agents`) · `resume <name>` | — | List / switch named profiles (each a separate identity + store). |
+| `status` · `stop` · `id` | `Status`/`Stop`/`Id` | Node/workspace status; stop the daemon; print the endpoint id. |
+| `invite` · `join` (alias `connect`) · `who` · `remote` (alias `seed`) | (P1 transport, §8/A§8) | The networking surface: invite/join a workspace, list peers, pin a seed. |
 
 ### 2.2 Notable behaviors
 
 - **Writes echo the resolved handle.** `new`/`edit`/`move`/… return `Response::Ref{reff}`
   so a script can capture the canonical handle (`iss_…` short prefix, §3) it just touched:
   `id=$(lait new "fix login" -p ENG --json | jq -r .reff)`.
+- **Branch-inferred refs.** On a git branch whose name embeds a `KEY-n` (e.g.
+  `eng-142-fix-login`), the `<ref>` is **optional** for `show`/`edit`/`move`/`history`/
+  `delete` — lait infers `ENG-142` from the branch, mirroring the git-companion workflow.
 - **No compare-and-swap (S§7.2).** There is no `--if-status open` flag and there never will
   be one; a `Response` is a snapshot with no cursor back into the doc, edits merge, and
   "close only if still open" is inexpressible. Stated here so nobody adds optimistic
@@ -179,7 +189,7 @@ connections over the one socket:
 - **Subscribe channel:** one long-lived connection carrying the live doorbell stream. This is
   the one Layer-B addition the TUI needs (S§7):
 
-  > **`Subscribe { since: u64 }`  [new]** — turns the one-shot handler into a **streaming
+  > **`Subscribe { since: u64 }`** — turns the one-shot handler into a **streaming
   > mode**: the daemon reads the request, then instead of returning after one response, parks
   > on the `EventLog` `Notify` and writes newline-delimited **`Doorbell` frames** until the
   > client hangs up or the daemon stops. Mechanically it is the existing `Wait` loop
@@ -450,23 +460,24 @@ The UI must make the CRDT's honest limitations legible rather than hiding them:
 - **Attribution is advisory (A§ non-goal 6).** Authorship (`createdBy`, comment authors) is
   shown as data, not a verified badge; the UI does not imply cryptographic provenance.
 
-## 8. Forward hooks (P1+) — named, slotted, not built
+## 8. Forward hooks (P1+) — slotted onto the P0 grammar
 
-The P0 surface is designed so later phases **add panels and columns, never reshape the
-grammar**. Where each lands:
+The P0 surface was designed so later phases **add panels and columns, never reshape the
+grammar** — and that held: P1 (live sync/presence) and P3 (membership) landed without
+touching the issue grammar. Where each attaches:
 
 - **P1 — live sync & presence.** A status bar gains a **sync indicator** (peers online,
   catalog-head freshness, "syncing N docs") fed by the existing presence/gossip events
-  (A§8); `who`/`invite`/`connect` (already in the skeleton) become the TUI's peers panel.
+  (A§8); `who`/`invite`/`connect` become the TUI's peers panel.
   No new issue grammar — sync is ambient.
 - **P1/P2 — receipts & tiers ([`HARDENING.md`]).** `send`/`ack`/`receipts`/`focus` and the
   tier ladder (`ambient…interrupt`) attach to the **activity/notification** surface, not the
   issue model: `watch --min-tier/--on-interrupt` is the CLI teeth; the TUI shows receipt
   badges (`✓delivered ✓seen ✓acked`) and honors `mute_below`. Designed there, slotted here.
-- **P3 — membership UI.** A **members view** over `Catalog.acl` (S§6): roles, add/remove,
-  key rotation — read-only until the signed-op grammar lands, then `MemberAdd/Remove`,
-  `KeyRotate` (S§7). The ACL is the only signed structure, so this view is the only one
-  showing verified identity. Join-request approval rides on the same op-graph: `members
+- **P3 — membership UI (landed).** A **members view** over `Catalog.acl` (S§6): roles,
+  add/remove, key rotation, driven by `MemberAdd/Remove`, `KeyRotate` (S§7). The ACL is
+  the only signed structure, so this view is the only one showing verified identity.
+  Join-request approval rides on the same op-graph: `members
   requests` lists announced joiners (authenticated key + an *unverified* nick claim) and
   `members approve <prefix|key> [--as <name>]` signs the `AddMember` op — resolving
   **key-first**, never by the self-asserted nick (an unauthenticated name must not select
@@ -482,7 +493,7 @@ grammar**. Where each lands:
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces
   never drift. TUI polish (themes, resize, wide-table horizontal scroll) is P4.
 
-## 9. Open decisions (mirror of A§14 / S§10)
+## 9. Decisions — settled (mirror of A§14 / S§10)
 
 - **§4 TUI substrate — ratatui** (default, agreed) vs any other Rust TUI lib. Settled.
 - **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Both
@@ -561,5 +572,5 @@ grammar**. Where each lands:
 
 **Companion sources:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) (A§) ·
 [`SCHEMA.md`](./SCHEMA.md) (S§) · [`HARDENING.md`](./HARDENING.md) (receipts/tiers) ·
-[ratatui](https://ratatui.rs) · existing `src/control.rs`, `src/cli.rs` (the skeleton this
-extends).
+[`GUIDED-JOIN.md`](./GUIDED-JOIN.md) (onboarding) · [ratatui](https://ratatui.rs) ·
+`src/control.rs`, `src/cli.rs`, `src/tui/`.

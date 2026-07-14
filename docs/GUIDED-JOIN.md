@@ -1,5 +1,10 @@
 # Guided join — the first-invite verifier
 
+> **Status:** shipped in v0.4.7. Both halves below — the `lait doctor` verifier and
+> the directory fix — are implemented and covered by `tests/guided_join.rs`. Companion
+> to [`ARCHITECTURE.md`](./ARCHITECTURE.md) (A§), [`SCHEMA.md`](./SCHEMA.md) (S§), and
+> [`UI.md`](./UI.md) (U§).
+
 ## Problem
 
 "Accept the invite and get to work" is the pitch; the reality is a chain of ~10

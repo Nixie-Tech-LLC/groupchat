@@ -1,5 +1,11 @@
 # Hardening: delivery, acknowledgment, and urgency tiers
 
+> **Status:** design proposal — **not yet built** (a deferred P4 hardening item, see
+> [`ROADMAP.md`](./ROADMAP.md)). This specifies the agent-messaging receipt/tier model;
+> the wire types and daemon plumbing below do not exist in the code yet. Companion to
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) (A§) and [`UI.md`](./UI.md) (U§8, where the TUI
+> surface is slotted).
+
 ## The problem
 
 N-way group chat works (it's a gossip topic — `send` reaches everyone). But when

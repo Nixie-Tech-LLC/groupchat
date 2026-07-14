@@ -42,9 +42,7 @@ enum View {
     Activity,
     Detail,
     Members,
-    /// The guided-join verifier panel (the onboarding gate readout).
     Doctor,
-    /// The joined-workspace selector (which directory holds which board).
     Workspaces,
     Help,
 }

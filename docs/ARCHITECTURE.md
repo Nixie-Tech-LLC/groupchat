@@ -1,10 +1,12 @@
 # Architecture & Plan — lait: a P2P issue tracker
 
-> **Status:** design draft, pre-build. Native Rust. Loro CRDT, git-backed store,
-> iroh P2P propagation. Built **functionality-first** (see [§13](#13-phased-build-plan)).
-> Supersedes the current chat-oriented `lait` code; keeps the name + iroh
-> foundation. The sync/catalog/index design (§5–§10) is validated against Loro's real
-> API and Beelay's implementation (see [§15](#15-decision-log) for sources).
+> **Status:** implemented (v0.4.8) — P0–P3 done and verified multi-node, P4 shipping;
+> this is the design of record. Native Rust. Loro CRDT, git-backed store, iroh P2P
+> propagation. Built **functionality-first** (see [§13](#13-phased-build-plan)). This
+> superseded the earlier chat-oriented `groupchat` code — keeping the iroh foundation
+> and, since the v0.4.0 rename, the name `lait`. The sync/catalog/index design (§5–§10)
+> was validated against Loro's real API and Beelay's implementation (see
+> [§15](#15-decision-log) for sources).
 
 ## 1. What this is
 
@@ -24,7 +26,7 @@ Git is the **durable local store, never the sync transport.** This is *not* git-
 issues are Loro CRDT documents, propagated P2P over iroh; git holds each node's durable
 copy and its persisted view of the shared root of trust (the genesis keys, [§6](#6-git-backed-store--trust-root)).
 
-### Kept from today's lait
+### Kept from the chat-era foundation
 iroh endpoint + `EndpointId` (ed25519 identity) · iroh-gossip topic (→ per-workspace
 announce/presence) · direct QUIC streams on a custom ALPN (→ pairwise Loro sync) ·
 iroh-blobs (→ attachments/snapshots) · `SignedMessage` sign/verify primitive (→ signed
@@ -346,17 +348,18 @@ VMs double as durable seed peers.
 
 No P1 wire rework is needed at P2/P3: formats are forward-compatible from the start (§10).
 
-## 14. Open decisions
+## 14. Decisions & open questions
 
-- **Which security design** to adapt at P3 (Beelay-ported / Keyhive-BeeKEM / Loro %ELO) —
-  deferred; all research-grade.
-- **UI surface beyond TUI** (Tauri vs local-web) — decide before/at P4.
-- **Naming** — "lait" is kept (fits a rapid-feedback tool).
-- **Validate before building (from the substrate research):** (a) two peers that
-  `shallow_snapshot` at *different* frontiers must still merge — confirm and test; (b)
-  `find_id_spans_between` / catalog-diff cost at thousands of docs; (c) whether per-`(peerId)`
-  run chunking maps cleanly onto Loro's `updates_in_range` export for the §10 envelope, or
-  needs custom framing.
+- **Which security design** to adapt (Beelay-ported / Keyhive-BeeKEM / Loro %ELO) —
+  **resolved for P3:** the simpler X25519 **sealed-box** distribution is used; a CGKA
+  (BeeKEM) key-agreement upgrade remains deferred (all research-grade).
+- **UI surface beyond TUI** (Tauri vs local-web) — still open; decide at/after P4.
+- **Naming** — **resolved:** `lait` (the v0.4.0 rename from `groupchat`).
+- **Validated during P0/P1 (from the substrate research):** (a) two peers that
+  `shallow_snapshot` at *different* frontiers still merge — confirmed, with the divergent
+  double-trim boundary handled by seed backfill; (b) `find_id_spans_between` / catalog-diff
+  cost at thousands of docs — measured; (c) whether per-`(peerId)` run chunking maps onto
+  Loro's `updates_in_range` export for the §10 envelope stays open, deferred with P2.
 
 ## 15. Decision log
 

@@ -1,11 +1,11 @@
 # Schema — lait data shapes
 
-> **Status:** design draft, pre-build. Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md);
-> section refs like (A§5) point there. Defines the concrete data shapes across three
-> layers and — more importantly — **what authority each field carries** and **which tool
-> enforces which invariant**. Where a shape is still a live decision it is flagged
-> **[DECISION]** with the chosen default in bold; flip any of them without reshaping the
-> rest.
+> **Status:** implemented (v0.4.8, `schemaVersion = 1`); this is the design of record.
+> Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md); section refs like (A§5) point
+> there. Defines the concrete data shapes across three layers and — more importantly —
+> **what authority each field carries** and **which tool enforces which invariant**.
+> Shapes that were live decisions are flagged **[DECISION]** with the **shipped default**
+> in bold; each is stated so it could be flipped without reshaping the rest.
 
 ## 1. Scope & the three-layer rule
 
@@ -331,6 +331,7 @@ enum Request {
   Label     { reff: Ref, add: Vec<Ref>, remove: Vec<Ref> },
   Comment   { reff: Ref, body: String },
   IssueView { reff: Ref },                          // lazy-loads the issue doc
+  IssueDelete { reff: Ref },                         // tombstone (§5.6)
   List      { project: Option<Ref>, filter: Filter },   // served from Catalog cache only
   Board     { project: Ref },
   History   { reff: Ref },                           // derived from Loro op history
@@ -338,8 +339,10 @@ enum Request {
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
   Wait      { since: u64, timeout_ms: u64 },         // kept verbatim (one-shot long-poll)
   Subscribe { since: u64 },                          // §7.5 — streaming doorbells for the TUI
-  // P1+: Invite, Join, Connect, Peers, Sync   // P3: MemberAdd/Remove, KeyRotate
-  Status, Stop,
+  Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
+  // transport (P1): Invite, Join, Connect, Who, SeedAdd/List/Remove
+  // membership (P3): MemberAdd/Remove, KeyRotate, Members, MemberRequests/Approve/Alias
+  Status, Id, Stop,
 }
 
 // snapshot projections (stable, versioned — NOT a dump of Layer A)
@@ -449,7 +452,7 @@ after it ships — the old ops live forever. Rules:
 4. **Renames are migrations,** written as ops (new key populated from old, old tombstoned),
    never edits to history.
 
-## 10. Open decisions (mirror of A§14)
+## 10. Decisions — shipped defaults (mirror of A§14)
 
 - **§5.1** `title` — **LWW value** (default) vs `LoroText`.
 - **§5.2** `assignees`/`labels` removal — **delete-key** (default) vs `false` tombstone.
