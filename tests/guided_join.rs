@@ -402,13 +402,17 @@ fn stop_kills_the_daemon_even_with_a_live_subscriber() {
     // daemon's stream task is provably inside its shutdown/doorbell select.
     let rt = rt();
     let _sub = rt.block_on(async {
-        let mut sub = lait::control::subscribe(&d.home, 0).await.expect("subscribe");
+        let mut sub = lait::control::subscribe(&d.home, 0)
+            .await
+            .expect("subscribe");
         sub.next().await.expect("first frame").expect("reset frame");
         sub
     });
 
     assert!(matches!(req(&d.home, Request::Stop), Response::Ok { .. }));
-    let exited = poll_until(Duration::from_secs(10), || d.child.try_wait().ok().flatten());
+    let exited = poll_until(Duration::from_secs(10), || {
+        d.child.try_wait().ok().flatten()
+    });
     assert!(
         exited.is_some(),
         "daemon must exit after stop even with a live subscriber"
