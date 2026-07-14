@@ -22,6 +22,7 @@ pub mod acl;
 pub mod app;
 pub mod catalog;
 pub mod cli;
+pub mod cmdspec;
 pub mod config;
 pub mod control;
 pub mod crypto;
