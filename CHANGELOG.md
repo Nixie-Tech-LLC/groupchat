@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — workspace & project re-architecture (BREAKING)
+
+> **Clean break.** Stores, invite tickets, and the wire protocol all changed;
+> old and new nodes cannot see each other (new gossip topics + ALPN bumps
+> `lait/sync/1`, `lait/presence/1`). **Every node must re-init (founders) or
+> re-join from a fresh invite (everyone else).** Pre-rewrite `.lait/` stores and
+> tickets are not migrated.
+
+Five early decisions were removed at the root instead of guarded (see
+`ARCHITECTURE.md` §15 and `GUIDED-JOIN.md`):
+
+- **Workspaces are founded explicitly.** `lait init [--name]` is the founding
+  verb: it mints the genesis here, names the workspace (default: the directory),
+  and **seeds a first project** so `lait new` works on the very next command.
+  Nothing creates a store implicitly anymore — a command in a directory with no
+  workspace errors with guidance instead of silently minting a decoy store (the
+  old lazy mint created a genesis + sealed key as a side effect of `lait ls` in
+  the wrong folder).
+- **The gossip topic derives from the workspace id.** The chat-era "room" string
+  (folder-seeded, drift-prone, three self-heal layers) is gone; the display name
+  is a synced, cosmetic catalog field — renaming never re-topics and never
+  invalidates tickets. `profile.json` is retired. Tickets are now
+  `WorkspaceTicket { workspace, name, host, host_nick, invite }`; old tickets
+  fail to parse with an "ask for a fresh one" hint.
+- **`lait join` bootstraps the store client-side** (cwd or `--dir`) from the
+  ticket before the daemon ever runs, so a daemon only opens a store already
+  bound to the right workspace. Joining from a directory bound to a *different*
+  workspace is a hard exit-2 error — the old silent adopt-if-empty /
+  split-brain-if-not heuristic is deleted. `remote add` with a foreign-workspace
+  ticket now errors ("join it first").
+- **`lait workspaces` is complete and live.** The registry is written by
+  `init`, `join`, and every daemon open — founders finally register. Rows carry
+  name, origin (founded/joined), advisory project keys, and `ls` probes live
+  status (`up`/`idle`/`missing`); `forget` deregisters, `prune` drops missing
+  entries. A new global **`-w <name|ws_id|path>`** selector targets any
+  registered workspace from any directory.
+- **`lait config`** — git-style layered local settings: global + per-store
+  `config.json`, store wins. Keys: `user.nick` (set applies live to a running
+  daemon via a new `ConfigReload` request — never a silent wait-for-restart) and
+  `project.default`; the `workspace.*` namespace is reserved for future synced
+  settings. `lait init`'s old settings-editor role (and the `--room` footgun
+  that silently re-topiced a live workspace) is gone.
+- **Project defaulting that matches how you work.** `new`/`board` resolve their
+  project through a fixed chain: explicit `-p` → the git branch's project key
+  (`eng-142-fix` → `ENG`, used only if it resolves) → `project.default` →
+  the sole project → a teaching error. `board`'s positional is now optional;
+  `ls -p` stays a pure filter; `move -p` stays explicit-only. Project keys are
+  validated (1–8 ASCII letters) so `KEY-n` aliases and branch inference stay
+  parseable.
+
 ## v0.4.8 — Windows self-update fix
 
 - **`lait update` works on Windows again.** cargo-dist ships the binary **flat**

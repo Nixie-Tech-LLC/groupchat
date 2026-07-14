@@ -85,8 +85,8 @@ pub struct DiagnosisView {
 pub struct DiagnoseInput<'a> {
     /// The workspace id this store is bound to, if any (`None` before genesis).
     pub workspace: Option<&'a str>,
-    /// The gossip room / topic name (the folder name by default).
-    pub room: &'a str,
+    /// The workspace's synced display name (may be empty on a pre-sync joiner).
+    pub name: &'a str,
     /// This node's ACL standing: `admin` | `member` | `pending`.
     pub membership: &'a str,
     /// Count of currently-online peers.
@@ -113,16 +113,19 @@ pub fn diagnose(input: DiagnoseInput<'_>) -> DiagnosisView {
             "workspace",
             GateState::Fail,
             format!(
-                "this directory is workspace {bound} (room {}), but the invite is for {exp} \
-                 — you're in a different store; cd to where you ran `lait join`",
-                input.room
+                "this directory is workspace {bound}, but the invite is for {exp} \
+                 — you're in a different store; cd to where you ran `lait join`, or target it with `-w`"
             ),
         ),
         _ => DiagnosisGate::new(
             "workspace",
             "workspace",
             GateState::Pass,
-            format!("{bound}  (room {})", input.room),
+            if input.name.is_empty() {
+                bound.to_string()
+            } else {
+                format!("{bound}  ('{}')", input.name)
+            },
         ),
     };
 
@@ -274,7 +277,7 @@ mod tests {
     fn input() -> DiagnoseInput<'static> {
         DiagnoseInput {
             workspace: Some("ws_A"),
-            room: "lait",
+            name: "lait",
             membership: "member",
             online_peers: 1,
             projects: 2,

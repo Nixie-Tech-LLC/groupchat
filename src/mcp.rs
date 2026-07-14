@@ -94,7 +94,8 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
 pub struct IssueNewArgs {
     /// Issue title.
     pub title: String,
-    /// Project ref (key like `ENG` or a `prj_` id). Optional if there is one.
+    /// Project ref (key like `ENG` or a `prj_` id). Optional — falls back to
+    /// the store's configured `project.default`, then the sole project.
     #[serde(default)]
     pub project: Option<String>,
     /// Assignee refs (`@me`, or a 64-hex key).
@@ -181,8 +182,10 @@ pub struct ListArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BoardArgs {
-    /// Project ref (key or `prj_` id).
-    pub project: String,
+    /// Project ref (key or `prj_` id). Optional — falls back to the store's
+    /// configured `project.default`, then the sole project.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -313,6 +316,9 @@ impl LaitMcp {
         self.run(Request::IssueNew {
             title: a.title,
             project: a.project,
+            // Agents have no git branch context — the environment hint is a
+            // CLI-only input; MCP always sends none.
+            project_hint: None,
             assignees: a.assignees,
             priority: a.priority,
             labels: a.labels,
@@ -423,7 +429,11 @@ impl LaitMcp {
         &self,
         Parameters(a): Parameters<BoardArgs>,
     ) -> Result<CallToolResult, McpError> {
-        self.run(Request::Board { project: a.project }).await
+        self.run(Request::Board {
+            project: a.project,
+            project_hint: None,
+        })
+        .await
     }
 
     #[tool(description = "An issue's derived activity/time-travel feed.")]
@@ -580,7 +590,11 @@ impl LaitMcp {
         .await
     }
 
-    #[tool(description = "Join a workspace from a ticket and broadcast a request to be added.")]
+    #[tool(
+        description = "Connect to the bound workspace via a ticket for it and broadcast a request \
+                       to be added. MCP runs against an already-bound store: a ticket for a \
+                       different workspace errors (join it with the CLI first)."
+    )]
     async fn join_room(
         &self,
         Parameters(a): Parameters<JoinArgs>,

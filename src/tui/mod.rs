@@ -100,6 +100,9 @@ struct App {
     prev_view: View,
     projects: Vec<ProjectDto>,
     project_idx: usize,
+    /// Whether the configured `project.default` was applied to `project_idx`
+    /// (first successful project load only — Tab cycling then owns it).
+    applied_default_project: bool,
     board: Option<BoardView>,
     list: Vec<Row>,
     col_idx: usize,
@@ -128,6 +131,7 @@ impl App {
             prev_view: View::Board,
             projects: Vec::new(),
             project_idx: 0,
+            applied_default_project: false,
             board: None,
             list: Vec::new(),
             col_idx: 0,
@@ -202,6 +206,21 @@ impl App {
             if self.project_idx >= self.projects.len() {
                 self.project_idx = 0;
             }
+            // First load: land on the configured `project.default` when set.
+            if !self.applied_default_project {
+                self.applied_default_project = true;
+                if let Some(dflt) =
+                    crate::config::Settings::load(Some(&self.home)).default_project()
+                {
+                    if let Some(i) = self
+                        .projects
+                        .iter()
+                        .position(|p| p.key.eq_ignore_ascii_case(&dflt))
+                    {
+                        self.project_idx = i;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -211,7 +230,13 @@ impl App {
             self.board = None;
             return Ok(());
         };
-        match self.req(Request::Board { project: p }).await? {
+        match self
+            .req(Request::Board {
+                project: Some(p),
+                project_hint: None,
+            })
+            .await?
+        {
             Response::Board(b) => {
                 self.board = Some(*b);
                 self.clamp_selection();
@@ -502,6 +527,7 @@ async fn submit_modal(app: &mut App, modal: Modal) -> Result<()> {
             Request::IssueNew {
                 title: buf,
                 project,
+                project_hint: None,
                 assignees: vec![],
                 priority: None,
                 labels: vec![],
@@ -785,7 +811,9 @@ fn effective_title(app: &App, row: &Row) -> String {
 fn draw_board(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let Some(b) = &app.board else {
         f.render_widget(
-            Paragraph::new("(no project — create one with the CLI: `lait projects new`)"),
+            Paragraph::new(
+                "(no projects visible yet — still syncing, or create one: `lait projects new`)",
+            ),
             area,
         );
         return;
@@ -1057,8 +1085,14 @@ fn draw_workspaces(f: &mut ratatui::Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
+        let name = if e.name.is_empty() {
+            "(unnamed)"
+        } else {
+            e.name.as_str()
+        };
+        let short: String = e.workspace.chars().take(12).collect();
         lines.push(Line::styled(
-            format!("{marker}{}  room {}{}", e.workspace, e.room, nick),
+            format!("{marker}{name}  {short}  {}{nick}", e.origin),
             style,
         ));
         lines.push(Line::styled(

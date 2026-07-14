@@ -40,8 +40,8 @@ One binary, four surfaces, sharing one persistent node:
 
 - `lait daemon` — the long-lived node: **owns the Loro documents** (a
   per-workspace catalog + one doc per issue) over a **git-backed durable store**,
-  plus the iroh endpoint (an ed25519 `EndpointId` identity), a signed-gossip room
-  for announce/presence, and a local control channel. Auto-spawned on first use.
+  plus the iroh endpoint (an ed25519 `EndpointId` identity), a signed-gossip
+  topic for announce/presence, and a local control channel. Auto-spawned on first use.
 - `lait <cmd>` — the CLI: flat verbs act on issues (`new`, `edit`, `move`,
   `assign`, `label`, `comment`, `show`, `ls`, `board`, `history`), plural nouns
   manage registries (`projects`, `labels`). `--json` emits a stable, versioned
@@ -56,16 +56,19 @@ friendly `KEY-n` alias (`ENG-142`). Refs resolve daemon-side; an ambiguous ref
 returns a candidate list, not an error. Boards render from the catalog cache
 (no per-issue loads), so a large workspace still paints instantly.
 
-State lives under `$LAIT_HOME` (or the platform config dir): `secret.key`,
-`profile.json`, and a `repo/` git store (`genesis.json`, `catalog.loro`,
-`docs/<id>.loro`). Only public keys and Loro snapshots are stored — never secrets.
+State lives in a per-repo `.lait/` store (or a self-contained `$LAIT_HOME`):
+`config.json` (local settings) and a `repo/` git store (`genesis.json`,
+`catalog.loro`, `docs/<id>.loro`); one global `secret.key` identity spans every
+store. Only public keys and Loro snapshots are stored — never secrets. Stores are
+created **only** by `lait init` (found) or `lait join` (from an invite) — nothing
+mints one implicitly.
 
 ### How it maps to iroh
 
 | Piece | Mechanism |
 |---|---|
 | Identity / handle | a persistent `EndpointId` (ed25519 public key) |
-| The room / workspace | an `iroh-gossip` topic (derived from the room name) |
+| The workspace | an `iroh-gossip` topic (derived from the workspace id) |
 | Announce + presence | signed gossip heartbeats + neighbor events + a `Bye` on shutdown |
 | Liveness probe | a direct QUIC handshake on a custom ALPN |
 | Signed messages | ed25519 `SignedMessage` sign/verify (→ signed membership ops later) |
@@ -148,17 +151,23 @@ A dev binary reports its commit so it's unmistakable from a tagged release:
 ## Quickstart (the tracker)
 
 ```bash
-lait projects new "Engineering" --key ENG   # create a project
-lait new "fix login race" -p ENG -P high     # → prints iss_… (and ENG-1)
-lait new "add dark mode"  -p ENG -P low
-lait board ENG                               # workflow columns × ordered rows
-lait edit ENG-1 --status in_progress         # refer by KEY-n or iss_ prefix
-lait assign ENG-1 @me
-lait comment ENG-1 "looking into it"
-lait show ENG-1                              # full issue: body, comments, meta
+cd my-project
+lait init                                    # found a workspace here (named after the
+                                             # directory, first project seeded)
+lait new "fix login race" -P high            # → prints iss_… (and e.g. MP-1)
+lait new "add dark mode"  -P low
+lait board                                   # workflow columns × ordered rows
+lait projects new "Design" --key DSN         # more projects when you need them
+lait edit MP-1 --status in_progress          # refer by KEY-n or iss_ prefix
+lait assign MP-1 @me
+lait comment MP-1 "looking into it"
+lait show MP-1                               # full issue: body, comments, meta
 lait ls --mine                               # your open issues
 lait activity                                # workspace transition feed
 lait tui                                     # full-screen interactive board
+lait workspaces                              # every workspace on this machine
+lait -w my-project board                     # target a workspace from anywhere
+lait config set project.default DSN          # default project for `new`/`board`
 ```
 
 Scripts capture the resolved handle from `--json`:
@@ -199,9 +208,9 @@ lait edit --status in_progress
 
 | Command | Description |
 |---|---|
-| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | Create an issue |
-| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | List rows from the catalog cache |
-| `board <PROJ>` | Render the project's board |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | Create an issue (`-p` optional: branch key → `project.default` → sole project) |
+| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | List rows from the catalog cache (`-p` is a pure filter) |
+| `board [PROJ]` | Render a project's board (positional optional, same chain as `new`) |
 | `show <ref>` | Full issue (lazily loads the issue doc) |
 | `edit <ref> [--title T] [--status S] [--priority P]` | Patch LWW fields (one activity row) |
 | `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | Set project and/or board order |
@@ -215,18 +224,22 @@ Registries + node:
 
 | Command | Description |
 |---|---|
+| `init [--name N] [--nick N]` | Found a workspace here (mints the genesis, seeds a first project) |
+| `workspaces [ls \| forget <sel> \| prune]` | Every workspace on this machine: name, origin, status, path |
+| `config [get \| set \| unset \| ls]` | Layered local settings (`user.nick`, `project.default`); store wins over global |
 | `projects [new <name> --key KEY \| ls]` | Manage the project registry |
 | `labels [new <name> --color C \| ls]` | Manage the label registry |
 | `members [add \| remove \| requests \| approve \| name \| rotate-key \| ls]` | Manage E2EE membership (signed ACL); `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local label for a key |
 | `activity [--since N]` | Workspace-wide recent transitions |
 | `tui` | Launch the full-screen board |
 | `status` · `id` · `stop` | Node/workspace status · endpoint id · stop daemon |
-| `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join` | Invite a teammate; the default pass admits them on `join` (add `--require-approval` for the gated `members requests`/`members approve` flow) |
+| `invite [--require-approval] [--reusable] [--ttl-hours N]` · `join <link> [--dir D]` | Invite a teammate; `join` creates the joiner's store (cwd or `--dir`) and the default pass admits them automatically (add `--require-approval` for the gated `members requests`/`members approve` flow) |
 | `who` · `watch` | Peers online · follow the event stream |
 | `profiles` / `resume <name>` | List profiles / switch to a named profile (each a separate identity + store) |
 
-Global flags: `--home DIR`, `--json`, `--no-color`. Exit codes: `0` ok · `1`
-usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
+Global flags: `--home DIR`, `-w SEL` (target a workspace by name/id/path from any
+directory), `--json`, `--no-color`. Exit codes: `0` ok · `1` usage/error · `2` ref
+not found / ambiguous · `3` daemon unreachable.
 
 ## Use from an AI agent (MCP)
 
@@ -272,7 +285,8 @@ board after a single `join` — no separate approval round-trip:
 # host — mint an invite link (carries the workspace, genesis, and a single-use pass)
 lait invite                        # → a link (+ a scannable QR); send it over
 
-# teammate — join from the link; the pass admits you automatically
+# teammate — join from the link (creates the store in the cwd, or pass --dir);
+# the pass admits you automatically
 lait join <INVITE> --nick bob
 lait status                        # you: member   ← board decrypts and syncs
 
@@ -307,9 +321,12 @@ portable seed that backfills cold clients.
 
 ## Running several nodes on one machine
 
-Set a distinct `LAIT_HOME` per node:
+Set a distinct `LAIT_HOME` per node — one founds, the other joins from the invite
+(there is no shared "room name": the gossip topic derives from the workspace id
+carried in the ticket):
 
 ```bash
-LAIT_HOME=/tmp/alice lait init --nick alice --room demo
-LAIT_HOME=/tmp/bob   lait init --nick bob   --room demo
+LAIT_HOME=/tmp/alice lait init --name demo --nick alice
+LAIT_HOME=/tmp/alice lait invite                       # → <INVITE>
+LAIT_HOME=/tmp/bob   lait join <INVITE> --nick bob
 ```

@@ -100,6 +100,7 @@ project/label config, board ordering, and the signed ACL log. Container-by-conta
 Catalog (root LoroMap)
   schemaVersion : value<u32>                         // §9 evolution gate
   workspaceId   : value<WorkspaceId>
+  name          : value<string>                      // display name — LWW, cosmetic (§4.1)
   docs      : LoroMap<DocId, DocMeta>                // authoritative *existence* set
   projects  : LoroMap<ProjectId, Project>
   boards    : LoroMap<ProjectId, LoroMovableList<DocId>>   // native board ORDER only
@@ -138,6 +139,17 @@ Project { id, workspaceId, name, key: string, color }   // key = the ENG in ENG-
 Label   { id, name, color }
 WorkflowState { id: StatusId, name, category: "backlog"|"active"|"done", color }
 ```
+
+### 4.1 Workspace `name` — cosmetic, never network identity
+
+The display name is a plain LWW register in the Catalog: set at founding (`lait init
+--name`, default the directory name), renameable later, synced like any config field.
+It carries **no authority and no network meaning** — the gossip topic derives from the
+`WorkspaceId` (`topic_for_workspace`, a domain-separated blake3 of the id), so renaming
+never re-topics a live workspace and never invalidates tickets. This deliberately
+replaces the retired "room" string (a folder-seeded name that doubled as the topic and
+could drift; see the decision log). A fresh joiner's catalog is empty until the
+founder's ops arrive, so the name may legitimately read as empty pre-sync.
 
 ## 5. Layer A — Issue document
 
@@ -292,7 +304,7 @@ InviteGrant {
   expires_at : u64,           // unix seconds; the redeemer checks freshness
   single_use : bool,          // one redemption vs. valid-until-expiry (a team link)
 }
-SignedInvite { issuer: PublicKey, grant: bytes(InviteGrant), sig }   // rides in the RoomTicket
+SignedInvite { issuer: PublicKey, grant: bytes(InviteGrant), sig }   // rides in the WorkspaceTicket
                                                                      // + the gossip JoinRequest
 ```
 
@@ -323,8 +335,9 @@ Newline-delimited JSON over the Unix socket, same transport as today. This is an
 ```rust
 // commands
 enum Request {
-  IssueNew  { title, project: Option<Ref>, assignees: Vec<UserRef>,
-              priority: Option<Priority>, labels: Vec<Ref>, body: Option<String> },
+  IssueNew  { title, project: Option<Ref>, project_hint: Option<String>,
+              assignees: Vec<UserRef>, priority: Option<Priority>,
+              labels: Vec<Ref>, body: Option<String> },
   IssueEdit { reff: Ref, patch: IssuePatch },      // title/status/priority
   IssueMove { reff: Ref, project: Option<Ref>, pos: Option<BoardPos> },
   Assign    { reff: Ref, who: Vec<UserRef>, add: bool },
@@ -333,12 +346,13 @@ enum Request {
   IssueView { reff: Ref },                          // lazy-loads the issue doc
   IssueDelete { reff: Ref },                         // tombstone (§5.6)
   List      { project: Option<Ref>, filter: Filter },   // served from Catalog cache only
-  Board     { project: Ref },
+  Board     { project: Option<Ref>, project_hint: Option<String> },   // §7.6 chain
   History   { reff: Ref },                           // derived from Loro op history
   ProjectNew{ name, key }, ProjectList, LabelNew{ name, color }, LabelList,
   Activity  { since: u64 },                          // ex-Log; the feed is PULLED, §7.5
   Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
   Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
+  ConfigReload,                                      // transport-plane; re-read local settings
   // transport (P1): Invite, Join, Connect, Who, SeedAdd/List/Remove
   // membership (P3): MemberAdd/Remove, KeyRotate, Members, MemberRequests/Approve/Alias
   Status, Id, Stop,
@@ -415,6 +429,27 @@ struct Doorbell {
 `Ref` and `UserRef` are resolved daemon-side: a `Ref` accepts a short `DocId` prefix, a
 `KEY-n` alias, or a project key; a `UserRef` accepts `@me`, a nick, or a key.
 
+### 7.6 The choose-project chain (`new` / `board`)
+
+Commands that need one *target/view* project resolve it daemon-side in a fixed
+precedence, in `Tracker::choose_project`:
+
+1. **explicit** `-p` / positional — a miss is a hard error ("user said X");
+2. **`project_hint`** — the project KEY the CLI extracted from the git branch
+   (`eng-142-fix` → `ENG`). Used **only if it resolves** to a real project;
+   otherwise it falls through silently ("environment suggests X" must never
+   break a command). MCP always sends `None` (agents have no branch);
+3. **`project.default`** — the store-config key, read fresh per request (no
+   boot cache, no reload protocol needed). Set-but-stale is a **hard error**
+   naming the fix (a user-chosen setting must not silently rot);
+4. **the sole project** when exactly one exists;
+5. a teaching error listing the keys and the `lait config set project.default`
+   one-liner.
+
+The two hint-free commands are deliberate: `ls -p` is a **pure filter** (a
+defaulted filter silently hides issues), and `move -p` is **explicit only**
+(a silently-inferred membership write is data damage).
+
 ## 8. Layer C — git repo layout & iroh framing
 
 **git = durable local store, never sync transport (A§6).** One repo per node:
@@ -430,6 +465,37 @@ struct Doorbell {
 
 Only **public keys, signed ops, and Loro snapshots/updates** — **never secrets** (A§6).
 Commit boundaries are durability points, not sync units.
+
+**Store creation is explicit.** A `<repo>` (a `.lait/` home) is born only in `lait init`
+(founding: genesis minted here, first project seeded) or `lait join` (bootstrap from a
+ticket: the ticket's genesis + **empty** catalog/membership docs, so importing the
+founder's ops adopts identical container ids). Nothing else creates one; a command in a
+store-less directory errors with guidance. `Tracker::open` on an uninitialized store is
+an error, never a founding event.
+
+### 8.1 Machine-level local files (not Layer A — never synced, never trusted)
+
+Under the platform config root, beside the global `secret.key`:
+
+```
+workspaces.json    // the workspace registry: [{ workspace, name, path,
+                   //   origin: "founded"|"joined", host_nick, last_opened,
+                   //   projects: [{key,name}] }]
+                   // written by init / join / every daemon open; pure navigation
+                   // state (powers `lait workspaces` + `-w`); advisory `name`/
+                   // `projects` snapshots; corrupt/absent ⇒ "no known workspaces"
+config.json        // global settings layer (flat string map)
+```
+
+Inside each store home: `config.json` — the store settings layer. `lait config` fronts
+the two layers git-style (store wins). Closed key table: `user.nick` (global+store,
+daemon-read → best-effort `ConfigReload` on set), `project.default` (store-only, read
+lazily per request, §7.6). The `workspace.*` namespace is **reserved** for future
+settings that sync through the Catalog. The old per-store `profile.json` is retired.
+
+**Ticket (wire, base32):** `WorkspaceTicket { workspace, name, host, host_nick,
+invite: Option<SignedInvite> }` — the topic is derived (`topic_for_workspace`), never
+shipped; `name` is a cosmetic preview for the joiner.
 
 **iroh framing (P1+, A§8):**
 - gossip announce / presence heartbeat: `{ workspaceId, catalogHead }` ("I have changes").
@@ -469,3 +535,11 @@ after it ships — the old ops live forever. Rules:
   pulled activity feed. See `UI.md` §4.2–§4.3.
 - **§7.5** streaming `Subscribe` + batched, project-keyed doorbells + `Reset`/`epoch`
   rebaseline; `seq` per-session, not durable (§2) (all agreed). See `UI.md` §4.1–§4.2.
+- **§4.1** network identity — **topic derives from `WorkspaceId`**; the "room" string
+  (folder-seeded, drift-prone, three heal layers) is retired; display name is a synced LWW
+  register (agreed, workspace re-architecture).
+- **§8** workspace creation — **explicit only** (`init` founds + seeds a first project;
+  `join` bootstraps from the ticket); lazy mint and join-time adoption are removed
+  (agreed, workspace re-architecture).
+- **§7.6** project defaulting — explicit > branch hint (resolve-or-skip) >
+  `project.default` (resolve-or-error) > sole project > teaching error (agreed).

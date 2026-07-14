@@ -13,8 +13,8 @@ use crate::{
     control::{self, request, ErrorKind, Event, EventKind, Request, Response},
     diagnose::{DiagnosisView, GateState},
     dto::{BoardView, IssueView, Priority, Row},
-    proto::RoomTicket,
-    workspaces::{self, WorkspaceEntry},
+    proto::WorkspaceTicket,
+    workspaces::{self, StorePresence, WorkspaceEntry},
 };
 
 /// Output mode threaded from the global `--json` / `--no-color` flags.
@@ -59,6 +59,14 @@ fn paint(on: bool, code: &str, s: &str) -> String {
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
     if request(home, &Request::Status).await.is_ok() {
         return Ok(());
+    }
+    // A daemon can only open an initialized store — fail fast with guidance
+    // instead of spawning a doomed process and timing out 20s later.
+    if !crate::store::initialized_at(home) {
+        return Err(anyhow!(
+            "no workspace at {} — found one with `lait init`, or join one with `lait join <link>`",
+            home.display()
+        ));
     }
     let exe = std::env::current_exe().context("locate own executable")?;
     // Pin the resolved store for the spawned daemon so it binds the exact same
@@ -173,7 +181,7 @@ pub async fn run_join(home: &Path, ticket: String, out: Out) -> Result<()> {
     // Parse client-side to recover the intended workspace before the ticket is
     // moved into the request. A malformed ticket simply yields no expectation; the
     // daemon returns the real parse error.
-    let parsed = ticket.parse::<RoomTicket>().ok();
+    let parsed = ticket.parse::<WorkspaceTicket>().ok();
     // A pass-carrying ticket (Pattern A) admits automatically within seconds, so
     // a pending membership is worth polling out; a pass-less ticket waits on a
     // human admin and would only stall the readout.
@@ -265,56 +273,119 @@ fn print_diagnosis_or(resp: &Response, out: Out) {
     }
 }
 
-/// `lait workspaces`: list the joined-workspace registry (store-free navigation
-/// state). Honours `--json`.
-pub fn print_workspaces(out: Out) {
+/// Live status of one registry entry: `missing` (store gone from disk), `up`
+/// (a daemon answers on its control channel), or `idle` (store present, no
+/// daemon). The probe is a short-deadline `Status` round-trip — never a spawn.
+async fn workspace_status(e: &WorkspaceEntry) -> &'static str {
+    if workspaces::presence(e) == StorePresence::Missing {
+        return "missing";
+    }
+    let up = tokio::time::timeout(
+        Duration::from_millis(300),
+        request(Path::new(&e.path), &Request::Status),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    if up {
+        "up"
+    } else {
+        "idle"
+    }
+}
+
+/// `lait workspaces`: every workspace on this machine (founded and joined),
+/// with live status. Honours `--json`.
+pub async fn print_workspaces(out: Out) {
     let entries = workspaces::list();
+    let mut statuses = Vec::with_capacity(entries.len());
+    for e in &entries {
+        statuses.push(workspace_status(e).await);
+    }
     if out.json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .zip(&statuses)
+            .map(|(e, s)| {
+                let mut v = serde_json::to_value(e).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("status".into(), serde_json::json!(s));
+                }
+                v
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::to_string(&serde_json::json!({ "workspaces": entries }))
+            serde_json::to_string(&serde_json::json!({ "workspaces": rows }))
                 .unwrap_or_else(|_| "{}".into())
         );
         return;
     }
     if entries.is_empty() {
-        println!("(no joined workspaces yet — run `lait join <link>`)");
+        println!("(no workspaces yet — `lait init` to found one, or `lait join <link>`)");
         return;
     }
-    for e in &entries {
+    for (e, status) in entries.iter().zip(&statuses) {
+        let short: String = e.workspace.chars().take(12).collect();
+        let code = match *status {
+            "up" => ansi::GREEN,
+            "idle" => ansi::DIM,
+            _ => ansi::RED,
+        };
+        let name = if e.name.is_empty() {
+            "(unnamed)"
+        } else {
+            &e.name
+        };
+        let projects = if e.projects.is_empty() {
+            String::new()
+        } else {
+            let keys: Vec<&str> = e.projects.iter().map(|p| p.key.as_str()).collect();
+            format!("  [{}]", keys.join(", "))
+        };
         let nick = if e.host_nick.is_empty() {
             String::new()
         } else {
             format!("  (from {})", e.host_nick)
         };
-        println!("{}  room {:<12}{}", e.workspace, e.room, nick);
+        println!(
+            "{name}  {short}  {}  {}{projects}{nick}",
+            e.origin,
+            paint(out.color, code, status),
+        );
         println!("  {}", paint(out.color, ansi::DIM, &e.path));
     }
 }
 
-/// The directory-trap guard message: shown when a read-only command is run in a
-/// directory with no workspace but the registry knows of ones the user joined.
-/// Points them at the real locations instead of silently binding a decoy store.
-pub fn warn_no_workspace_here(known: &[WorkspaceEntry], out: Out) {
-    eprintln!("no lait workspace in this directory — refusing to create an empty one here.");
-    eprintln!();
-    eprintln!("you've joined {} workspace(s):", known.len());
-    for e in known {
-        let nick = if e.host_nick.is_empty() {
-            String::new()
-        } else {
-            format!(" (from {})", e.host_nick)
-        };
+/// The universal "no workspace here" error: any store-needing command run in a
+/// directory with no discoverable `.lait/` gets this instead of a silently
+/// minted decoy store. Points at the creation verbs and every known workspace.
+pub fn err_no_store_here(out: Out) {
+    eprintln!("no lait workspace in this directory (nothing is created implicitly).");
+    let known = workspaces::list();
+    if !known.is_empty() {
+        eprintln!();
+        eprintln!("workspaces on this machine:");
+        for e in &known {
+            let name = if e.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &e.name
+            };
+            eprintln!(
+                "  {} {name}  \u{2192}  {}",
+                paint(out.color, ansi::DIM, "\u{2022}"),
+                e.path
+            );
+        }
+        eprintln!();
         eprintln!(
-            "  {} {}{}  \u{2192}  {}",
-            paint(out.color, ansi::DIM, "\u{2022}"),
-            e.workspace,
-            nick,
-            e.path
+            "cd into one, target one from here with `-w <name>`, or `lait workspaces` for details."
         );
+    } else {
+        eprintln!();
+        eprintln!("found a workspace here with `lait init`, or join one with `lait join <link>`.");
     }
-    eprintln!();
-    eprintln!("cd into one of those directories, or run `lait workspaces` to see them again.");
 }
 
 /// Print a response; return the process exit code it implies.
@@ -464,7 +535,13 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         Response::Status(s) => {
             println!("id:        {}", s.id);
             println!("nick:      {}", s.nick);
-            println!("workspace: {}", s.workspace.as_deref().unwrap_or("(none)"));
+            let ws_line = match (s.name.is_empty(), s.workspace.as_deref()) {
+                (false, Some(ws)) => format!("{} ({ws})", s.name),
+                (true, Some(ws)) => ws.to_string(),
+                (false, None) => s.name.clone(),
+                (true, None) => "(none)".to_string(),
+            };
+            println!("workspace: {ws_line}");
             if !s.membership.is_empty() {
                 let code = if s.membership == "pending" {
                     ansi::YELLOW
@@ -473,7 +550,6 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 };
                 println!("you:       {}", paint(out.color, code, &s.membership));
             }
-            println!("room:      {}", s.room);
             println!("issues:    {}", s.issues);
             println!("projects:  {}", s.projects);
             println!("online:    {} peer(s)", s.online_peers);
@@ -694,7 +770,7 @@ pub async fn run_invite(
         return Ok(());
     }
     let link = token
-        .parse::<RoomTicket>()
+        .parse::<WorkspaceTicket>()
         .map(|t| t.link())
         .unwrap_or_else(|_| format!("lait://join/{token}"));
     println!("{token}");

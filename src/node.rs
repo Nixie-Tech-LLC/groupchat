@@ -48,7 +48,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{acquire_daemon_lock, load_or_create_identity, Profile},
+    config::{acquire_daemon_lock, load_or_create_identity, Settings},
     control::{
         control_name, Doorbell, Event as LogEvent, EventKind, PresenceEntry, Request, Response,
         StatusInfo,
@@ -57,12 +57,12 @@ use crate::{
     ids::{SystemUlidSource, UserId},
     index::{resolve_user_dir, KnownUser, UserResolution},
     presence::PeerState,
-    proto::{topic_for_room, InviteGrant, Payload, RoomTicket, SignedInvite, SignedMessage},
+    proto::{InviteGrant, Payload, SignedInvite, SignedMessage, WorkspaceTicket},
     store::Store,
     tracker::{DirtySet, Tracker},
 };
 
-const PRESENCE_ALPN: &[u8] = b"lait/presence/0";
+const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -413,15 +413,19 @@ fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
 /// Cheaply-cloneable shared presence state.
 #[derive(Debug, Clone)]
 pub struct Shared {
-    pub nick: String,
-    /// The gossip room we're in. Mutable because `Join` **adopts** the ticket's
-    /// room — live (the topic swap in `join_topic`) *and* here, so `status`,
-    /// `doctor`, and above all `invite` report/mint the room we actually joined,
-    /// not the one the profile was seeded with.
-    pub room: Arc<Mutex<String>>,
+    /// Our display nick. Mutable so a `ConfigReload` (from `lait config set
+    /// user.nick`) applies live instead of waiting for a restart. There is no
+    /// room here: the gossip topic is a pure function of the workspace id.
+    pub nick: Arc<Mutex<String>>,
     pub my_id: EndpointId,
     pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
     pub events: Arc<Mutex<EventLog>>,
+}
+
+impl Shared {
+    fn nick(&self) -> String {
+        self.nick.lock().unwrap().clone()
+    }
 }
 
 /// The running node.
@@ -762,50 +766,25 @@ impl Node {
         Ok(())
     }
 
-    /// Adopt the ticket's room as ours — live and persisted. Joining a workspace
-    /// means living in its gossip room: without this the joiner's profile keeps
-    /// its seeded room ("default"/repo-dir), so the *next cold boot* subscribes
-    /// to the wrong topic — no peers, no presence, `doctor` waiting on a peer
-    /// forever — and any invite the joiner mints carries the wrong room onward.
-    /// Persistence is best-effort (the live topic swap already happened; a write
-    /// failure shouldn't fail the join), but it is warned, not swallowed.
-    fn adopt_room(&self, room: &str) {
-        if room.is_empty() {
-            return;
-        }
-        {
-            let mut cur = self.shared.room.lock().unwrap();
-            if *cur == room {
-                return;
-            }
-            room.clone_into(&mut cur);
-        }
-        match crate::config::Profile::load(&self.home) {
-            Ok(mut p) => {
-                p.room = room.to_string();
-                if let Err(e) = p.save(&self.home) {
-                    tracing::warn!("could not persist adopted room '{room}': {e:#}");
-                }
-            }
-            Err(e) => tracing::warn!("could not load profile to adopt room '{room}': {e:#}"),
-        }
-    }
-
-    /// Adopt a ticket's workspace (if we're empty, A§6/A§10), join its gossip
-    /// topic, announce, and eagerly pull from the host to backfill.
-    async fn adopt_and_join(self: &Arc<Self>, ticket: &RoomTicket) -> Result<()> {
-        if !ticket.workspace.is_empty() {
-            let founder = ticket.host.to_string();
-            let _ = self
-                .tracker
-                .lock()
-                .unwrap()
-                .adopt_workspace(&ticket.workspace, &founder);
+    /// Connect to the bound workspace's mesh through a ticket: join the topic,
+    /// broadcast our join request, announce, and eagerly pull from the host to
+    /// backfill. The store was already bootstrapped by the CLI
+    /// ([`crate::tracker::join_workspace_store`]) — a ticket for a *different*
+    /// workspace is a hard error, never an adoption: a daemon is only ever
+    /// subscribed to its own workspace's topic, so split-brain is structurally
+    /// impossible.
+    async fn connect_workspace(self: &Arc<Self>, ticket: &WorkspaceTicket) -> Result<()> {
+        let bound = self.tracker.lock().unwrap().workspace_str();
+        if ticket.workspace != bound {
+            anyhow::bail!(
+                "this store is bound to workspace {bound}, but the invite is for {} — \
+                 run `lait join` from a directory that isn't already a workspace",
+                ticket.workspace
+            );
         }
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
-        self.adopt_room(&ticket.room);
         self.broadcast(Payload::JoinRequest {
-            nick: self.shared.nick.clone(),
+            nick: self.shared.nick(),
             // Echo the ticket's pre-authorization (if any) so an admin receiver can
             // auto-seal us the key without a manual approve (Pattern A).
             invite: ticket.invite.clone(),
@@ -821,7 +800,7 @@ impl Node {
     /// admin approves us we hold ciphertext and aren't on the board (UI.md §8).
     /// So we tell the joiner the truth and point at the one next step, instead of
     /// implying success. If we resolved to an already-member (a re-join), say so.
-    fn join_message(&self, ticket: &RoomTicket) -> String {
+    fn join_message(&self, ticket: &WorkspaceTicket) -> String {
         let host = if ticket.host_nick.is_empty() {
             "the workspace admin".to_string()
         } else {
@@ -849,18 +828,26 @@ impl Node {
         }
     }
 
-    /// Pin a seed (A§10). Accepts two forms: a full `RoomTicket` (adopt the
-    /// workspace, join, and backfill — the primary path), or a bare endpoint id
-    /// (pin only, for a peer we already share a workspace with). Either way the
-    /// pin is persisted so future restarts always dial and backfill from it.
+    /// Pin a seed (A§10). Accepts two forms: a full `WorkspaceTicket` for the
+    /// workspace this store is bound to (connect + backfill — the primary path),
+    /// or a bare endpoint id (pin only, for a peer we already share a workspace
+    /// with). A ticket for a *foreign* workspace is an error — join it first.
+    /// Either way the pin is persisted so restarts always dial and backfill.
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
-        if let Ok(ticket) = arg.parse::<RoomTicket>() {
+        if let Ok(ticket) = arg.parse::<WorkspaceTicket>() {
             let id = ticket.host;
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
-            self.adopt_and_join(&ticket).await?;
+            let bound = self.tracker.lock().unwrap().workspace_str();
+            if ticket.workspace != bound {
+                return Ok(Response::err(format!(
+                    "that ticket is for a different workspace ({}) — join it first: `lait join <ticket>`",
+                    ticket.workspace
+                )));
+            }
+            self.connect_workspace(&ticket).await?;
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
@@ -872,7 +859,7 @@ impl Node {
             self.clone().trigger_pull(id);
             return Ok(Response::Ok {
                 message: Some(format!(
-                    "{} seed {id} \u{2014} adopted workspace, backfilling",
+                    "{} seed {id} \u{2014} backfilling",
                     if newly { "pinned" } else { "updated" }
                 )),
             });
@@ -944,7 +931,7 @@ impl Node {
             interval.tick().await;
             if let Err(e) = self
                 .broadcast(Payload::Presence {
-                    nick: self.shared.nick.clone(),
+                    nick: self.shared.nick(),
                     state: self.my_presence_state(),
                 })
                 .await
@@ -1013,6 +1000,13 @@ impl Node {
 
     /// Stamp a tracker [`DirtySet`] into a doorbell and wake every parked stream.
     fn ring_doorbell(&self, dirty: DirtySet) {
+        // Project config moved (local edit or sync import) — keep the machine
+        // registry's advisory project snapshot fresh. Every ring_doorbell call
+        // site has already released the tracker lock, so the re-lock inside is
+        // safe.
+        let projects_moved = dirty
+            .dirty_catalog
+            .contains(&crate::control::CatalogScope::Projects);
         let mut d = self.doorbell.lock().unwrap();
         d.seq += 1;
         let frame = Doorbell {
@@ -1030,6 +1024,9 @@ impl Node {
         }
         drop(d);
         self.doorbell_notify.notify_waiters();
+        if projects_moved {
+            self.refresh_registry_row();
+        }
     }
 
     /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
@@ -1204,6 +1201,7 @@ impl Node {
             Request::IssueNew {
                 title,
                 project,
+                project_hint,
                 assignees,
                 priority,
                 labels,
@@ -1216,6 +1214,7 @@ impl Node {
                 Request::IssueNew {
                     title,
                     project,
+                    project_hint,
                     assignees: out,
                     priority,
                     labels,
@@ -1407,7 +1406,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let me = self.my_userid();
-                let (workspace, issues, projects, membership) = {
+                let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
                     let acl = t.acl_state();
                     let membership = if acl.is_admin(&me) {
@@ -1419,6 +1418,7 @@ impl Node {
                     };
                     (
                         Some(t.workspace_id().to_string()),
+                        t.workspace_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
@@ -1427,8 +1427,8 @@ impl Node {
                 let pending_requests = self.pending_join_requests().len();
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
-                    nick: self.shared.nick.clone(),
-                    room: self.shared.room.lock().unwrap().clone(),
+                    nick: self.shared.nick(),
+                    name,
                     online_peers,
                     workspace,
                     issues,
@@ -1449,7 +1449,7 @@ impl Node {
                     .filter(|p| p.presence.is_online())
                     .count();
                 let me = self.my_userid();
-                let (workspace, issues, projects, membership) = {
+                let (workspace, name, issues, projects, membership) = {
                     let t = self.tracker.lock().unwrap();
                     let acl = t.acl_state();
                     let membership = if acl.is_admin(&me) {
@@ -1461,15 +1461,15 @@ impl Node {
                     };
                     (
                         t.workspace_id().to_string(),
+                        t.workspace_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
                     )
                 };
-                let room = self.shared.room.lock().unwrap().clone();
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
                     workspace: Some(workspace.as_str()),
-                    room: room.as_str(),
+                    name: name.as_str(),
                     membership: membership.as_str(),
                     online_peers,
                     projects,
@@ -1486,7 +1486,10 @@ impl Node {
                 reusable,
                 ttl_hours,
             } => {
-                let workspace = self.tracker.lock().unwrap().workspace_str();
+                let (workspace, name) = {
+                    let t = self.tracker.lock().unwrap();
+                    (t.workspace_str(), t.workspace_name())
+                };
                 // Default: embed a signed, single-use pre-authorization so the
                 // joiner is auto-admitted (Pattern A). `--require-approval` mints a
                 // grant-less ticket that falls back to the manual approve flow.
@@ -1499,11 +1502,11 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
-                let ticket = RoomTicket {
-                    room: self.shared.room.lock().unwrap().clone(),
-                    host: self.shared.my_id,
-                    host_nick: self.shared.nick.clone(),
+                let ticket = WorkspaceTicket {
                     workspace,
+                    name,
+                    host: self.shared.my_id,
+                    host_nick: self.shared.nick(),
                     invite,
                 };
                 Ok(Response::Text {
@@ -1511,22 +1514,12 @@ impl Node {
                 })
             }
             Request::Join { ticket } | Request::Connect { ticket } => {
-                let ticket: RoomTicket = ticket.parse().context("parse room ticket")?;
-                self.adopt_and_join(&ticket).await?;
-                // Record where this workspace now lives (store path → workspace) so
-                // a joiner who later runs commands from a different directory can be
-                // pointed back here instead of silently binding a decoy store — the
-                // directory trap (docs/GUIDED-JOIN.md §B). Best-effort: a registry
-                // write failure must never fail the join itself.
-                if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
-                    workspace: ticket.workspace.clone(),
-                    room: ticket.room.clone(),
-                    path: self.home.display().to_string(),
-                    host_nick: ticket.host_nick.clone(),
-                    last_seen: now_secs(),
-                }) {
-                    tracing::warn!("workspace registry upsert failed: {e:#}");
-                }
+                let ticket: WorkspaceTicket = ticket.parse().context("parse workspace ticket")?;
+                // The CLI already bootstrapped this store from the ticket
+                // (`tracker::join_workspace_store`) and registered it; the
+                // daemon's part is transport only — connect, request admission,
+                // backfill.
+                self.connect_workspace(&ticket).await?;
                 Ok(Response::Ok {
                     message: Some(self.join_message(&ticket)),
                 })
@@ -1598,6 +1591,27 @@ impl Node {
                     .collect();
                 Ok(Response::Who { peers })
             }
+            Request::ConfigReload => {
+                // Re-read the layered settings so a daemon-read key set via
+                // `lait config` applies live (never a silent wait-for-restart).
+                let settings = Settings::load(Some(&self.home));
+                let nick = settings.nick();
+                *self.shared.nick.lock().unwrap() = nick.clone();
+                self.tracker.lock().unwrap().set_nick(nick.clone());
+                // Broadcast the new nick right away so peers don't wait a
+                // heartbeat to see it.
+                let me = self.clone();
+                tokio::spawn(async move {
+                    me.broadcast(Payload::Hello {
+                        nick: me.shared.nick(),
+                    })
+                    .await
+                    .ok();
+                });
+                Ok(Response::Ok {
+                    message: Some(format!("config reloaded (nick: {nick})")),
+                })
+            }
             Request::Stop => {
                 let me = self.clone();
                 tokio::spawn(async move {
@@ -1608,6 +1622,28 @@ impl Node {
                     message: Some("shutting down".to_string()),
                 })
             }
+        }
+    }
+
+    /// Refresh this store's row in the machine-level workspace registry —
+    /// advisory navigation state (name + project keys for `lait workspaces`).
+    /// Best-effort: registry failure never affects daemon operation. The
+    /// registry's merge keeps `origin`/`host_nick` from the init/join upsert.
+    fn refresh_registry_row(&self) {
+        let (workspace, name, projects) = {
+            let t = self.tracker.lock().unwrap();
+            (t.workspace_str(), t.workspace_name(), t.project_briefs())
+        };
+        if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+            workspace,
+            name,
+            path: self.home.display().to_string(),
+            origin: crate::workspaces::Origin::default(),
+            host_nick: String::new(),
+            last_opened: now_secs(),
+            projects,
+        }) {
+            tracing::debug!("workspace registry refresh failed: {e:#}");
         }
     }
 
@@ -1768,62 +1804,45 @@ async fn write_line_half<T: serde::Serialize>(
     write_half.flush().await
 }
 
-/// Whether a registry `path` string names the same store as `home`, tolerant of
-/// slash direction and case differences (Windows) via canonicalization, falling
-/// back to a string compare when either side can't be canonicalized.
-fn same_store_path(registered: &str, home: &Path) -> bool {
-    let reg = Path::new(registered);
-    match (reg.canonicalize(), home.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => registered == home.display().to_string(),
-    }
-}
-
 /// Build and run the daemon until a Stop request arrives. When `seed` is set the
 /// node runs as an always-on seed and never idle-shuts-down (DUR-4).
 pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let _daemon_lock = acquire_daemon_lock(&home)?;
 
-    // Identity is global by default (DUR-5); store (profile/repo/lock/socket) is
+    // Identity is global by default (DUR-5); store (repo/lock/socket/config) is
     // this per-repo home. `$LAIT_HOME` collapses both back into `home`.
     let secret_key = load_or_create_identity(&crate::config::identity_dir()?)?;
-    let mut profile = Profile::load(&home)?;
+    let settings = Settings::load(Some(&home));
+    let nick = settings.nick();
 
-    // Self-heal a stale room. A store joined before rooms were adopted on `Join`
-    // kept its seeded room ("default"/repo-dir) while the workspace actually
-    // lives in the ticket's room — so every cold boot subscribed to the wrong
-    // gossip topic: no peers, no presence, a `doctor` stuck waiting on a peer.
-    // The workspace registry recorded the ticket's room at join time; if it has
-    // an entry for this exact store and the rooms disagree, the registry is the
-    // one that witnessed the join — adopt it.
-    if let Some(entry) = crate::workspaces::list()
-        .into_iter()
-        .find(|e| same_store_path(&e.path, &home))
-    {
-        if !entry.room.is_empty() && entry.room != profile.room {
-            tracing::info!(
-                "healing room '{}' -> '{}' (from the workspace registry)",
-                profile.room,
-                entry.room
-            );
-            profile.room = entry.room;
-            if let Err(e) = profile.save(&home) {
-                tracing::warn!("could not persist healed room: {e:#}");
-            }
-        }
-    }
-
-    // Tracker core (P0): open the git-backed store and load/create the workspace.
+    // Tracker core (P0): open the git-backed store. The store must already be
+    // initialized (`lait init` / `lait join`) — a daemon never founds a
+    // workspace as a side effect of starting.
     let store = Store::open(&home)?;
     let me = UserId::from_key_string(secret_key.public().to_string());
     let identity_seed = secret_key.to_bytes();
     let tracker = Tracker::open(
         store,
         me,
-        profile.nick.clone(),
+        nick.clone(),
         identity_seed,
         Box::new(SystemUlidSource),
     )?;
+    // Register/refresh this store in the machine-level workspace registry so
+    // founders and joiners alike show up in `lait workspaces` and resolve via
+    // `-w`. Best-effort (navigation state, never a gate); the merge keeps the
+    // origin/host_nick recorded by `lait init`/`lait join`.
+    if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
+        workspace: tracker.workspace_str(),
+        name: tracker.workspace_name(),
+        path: home.display().to_string(),
+        origin: crate::workspaces::Origin::default(),
+        host_nick: String::new(),
+        last_opened: now_secs(),
+        projects: tracker.project_briefs(),
+    }) {
+        tracing::warn!("workspace registry upsert failed: {e:#}");
+    }
     let tracker = Arc::new(Mutex::new(tracker));
 
     let memory_lookup = MemoryLookup::new();
@@ -1837,8 +1856,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
     let shared = Shared {
-        nick: profile.nick.clone(),
-        room: Arc::new(Mutex::new(profile.room.clone())),
+        nick: Arc::new(Mutex::new(nick)),
         my_id,
         presence: Arc::new(Mutex::new(HashMap::new())),
         events: Arc::new(Mutex::new(EventLog::default())),
@@ -1857,7 +1875,9 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     endpoint.online().await;
 
-    let topic = topic_for_room(&profile.room);
+    // The topic is a pure function of the workspace id — no user-settable
+    // network name, so a cold boot can never subscribe to the wrong topic.
+    let topic = crate::proto::topic_for_workspace(&tracker.lock().unwrap().workspace_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
     // rejoins the mesh instead of waiting to be re-announced to (DUR-1), unioned
     // with the explicit, sticky seed pins (A§10) so a restart always dials its
@@ -1913,7 +1933,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     tokio::spawn(node.clone().idle_shutdown_loop());
 
     node.broadcast(Payload::Hello {
-        nick: node.shared.nick.clone(),
+        nick: node.shared.nick(),
     })
     .await
     .ok();
@@ -1933,7 +1953,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .create_tokio()
         .context("bind control channel")?;
 
-    tracing::info!("lait daemon online as {my_id} in room '{}'", profile.room);
+    {
+        let t = node.tracker.lock().unwrap();
+        tracing::info!(
+            "lait daemon online as {my_id} in workspace '{}' ({})",
+            t.workspace_name(),
+            t.workspace_str()
+        );
+    }
 
     let shutdown = node.shutdown.clone();
     loop {
@@ -1967,7 +1994,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // that hangs past the deadline gets abandoned; state is already durable.
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         node.broadcast(Payload::Bye {
-            nick: node.shared.nick.clone(),
+            nick: node.shared.nick(),
         })
         .await
         .ok();

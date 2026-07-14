@@ -103,6 +103,7 @@ fn new_collects_repeated_short_flags() {
         Request::IssueNew {
             title: "Fix login".into(),
             project: Some("ENG".into()),
+            project_hint: None,
             assignees: vec!["alice".into(), "bob".into()],
             priority: Some("high".into()),
             labels: vec!["x".into(), "y".into()],
@@ -186,6 +187,68 @@ fn members_add_reads_admin_and_local_name() {
             as_name: Some("Alice".into()),
         },
     );
+}
+
+#[test]
+fn board_positional_is_optional() {
+    // Bare `lait board` parses — the daemon's choose-project chain (sole
+    // project / `project.default` / branch hint) supplies the view project.
+    // `project_hint` is environment-derived (git branch), so only `project` is
+    // pinned here.
+    let got = parse_to_request(&["lait", "board"]).expect("bare `lait board` must parse");
+    match got {
+        Request::Board { project, .. } => assert_eq!(project, None),
+        other => panic!("expected Request::Board, got {other:?}"),
+    }
+    // With an explicit positional the hint is pinned None (an explicit project
+    // always wins; no git subprocess runs).
+    parses_to(
+        &["lait", "board", "ENG"],
+        Request::Board {
+            project: Some("ENG".into()),
+            project_hint: None,
+        },
+    );
+}
+
+#[test]
+fn explicit_project_pins_the_hint_to_none() {
+    // Under an explicit `-p` the branch-derived project_hint must be None — the
+    // daemon must never see a hint that could override an explicit choice.
+    parses_to(
+        &["lait", "new", "t", "-p", "ENG"],
+        Request::IssueNew {
+            title: "t".into(),
+            project: Some("ENG".into()),
+            project_hint: None,
+            assignees: vec![],
+            priority: None,
+            labels: vec![],
+            body: None,
+        },
+    );
+}
+
+#[test]
+fn config_set_is_special_dispatch_not_a_request() {
+    // `lait config set` is handled by a bespoke `app::run` arm (layered local
+    // settings, no daemon round-trip) — parse_to_request must refuse it by
+    // naming the special-dispatch leaf, not silently produce a Request.
+    let err = parse_to_request(&["lait", "config", "set", "user.nick", "moon"])
+        .expect_err("config set must not map to a Request");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("special-dispatch") && msg.contains("set"),
+        "error should name the special-dispatch leaf, got: {msg}"
+    );
+}
+
+#[test]
+fn cli_tree_builds_and_validates() {
+    // clap panics on a malformed tree (dup ids, bad positionals). Asserts the
+    // whole registry — including the `-w` global and the `config`/`workspaces`
+    // groups — assembles into a legal Command.
+    build_cli(&specs()).debug_assert();
 }
 
 #[test]

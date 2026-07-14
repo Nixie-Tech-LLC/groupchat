@@ -87,7 +87,7 @@ admin admits it.
 docker compose up -d --build          # from the repo root
 docker compose exec seed lait id      # copy the node id
 # from an admin node:  lait members add <that-id>
-docker compose exec seed lait seed add <room-ticket>   # adopt a workspace to serve
+docker compose exec seed lait join <invite-ticket>     # bootstrap the workspace to serve
 ```
 
 See [`docker-compose.yml`](../docker-compose.yml) for details. iroh handles NAT

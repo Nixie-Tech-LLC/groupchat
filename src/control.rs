@@ -77,6 +77,12 @@ pub enum Request {
         title: String,
         #[serde(default)]
         project: Option<String>,
+        /// Environment hint (the CLI's git-branch project key) — distinct from
+        /// `project` because "user said X" must error loudly on a miss while
+        /// "environment suggests X" must fall through silently (S: the
+        /// choose-project chain). MCP always sends `None`.
+        #[serde(default)]
+        project_hint: Option<String>,
         #[serde(default)]
         assignees: Vec<String>,
         #[serde(default)]
@@ -132,7 +138,12 @@ pub enum Request {
         filter: Filter,
     },
     Board {
-        project: String,
+        /// Optional since the choose-project chain can supply the view project
+        /// (sole project / `project.default` / branch hint).
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        project_hint: Option<String>,
     },
     History {
         reff: String,
@@ -240,6 +251,11 @@ pub enum Request {
         since: u64,
     },
     Who,
+    /// Re-read the layered local settings (`lait config set` sends this
+    /// best-effort so a daemon-read key like `user.nick` applies live instead
+    /// of silently waiting for a restart). Transport-plane like `Stop` — not
+    /// part of the MCP tool surface.
+    ConfigReload,
     Stop,
 }
 
@@ -421,7 +437,9 @@ pub struct PresenceEntry {
 pub struct StatusInfo {
     pub id: String,
     pub nick: String,
-    pub room: String,
+    /// The workspace display name (synced catalog value; empty on a joiner
+    /// whose catalog hasn't arrived yet).
+    pub name: String,
     pub online_peers: usize,
     pub workspace: Option<String>,
     pub issues: usize,

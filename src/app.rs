@@ -15,16 +15,102 @@
 //! same live tree (`cmdspec::build_cli`).
 
 use anyhow::{anyhow, Result};
+use clap::ArgMatches;
 use clap_complete::{generate, Shell};
 
 use crate::{
     cli::Out,
     cmdspec::{self, Dispatch, Special},
-    config::{self, load_or_create_identity, Profile},
+    config::{self, load_or_create_identity},
     control::Request,
+    ids::{SystemUlidSource, UserId},
     install::{self, Client, Scope},
     mcp, node,
+    store::Store,
+    workspaces,
 };
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Resolve a `-w <SEL>` workspace selector to a store path via the registry:
+/// a path (containing a separator or naming an existing dir), a `ws_` id or
+/// unique prefix, or a case-insensitive display-name match.
+fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    // Path form: explicit separators or an existing directory. Accept either
+    // the `.lait` dir itself or its parent.
+    if sel.contains('/') || sel.contains('\\') || Path::new(sel).is_dir() {
+        let p = Path::new(sel);
+        let store = if crate::store::initialized_at(p) {
+            p.to_path_buf()
+        } else if crate::store::initialized_at(&p.join(".lait")) {
+            p.join(".lait")
+        } else {
+            return Err(anyhow!(
+                "no initialized workspace store at '{sel}' (or under '{sel}/.lait')"
+            ));
+        };
+        return Ok(store);
+    }
+    let entries = workspaces::list();
+    let matches: Vec<_> = if sel.starts_with("ws_") {
+        entries
+            .iter()
+            .filter(|e| e.workspace == sel || e.workspace.starts_with(sel))
+            .collect()
+    } else {
+        entries
+            .iter()
+            .filter(|e| e.name.eq_ignore_ascii_case(sel))
+            .collect()
+    };
+    match matches.len() {
+        1 => {
+            let e = matches[0];
+            if workspaces::presence(e) == workspaces::StorePresence::Missing {
+                return Err(anyhow!(
+                    "workspace '{}' is registered at {} but the store is gone — run `lait workspaces prune`",
+                    sel,
+                    e.path
+                ));
+            }
+            Ok(PathBuf::from(&e.path))
+        }
+        0 => {
+            let known: Vec<String> = entries
+                .iter()
+                .map(|e| {
+                    if e.name.is_empty() {
+                        e.workspace.clone()
+                    } else {
+                        e.name.clone()
+                    }
+                })
+                .collect();
+            Err(anyhow!(
+                "no workspace matches '{sel}' — known: {} (see `lait workspaces`)",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        }
+        _ => {
+            let cands: Vec<String> = matches
+                .iter()
+                .map(|e| format!("{} ({})", e.workspace, e.path))
+                .collect();
+            eprintln!("'{sel}' is ambiguous:\n  {}", cands.join("\n  "));
+            std::process::exit(2);
+        }
+    }
+}
 
 /// Parse arguments and run.
 pub async fn run() -> Result<()> {
@@ -84,6 +170,22 @@ pub async fn run() -> Result<()> {
         _ => {}
     }
 
+    // Home resolution honours an explicit --home over the session registry.
+    // Applied before ANY store-touching dispatch (including `config`, whose
+    // store layer resolves through the same env).
+    if let Some(h) = matches.get_one::<String>("home") {
+        std::env::set_var("LAIT_HOME", h);
+    }
+    // `-w <SEL>`: resolve the selector to a store path and pin it, so every
+    // command below binds that exact store from any directory. The pin rides
+    // the same env the daemon spawn uses (`LAIT_STORE`), so the plumbing is
+    // shared with cwd binding. `--home`/`$LAIT_HOME` still outrank it (and
+    // clap already rejects combining the two flags).
+    if let Some(sel) = matches.get_one::<String>("workspace") {
+        let store = resolve_workspace_selector(sel)?;
+        std::env::set_var("LAIT_STORE", &store);
+    }
+
     // Registry-level commands that operate across identities (no store/daemon).
     match &leaf.dispatch {
         Dispatch::Special(Special::Profiles) => {
@@ -115,37 +217,80 @@ pub async fn run() -> Result<()> {
             if !out.json {
                 println!("resumed identity '{name}'");
             }
+            // A fresh identity home holds no workspace yet — say so instead of
+            // spawning a daemon that can only fail to open the store.
+            if !crate::store::initialized_at(&home) {
+                crate::cli::emit_ok(
+                    &format!(
+                        "identity '{name}' has no workspace yet — `lait init` to found one, or `lait join <link>`"
+                    ),
+                    out,
+                );
+                return Ok(());
+            }
             return crate::cli::run(&home, Request::Status, out).await;
         }
-        // The joined-workspace registry: pure navigation state, no store/daemon.
+        // The workspace registry + config: pure local state, no store/daemon.
         Dispatch::Special(Special::Workspaces) => {
-            crate::cli::print_workspaces(out);
+            crate::cli::print_workspaces(out).await;
             return Ok(());
+        }
+        Dispatch::Special(Special::WorkspacesForget) => {
+            let sel = m.get_one::<String>("sel").cloned().unwrap_or_default();
+            let removed = workspaces::forget(&sel)?;
+            if removed.is_empty() {
+                eprintln!("nothing in the registry matches '{sel}'");
+                std::process::exit(2);
+            }
+            for e in &removed {
+                crate::cli::emit_ok(
+                    &format!("forgot {} at {} (store untouched)", e.workspace, e.path),
+                    out,
+                );
+            }
+            return Ok(());
+        }
+        Dispatch::Special(Special::WorkspacesPrune) => {
+            let removed = workspaces::prune()?;
+            crate::cli::emit_ok(
+                &format!(
+                    "pruned {} missing entr{}",
+                    removed.len(),
+                    if removed.len() == 1 { "y" } else { "ies" }
+                ),
+                out,
+            );
+            return Ok(());
+        }
+        Dispatch::Special(
+            Special::ConfigGet | Special::ConfigSet | Special::ConfigUnset | Special::ConfigList,
+        ) => {
+            return run_config(&leaf.dispatch, m, out).await;
         }
         _ => {}
     }
 
-    // Home resolution honours an explicit --home over the session registry.
-    if let Some(h) = matches.get_one::<String>("home") {
-        std::env::set_var("LAIT_HOME", h);
-    }
     // `update` swaps the binary; it must not resolve/create a workspace store.
     if matches!(leaf.dispatch, Dispatch::Special(Special::Update)) {
         return run_update().await;
     }
-    // Directory-trap guard (docs/GUIDED-JOIN.md §B): a *read-only* command run in a
-    // directory with no discoverable `.lait/` must NOT silently create a decoy
-    // store. When we know of workspaces they've joined, point them there and exit
-    // instead of manufacturing an empty one. `init`/`join` (and writes) still
-    // create; an explicit `--home`/`$LAIT_HOME` opts out.
-    if leaf.read_only && config::existing_home().is_none() {
-        let known = crate::workspaces::list();
-        if !known.is_empty() {
-            crate::cli::warn_no_workspace_here(&known, out);
-            std::process::exit(2);
-        }
+    // The two creation verbs resolve (and may create) their own store.
+    match &leaf.dispatch {
+        Dispatch::Special(Special::Init) => return run_init(m, out).await,
+        Dispatch::Special(Special::Join) => return run_join_cli(m, out).await,
+        _ => {}
     }
-    let home = config::resolve_home(None)?;
+    // Everything else binds an existing store or gets the guided error —
+    // nothing is ever created implicitly (the decoy-store trap is gone by
+    // construction, not by guard).
+    let home = match config::resolve_existing_store(None) {
+        Ok(h) => h,
+        Err(e) if e.downcast_ref::<config::NoStoreHere>().is_some() => {
+            crate::cli::err_no_store_here(out);
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
 
     match &leaf.dispatch {
         // The uniform path: build one Request and round-trip the daemon.
@@ -154,34 +299,6 @@ pub async fn run() -> Result<()> {
             crate::cli::run(&home, req, out).await?;
         }
         Dispatch::Special(s) => match s {
-            Special::Init => {
-                let key = load_or_create_identity(&config::identity_dir()?)?;
-                let mut profile = Profile::load(&home)?;
-                if let Some(n) = m.get_one::<String>("nick") {
-                    profile.nick = n.clone();
-                }
-                if let Some(r) = m.get_one::<String>("room") {
-                    profile.room = r.clone();
-                }
-                profile.save(&home)?;
-                if out.json {
-                    crate::cli::emit_ok(
-                        &format!(
-                            "initialized id={} nick={} room={}",
-                            key.public(),
-                            profile.nick,
-                            profile.room
-                        ),
-                        out,
-                    );
-                } else {
-                    println!("initialized.");
-                    println!("id:   {}", key.public());
-                    println!("nick: {}", profile.nick);
-                    println!("room: {}", profile.room);
-                    println!("home: {}", home.display());
-                }
-            }
             Special::Id => {
                 let key = load_or_create_identity(&config::identity_dir()?)?;
                 crate::cli::emit_text(&key.public().to_string(), out);
@@ -232,22 +349,6 @@ pub async fn run() -> Result<()> {
                 crate::cli::run_invite(&home, email, require_approval, reusable, ttl_hours, out)
                     .await?
             }
-            Special::Join => {
-                // Set the display name before the daemon is auto-spawned (via
-                // ensure_daemon) so a cold joiner announces the right name on its
-                // join request. It stays a self-asserted claim — the admin approves
-                // by key, never by this nick (UI.md §8).
-                if let Some(n) = m.get_one::<String>("nick") {
-                    let mut profile = Profile::load(&home)?;
-                    profile.nick = n.clone();
-                    profile.save(&home)?;
-                }
-                let ticket = m.get_one::<String>("ticket").cloned().unwrap_or_default();
-                // `join` runs the guided-join verifier as its tail so the joiner
-                // sees the gate readout — including a directory/store mismatch —
-                // instead of a bare "ok".
-                crate::cli::run_join(&home, ticket, out).await?
-            }
             Special::Watch => {
                 let since = match m.get_one::<String>("since") {
                     Some(s) => Some(
@@ -265,6 +366,14 @@ pub async fn run() -> Result<()> {
             | Special::Profiles
             | Special::Resume
             | Special::Workspaces
+            | Special::WorkspacesForget
+            | Special::WorkspacesPrune
+            | Special::ConfigGet
+            | Special::ConfigSet
+            | Special::ConfigUnset
+            | Special::ConfigList
+            | Special::Init
+            | Special::Join
             | Special::Update => {
                 unreachable!("handled before home resolution")
             }
@@ -272,6 +381,277 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `lait init`: found a workspace rooted at `cwd/.lait` (or `$LAIT_HOME`).
+/// Explicit creation is the ONLY way a workspace comes into existence besides
+/// `join` — nothing is minted as a side effect of other commands.
+async fn run_init(m: &ArgMatches, out: Out) -> Result<()> {
+    // Refuse when discovery already binds an initialized store: one directory
+    // (tree) holds one workspace.
+    if let Some(existing) = config::existing_home() {
+        if crate::store::initialized_at(&existing) {
+            eprintln!(
+                "already inside a workspace — its store is at {}",
+                existing.display()
+            );
+            eprintln!("to found another workspace, run `lait init` in a different directory.");
+            std::process::exit(1);
+        }
+    }
+    let cwd = std::env::current_dir()?;
+    let home = config::store_dir_for_init(&cwd)?;
+    // Display name: --name, else the directory the store lives in.
+    let name = match m.get_one::<String>("name") {
+        Some(n) => n.clone(),
+        None => dir_display_name(&home),
+    };
+    // `--nick` is sugar for `lait config set user.nick` at the store layer.
+    if let Some(n) = m.get_one::<String>("nick") {
+        let p = config::store_config_path(&home);
+        let mut cfg = config::ConfigMap::load(&p);
+        cfg.set("user.nick", n);
+        cfg.save(&p)?;
+    }
+    let key = load_or_create_identity(&config::identity_dir()?)?;
+    let me = UserId::from_key_string(key.public().to_string());
+    let store = Store::open(&home)?;
+    let (ws, project) = crate::tracker::found_workspace(&store, &me, &name, &SystemUlidSource)?;
+    // Register the founder — this is what makes `lait workspaces` complete.
+    if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
+        workspace: ws.to_string(),
+        name: name.clone(),
+        path: home.display().to_string(),
+        origin: workspaces::Origin::Founded,
+        host_nick: String::new(),
+        last_opened: now_secs(),
+        projects: vec![workspaces::ProjectBrief {
+            key: project.key.clone(),
+            name: project.name.clone(),
+        }],
+    }) {
+        eprintln!("(workspace registry update failed: {e:#})");
+    }
+    if out.json {
+        crate::cli::emit_ok(
+            &format!(
+                "founded workspace '{name}' ({ws}) with project {} at {}",
+                project.key,
+                home.display()
+            ),
+            out,
+        );
+    } else {
+        println!("founded workspace '{name}' ({ws})");
+        println!("id:      {}", key.public());
+        println!(
+            "project: {} ({}) — `lait new \"...\"` files into it",
+            project.name, project.key
+        );
+        println!("home:    {}", home.display());
+        println!();
+        println!("invite someone: `lait invite`");
+    }
+    Ok(())
+}
+
+/// The human name of the directory a store serves: the store dir's parent for a
+/// `.lait`, else the dir itself (self-contained homes).
+fn dir_display_name(home: &std::path::Path) -> String {
+    let dir = if home.file_name().is_some_and(|f| f == ".lait") {
+        home.parent().unwrap_or(home)
+    } else {
+        home
+    };
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("workspace")
+        .to_string()
+}
+
+/// `lait join`: client-orchestrated store creation from a ticket, then the
+/// daemon transport leg + guided-join verifier tail. The store is bootstrapped
+/// *before* the daemon spawns, so the daemon only ever opens a well-formed
+/// store bound to the ticket's workspace — the old adopt-or-split-brain
+/// heuristic has nothing left to do.
+async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
+    let ticket_str = m.get_one::<String>("ticket").cloned().unwrap_or_default();
+    let ticket: crate::proto::WorkspaceTicket = ticket_str.parse()?;
+
+    // Resolve the target store: --dir, else the discoverable store, else a
+    // fresh `cwd/.lait` (with a guard against homedir/root litter).
+    let target = if let Some(d) = m.get_one::<String>("dir") {
+        config::store_dir_under(std::path::Path::new(d))?
+    } else if let Some(existing) = config::existing_home() {
+        existing
+    } else {
+        let cwd = std::env::current_dir()?;
+        let is_home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .is_some_and(|h| std::path::Path::new(&h) == cwd);
+        if is_home || cwd.parent().is_none() {
+            eprintln!("refusing to create a workspace store in {} — pass --dir <path> (or cd into the project directory first).", cwd.display());
+            std::process::exit(1);
+        }
+        config::store_dir_for_init(&cwd)?
+    };
+
+    if crate::store::initialized_at(&target) {
+        // Bound already: a re-join of the same workspace is fine; a different
+        // one is a hard error (never adopt, never wipe).
+        let store = Store::open(&target)?;
+        match store.genesis()? {
+            Some(g) if g.workspace_id.to_string() == ticket.workspace => {}
+            Some(g) => {
+                eprintln!(
+                    "this directory holds workspace {} — the invite is for {}.",
+                    g.workspace_id, ticket.workspace
+                );
+                eprintln!("run `lait join` from another directory, or pass --dir <path>.");
+                std::process::exit(2);
+            }
+            None => {
+                return Err(anyhow!(
+                    "corrupt store at {} (catalog without genesis)",
+                    target.display()
+                ))
+            }
+        }
+    } else {
+        let store = Store::open(&target)?;
+        crate::tracker::join_workspace_store(&store, &ticket.workspace, &ticket.host.to_string())?;
+    }
+
+    // Set the display name before the daemon is auto-spawned so a cold joiner
+    // announces the right name on its join request. It stays a self-asserted
+    // claim — the admin approves by key, never by this nick (UI.md §8).
+    if let Some(n) = m.get_one::<String>("nick") {
+        let p = config::store_config_path(&target);
+        let mut cfg = config::ConfigMap::load(&p);
+        cfg.set("user.nick", n);
+        cfg.save(&p)?;
+    }
+
+    // Register the joiner store (pre-daemon, so `lait workspaces` sees it even
+    // if the transport leg fails below).
+    if let Err(e) = workspaces::upsert(workspaces::WorkspaceEntry {
+        workspace: ticket.workspace.clone(),
+        name: ticket.name.clone(),
+        path: target.display().to_string(),
+        origin: workspaces::Origin::Joined,
+        host_nick: ticket.host_nick.clone(),
+        last_opened: now_secs(),
+        projects: vec![],
+    }) {
+        eprintln!("(workspace registry update failed: {e:#})");
+    }
+
+    // Daemon leg: spawn against the exact bootstrapped store, then the guided
+    // verifier tail (gate readout instead of a bare "ok").
+    std::env::set_var("LAIT_STORE", &target);
+    crate::cli::run_join(&target, ticket_str, out).await
+}
+
+/// `lait config get|set|unset|ls`: layered local settings. Daemon-free by
+/// construction — binds via `existing_home()` only (never creates a store,
+/// never spawns); a daemon-read key change is pushed to a *running* daemon via
+/// `ConfigReload`, else it applies on next start (and says so).
+async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()> {
+    use crate::config::{key_spec, ConfigMap, KeyLayers, Settings, KEYS};
+    let home = config::existing_home().filter(|h| crate::store::initialized_at(h));
+    let which = match dispatch {
+        Dispatch::Special(s) => *s,
+        _ => unreachable!(),
+    };
+    match which {
+        Special::ConfigList => {
+            let settings = Settings::load(home.as_deref());
+            for spec in KEYS {
+                let (value, origin) = match (
+                    settings.store.get(spec.name),
+                    settings.global.get(spec.name),
+                ) {
+                    (Some(v), _) => (v.to_string(), "store"),
+                    (None, Some(v)) => (v.to_string(), "global"),
+                    (None, None) => match (spec.built_in)() {
+                        Some(v) => (v, "default"),
+                        None => ("(unset)".to_string(), "default"),
+                    },
+                };
+                if out.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "key": spec.name, "value": value, "origin": origin })
+                    );
+                } else {
+                    println!("{} = {}  ({origin}) — {}", spec.name, value, spec.help);
+                }
+            }
+            Ok(())
+        }
+        Special::ConfigGet => {
+            let key = m.get_one::<String>("key").cloned().unwrap_or_default();
+            let spec = key_spec(&key)?;
+            let settings = Settings::load(home.as_deref());
+            match settings.get(&key) {
+                Some(v) => crate::cli::emit_text(v, out),
+                None => match (spec.built_in)() {
+                    Some(v) => crate::cli::emit_text(&format!("{v} (default)"), out),
+                    None => {
+                        eprintln!("'{key}' is unset");
+                        std::process::exit(2);
+                    }
+                },
+            }
+            Ok(())
+        }
+        Special::ConfigSet | Special::ConfigUnset => {
+            let key = m.get_one::<String>("key").cloned().unwrap_or_default();
+            let spec = key_spec(&key)?;
+            let global = m.get_flag("global");
+            if global && spec.layers == KeyLayers::StoreOnly {
+                return Err(anyhow!("'{key}' is a per-store key — drop --global"));
+            }
+            let path = if global {
+                config::global_config_path()?
+            } else {
+                let h = home.ok_or_else(|| {
+                    anyhow!("not inside a workspace — cd into one, use -w, or pass --global")
+                })?;
+                config::store_config_path(&h)
+            };
+            let mut cfg = ConfigMap::load(&path);
+            let message = if which == Special::ConfigSet {
+                let value = m.get_one::<String>("value").cloned().unwrap_or_default();
+                cfg.set(&key, &value);
+                cfg.save(&path)?;
+                format!("{key} = {value}")
+            } else {
+                if !cfg.unset(&key) {
+                    eprintln!("'{key}' was not set in that layer");
+                    std::process::exit(2);
+                }
+                cfg.save(&path)?;
+                format!("unset {key}")
+            };
+            // Daemon-read keys: never a silent wait-for-restart. Bare
+            // `control::request` (NOT `cli::client`) so we never auto-spawn a
+            // daemon just to tell it about a config change.
+            let mut applied = String::new();
+            if spec.daemon_read {
+                if let Some(h) = config::existing_home() {
+                    applied = match crate::control::request(&h, &Request::ConfigReload).await {
+                        Ok(_) => " (applied to the running daemon)".to_string(),
+                        Err(_) => " (applies when the daemon next starts)".to_string(),
+                    };
+                }
+            }
+            crate::cli::emit_ok(&format!("{message}{applied}"), out);
+            Ok(())
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// `lait update`: update the installed binary in place from the latest GitHub

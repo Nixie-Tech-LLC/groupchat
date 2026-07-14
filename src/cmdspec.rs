@@ -49,6 +49,12 @@ pub enum Special {
     Profiles,
     Resume,
     Workspaces,
+    WorkspacesForget,
+    WorkspacesPrune,
+    ConfigGet,
+    ConfigSet,
+    ConfigUnset,
+    ConfigList,
     Update,
 }
 
@@ -64,9 +70,6 @@ pub struct Spec {
     /// Escape hatch for arg shapes ArgSpec doesn't model (value-enums, etc.).
     pub customize: Option<fn(Command) -> Command>,
     pub dispatch: Dispatch,
-    /// A view-only command that must not create a decoy store (directory trap,
-    /// docs/GUIDED-JOIN.md §B).
-    pub read_only: bool,
     /// A long-running networked service (`daemon`, `mcp`) that must keep Rust's
     /// default SIGPIPE-ignored so a dropped socket returns EPIPE, not a kill.
     pub service: bool,
@@ -89,7 +92,6 @@ impl Spec {
             sub_required: false,
             customize: None,
             dispatch: Dispatch::Request(f),
-            read_only: false,
             service: false,
         }
     }
@@ -105,17 +107,12 @@ impl Spec {
             sub_required: false,
             customize: None,
             dispatch: Dispatch::Special(s),
-            read_only: false,
             service: false,
         }
     }
 
     fn alias(mut self, a: &'static [&'static str]) -> Spec {
         self.aliases = a;
-        self
-    }
-    fn read_only(mut self) -> Spec {
-        self.read_only = true;
         self
     }
     fn service(mut self) -> Spec {
@@ -296,6 +293,19 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .help("Select the node's home directory (overrides $LAIT_HOME)."),
         )
         .arg(
+            Arg::new("workspace")
+                .short('w')
+                .long("workspace")
+                .global(true)
+                .action(ArgAction::Set)
+                .conflicts_with("home")
+                .value_name("SEL")
+                .help(
+                    "Select a workspace by name, ws_ id (or prefix), or path — from any \
+                     directory (see `lait workspaces`).",
+                ),
+        )
+        .arg(
             Arg::new("json")
                 .long("json")
                 .global(true)
@@ -460,19 +470,44 @@ fn resolve_reff(m: &ArgMatches) -> Result<String> {
     }
 }
 
+/// The project KEY implied by the current git branch (`eng-142-fix` → `ENG`) —
+/// the environment hint for the daemon's choose-project chain. Shipped as
+/// `project_hint`, distinct from an explicit `-p`: the daemon uses it only if
+/// it resolves to a real project, so a branch like `wip-2` never breaks `new`.
+fn infer_project_key_from_git_branch() -> Option<String> {
+    let key_n = infer_ref_from_git_branch()?;
+    key_n.split('-').next().map(str::to_string)
+}
+
+/// The optional `-p/--project` flag shared by `new`/`ls`/`move` (one place to
+/// keep the flag shape consistent).
+fn project_flag(help: &'static str) -> ArgSpec {
+    ArgSpec::val("project", help).short('p')
+}
+
+/// Fill the `project_hint` field: only worth computing (a git subprocess) when
+/// no explicit project was given — an explicit `-p` always wins anyway.
+fn project_hint(m: &ArgMatches) -> Option<String> {
+    if opt_str(m, "project").is_some() {
+        None
+    } else {
+        infer_project_key_from_git_branch()
+    }
+}
+
 // ---- The registry ------------------------------------------------------------
 
 /// The full CLI surface as data. Built once per invocation in `app::run`.
 pub fn specs() -> Vec<Spec> {
     use ArgSpec as A;
     vec![
-        // ---- identity / workspace init ----
+        // ---- workspace founding ----
         Spec::special(
             "init",
-            "Initialize identity and workspace settings (nickname, room/workspace).",
+            "Found a new workspace here (mints the genesis; seeds a first project).",
             vec![
-                A::val("nick", "Display nickname."),
-                A::val("room", "Room / workspace name."),
+                A::val("name", "Workspace display name (default: this directory's name)."),
+                A::val("nick", "Display nickname (sugar for `lait config set user.nick`)."),
             ],
             Special::Init,
         ),
@@ -482,7 +517,7 @@ pub fn specs() -> Vec<Spec> {
             "Create an issue; echoes the resolved handle.",
             vec![
                 A::pos("title", "Issue title."),
-                A::val("project", "Target project key.").short('p'),
+                project_flag("Target project key (default: branch key, `project.default`, or the sole project)."),
                 A::multi("assignees", "Assign a member (repeatable).")
                     .short('a')
                     .long("assign"),
@@ -496,6 +531,7 @@ pub fn specs() -> Vec<Spec> {
                 Ok(Request::IssueNew {
                     title: req_str(m, "title"),
                     project: opt_str(m, "project"),
+                    project_hint: project_hint(m),
                     assignees: multi(m, "assignees"),
                     priority: opt_str(m, "priority"),
                     labels: multi(m, "labels"),
@@ -507,7 +543,7 @@ pub fn specs() -> Vec<Spec> {
             "ls",
             "List issue rows from the Catalog cache (no issue-doc loads).",
             vec![
-                A::val("project", "Filter to a project.").short('p'),
+                project_flag("Filter to a project (a pure filter — never defaulted)."),
                 A::flag("mine", "Only issues assigned to you."),
                 A::val("status", "Filter by status."),
                 A::val("label", "Filter by label."),
@@ -524,19 +560,21 @@ pub fn specs() -> Vec<Spec> {
                     },
                 })
             },
-        )
-        .read_only(),
+        ),
         Spec::req(
             "board",
             "Render a project's board (workflow columns × ordered rows).",
-            vec![A::pos("project", "Project key.")],
+            vec![A::pos_opt(
+                "project",
+                "Project key (default: branch key, `project.default`, or the sole project).",
+            )],
             |m| {
                 Ok(Request::Board {
-                    project: req_str(m, "project"),
+                    project: opt_str(m, "project"),
+                    project_hint: project_hint(m),
                 })
             },
-        )
-        .read_only(),
+        ),
         Spec::req(
             "show",
             "Show a full issue (ref optional — inferred from the git branch).",
@@ -546,8 +584,7 @@ pub fn specs() -> Vec<Spec> {
                     reff: resolve_reff(m)?,
                 })
             },
-        )
-        .read_only(),
+        ),
         Spec::req(
             "edit",
             "Patch an issue's LWW fields (ref optional — inferred from the git branch).",
@@ -571,7 +608,7 @@ pub fn specs() -> Vec<Spec> {
             "Set project (truth) and/or board position (ref optional — inferred from git).",
             vec![
                 A::pos_opt("reff", "Issue ref."),
-                A::val("project", "Move to project.").short('p'),
+                project_flag("Move to project (explicit only — membership is never inferred)."),
                 A::flag("top", "Move to top of its column."),
                 A::flag("bottom", "Move to bottom of its column."),
                 A::val("before", "Place before this ref."),
@@ -680,8 +717,7 @@ pub fn specs() -> Vec<Spec> {
                     reff: resolve_reff(m)?,
                 })
             },
-        )
-        .read_only(),
+        ),
         // ---- registries (grouped: bare = list) ----
         Spec {
             subs: vec![
@@ -701,7 +737,6 @@ pub fn specs() -> Vec<Spec> {
                 ),
                 Spec::req("ls", "List projects.", vec![], |_| Ok(Request::ProjectList)),
             ],
-            read_only: true,
             ..Spec::req("projects", "Manage the project registry.", vec![], |_| {
                 Ok(Request::ProjectList)
             })
@@ -724,7 +759,6 @@ pub fn specs() -> Vec<Spec> {
                 ),
                 Spec::req("ls", "List labels.", vec![], |_| Ok(Request::LabelList)),
             ],
-            read_only: true,
             ..Spec::req("labels", "Manage the label registry.", vec![], |_| {
                 Ok(Request::LabelList)
             })
@@ -805,7 +839,6 @@ pub fn specs() -> Vec<Spec> {
                 ),
                 Spec::req("ls", "List members.", vec![], |_| Ok(Request::Members)),
             ],
-            read_only: true,
             ..Spec::req(
                 "members",
                 "Manage workspace membership (the signed ACL, P3). `members` lists.",
@@ -822,15 +855,13 @@ pub fn specs() -> Vec<Spec> {
                     since: u64_arg(m, "since")?,
                 })
             },
-        )
-        .read_only(),
+        ),
         Spec::special(
             "tui",
             "Launch the full-screen TUI board.",
             vec![],
             Special::Tui,
-        )
-        .read_only(),
+        ),
         Spec::req(
             "doctor",
             "Guided-join verifier: diagnose why you can't get to work yet.",
@@ -841,15 +872,76 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         )
-        .alias(&["verify"])
-        .read_only(),
-        Spec::special(
-            "workspaces",
-            "List the workspaces you've joined and where each lives on this machine.",
-            vec![],
-            Special::Workspaces,
-        )
-        .read_only(),
+        .alias(&["verify"]),
+        Spec {
+            subs: vec![
+                Spec::special(
+                    "ls",
+                    "List known workspaces with status (default).",
+                    vec![],
+                    Special::Workspaces,
+                ),
+                Spec::special(
+                    "forget",
+                    "Deregister a workspace (registry only — never touches the store on disk).",
+                    vec![A::pos("sel", "A store path, ws_ id, or unique id prefix.")],
+                    Special::WorkspacesForget,
+                ),
+                Spec::special(
+                    "prune",
+                    "Drop registry entries whose store no longer exists on disk.",
+                    vec![],
+                    Special::WorkspacesPrune,
+                ),
+            ],
+            ..Spec::special(
+                "workspaces",
+                "Every workspace on this machine: name, id, origin, status, projects, path.",
+                vec![],
+                Special::Workspaces,
+            )
+        },
+        Spec {
+            subs: vec![
+                Spec::special(
+                    "get",
+                    "Print a key's effective value (store layer wins over global).",
+                    vec![A::pos("key", "Config key (see `lait config ls`).")],
+                    Special::ConfigGet,
+                ),
+                Spec::special(
+                    "set",
+                    "Set a key. Store layer by default; --global for the machine layer.",
+                    vec![
+                        A::pos("key", "Config key (e.g. user.nick, project.default)."),
+                        A::pos("value", "The value."),
+                        A::flag("global", "Write the global layer instead of this store's."),
+                    ],
+                    Special::ConfigSet,
+                ),
+                Spec::special(
+                    "unset",
+                    "Remove a key from a layer.",
+                    vec![
+                        A::pos("key", "Config key."),
+                        A::flag("global", "Remove from the global layer instead."),
+                    ],
+                    Special::ConfigUnset,
+                ),
+                Spec::special(
+                    "ls",
+                    "List effective settings, annotated with their origin layer (default).",
+                    vec![],
+                    Special::ConfigList,
+                ),
+            ],
+            ..Spec::special(
+                "config",
+                "Get/set layered local settings (global + per-store; store wins).",
+                vec![],
+                Special::ConfigList,
+            )
+        },
         Spec::special("id", "Print our endpoint id.", vec![], Special::Id),
         Spec::special(
             "daemon",
@@ -897,8 +989,7 @@ pub fn specs() -> Vec<Spec> {
         }),
         Spec::req("status", "Show node and workspace status.", vec![], |_| {
             Ok(Request::Status)
-        })
-        .read_only(),
+        }),
         Spec::special(
             "invite",
             "Print a base32 ticket (+ QR) others use to join your workspace.",
@@ -928,10 +1019,11 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::special(
             "join",
-            "Join a workspace from an invite link.",
+            "Join a workspace from an invite link (creates the store here, or at --dir).",
             vec![
                 A::pos("ticket", "The invite link / ticket from `lait invite`."),
                 A::val("nick", "Set your display name as you join."),
+                A::val("dir", "Create the joined workspace's store under this directory."),
             ],
             Special::Join,
         )
@@ -940,7 +1032,7 @@ pub fn specs() -> Vec<Spec> {
             subs: vec![
                 Spec::req(
                     "add",
-                    "Pin a remote and adopt its workspace (invite link or endpoint id).",
+                    "Pin a remote for this workspace (an invite link for it, or an endpoint id).",
                     vec![A::pos("target", "An invite link or an endpoint id.")],
                     |m| {
                         Ok(Request::SeedAdd {
@@ -996,8 +1088,7 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req("who", "List peers and their online status.", vec![], |_| {
             Ok(Request::Who)
-        })
-        .read_only(),
+        }),
         Spec::special(
             "profiles",
             "List your profiles — each a separate private identity.",

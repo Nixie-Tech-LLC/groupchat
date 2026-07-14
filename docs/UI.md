@@ -52,9 +52,13 @@ same refactor-freedom the contract buys the CLI and MCP.
 
 ## 2. CLI command surface
 
-Invocation: `lait [--home DIR] [--json] [--no-color] <command> [args]`. `--home`
-selects the node (`$LAIT_HOME`); `--json` switches every command to the versioned DTO
-(§2.3); the daemon is auto-spawned on first use (existing `ensure_daemon`).
+Invocation: `lait [--home DIR] [-w SEL] [--json] [--no-color] <command> [args]`. `--home`
+selects a self-contained node (`$LAIT_HOME`); `-w/--workspace` selects a workspace **from
+any directory** by name, `ws_` id (or unique prefix), or path — resolved through the
+workspace registry to a store path (precedence: `--home` > `-w` > cwd discovery);
+`--json` switches every command to the versioned DTO (§2.3); the daemon is auto-spawned
+on first use (existing `ensure_daemon`). Commands never create a store implicitly: in a
+directory with no workspace they error with guidance (`init`/`join`/`-w`).
 
 ### 2.1 Command table
 
@@ -63,12 +67,13 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 
 | Command | `Request` (S§7) | Description |
 |---|---|---|
-| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). |
-| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | `List` | List rows from the Catalog cache only (no issue-doc loads). `--all` includes done/tombstoned. |
-| `board <PROJ>` | `Board` | Render the project's columns (workflow states × ordered rows). |
+| `init [--name N] [--nick N]` | — | **Found a workspace here** (`cwd/.lait`): mints the genesis, names it (default: the directory), seeds a first project so `new` works immediately. Errors inside an existing workspace. |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). `-p` optional — the S§7.6 chain (branch key → `project.default` → sole project). |
+| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | `List` | List rows from the Catalog cache only (no issue-doc loads). `-p` is a pure filter (never defaulted); `--all` includes done/tombstoned. |
+| `board [PROJ]` | `Board` | Render the project's columns (workflow states × ordered rows). Positional optional — the S§7.6 chain. |
 | `show <ref>` | `IssueView` | Full issue — **lazy-loads the issue doc**. Body, comments, activity. |
 | `edit <ref> [--title T] [--status S] [--priority P]` | `IssueEdit` | Patch the LWW fields. Multiple flags = **one** commit = one activity row (S§7.1). |
-| `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | `IssueMove` | Set project (truth) and/or board position (order). |
+| `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | `IssueMove` | Set project (truth) and/or board position (order). `-p` explicit only — membership is never inferred. |
 | `assign <ref> <userref…> [--remove]` | `Assign` | Add/remove assignees (present-key set, S§5.2). |
 | `label <ref> [+LABEL…] [-LABEL…]` | `Label` | Add (`+`) / remove (`-`) labels on an issue. |
 | `comment <ref> [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). No arg → open `$EDITOR`. |
@@ -81,10 +86,11 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | `watch [--since N] [--exec CMD] [--notify]` | `Subscribe`-stream | Follow forever; run a hook / desktop-notify per event. The scripting primitive. |
 | `tui` | — | Launch the full-screen board (§4). |
 | `doctor` (alias `verify`) | `Diagnose` | Guided-join verifier: names the one onboarding gate that's blocking ([`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). Auto-tails `join`. |
-| `workspaces` | — | List joined workspaces + their store paths (the directory-trap fix, [`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). |
+| `workspaces [ls\|forget <sel>\|prune]` | — | Every workspace on this machine (founded + joined): name, id, origin, live status (`up`/`idle`/`missing`), project keys, path. `forget` deregisters (never touches disk); `prune` drops missing entries. |
+| `config [get\|set\|unset\|ls]` | — | Layered local settings, git-style: global `config.json` + per-store `config.json` (store wins). Keys: `user.nick` (daemon-read → live `ConfigReload` on set), `project.default`; `workspace.*` reserved for future synced settings. Daemon-free. |
 | `profiles` (alias `agents`) · `resume <name>` | — | List / switch named profiles (each a separate identity + store). |
 | `status` · `stop` · `id` | `Status`/`Stop`/`Id` | Node/workspace status; stop the daemon; print the endpoint id. |
-| `invite` · `join` (alias `connect`) · `who` · `remote` (alias `seed`) | (P1 transport, §8/A§8) | The networking surface: invite/join a workspace, list peers, pin a seed. |
+| `invite` · `join [--dir D]` (alias `connect`) · `who` · `remote` (alias `seed`) | (P1 transport, §8/A§8) | The networking surface: invite/join a workspace, list peers, pin a seed. `join` **creates** the joiner's store (cwd or `--dir`) from the ticket before the daemon runs; joining from a directory bound to a different workspace is a hard exit-2 error. |
 
 ### 2.2 Notable behaviors
 
@@ -94,6 +100,10 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 - **Branch-inferred refs.** On a git branch whose name embeds a `KEY-n` (e.g.
   `eng-142-fix-login`), the `<ref>` is **optional** for `show`/`edit`/`move`/`history`/
   `delete` — lait infers `ENG-142` from the branch, mirroring the git-companion workflow.
+- **Branch-inferred project.** The same branch also yields the project KEY (`ENG`),
+  shipped to the daemon as a separate `project_hint` for `new`/`board` (S§7.6): used only
+  if it resolves to a real project, so a branch like `wip-2` never breaks anything, and an
+  explicit `-p` miss still errors loudly.
 - **No compare-and-swap (S§7.2).** There is no `--if-status open` flag and there never will
   be one; a `Response` is a snapshot with no cursor back into the doc, edits merge, and
   "close only if still open" is inexpressible. Stated here so nobody adds optimistic
