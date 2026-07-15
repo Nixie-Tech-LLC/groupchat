@@ -469,7 +469,8 @@ impl Tracker {
                 title,
                 status,
                 priority,
-            } => self.issue_edit(reff, title, status, priority),
+                description,
+            } => self.issue_edit(reff, title, status, priority, description),
             Request::IssueMove { reff, project, pos } => self.issue_move(reff, project, pos),
             Request::Assign { reff, who, add } => self.assign(reff, who, add),
             Request::Label { reff, add, remove } => self.label(reff, add, remove),
@@ -667,6 +668,7 @@ impl Tracker {
         title: Option<String>,
         status: Option<String>,
         priority: Option<String>,
+        description: Option<String>,
     ) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
@@ -685,7 +687,7 @@ impl Tracker {
             },
             None => None,
         };
-        if title.is_none() && status.is_none() && priority.is_none() {
+        if title.is_none() && status.is_none() && priority.is_none() && description.is_none() {
             return Ok((Response::err("nothing to edit"), None));
         }
 
@@ -725,6 +727,16 @@ impl Tracker {
                     field: "priority".into(),
                     from: Some(from.as_str().to_string()),
                     to: Some(p.as_str().to_string()),
+                });
+            }
+            if let Some(d) = &description {
+                // Full-buffer replace (P0, UI.md §5.3). Bodies are too big for
+                // the activity row — record the transition, elide the values.
+                issue.set_description(d)?;
+                changes.push(FieldChange {
+                    field: "description".into(),
+                    from: None,
+                    to: None,
                 });
             }
             issue.commit();
@@ -2353,6 +2365,7 @@ mod tests {
             title: None,
             status: Some("nonsense_status".into()),
             priority: None,
+            description: None,
         });
         assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
         assert!(dirty.is_none(), "a rejected write must ring no doorbell");
@@ -2368,6 +2381,7 @@ mod tests {
             title: Some("x".into()),
             status: None,
             priority: None,
+            description: None,
         });
         assert!(matches!(resp, Response::Error { .. }));
         assert!(dirty.is_none());
@@ -2385,6 +2399,7 @@ mod tests {
             title: Some("t2".into()),
             status: Some("in_progress".into()),
             priority: Some("high".into()),
+            description: None,
         });
         assert!(matches!(resp, Response::Ref { .. }));
         assert_eq!(
@@ -2412,6 +2427,7 @@ mod tests {
             title: Some("changed".into()),
             status: Some("in_progress".into()),
             priority: None,
+            description: None,
         });
         let rows = match n
             .tracker
@@ -2723,6 +2739,7 @@ mod tests {
             title: None,
             status: Some("done".into()),
             priority: None,
+            description: None,
         });
         // board movable list is now empty (bounded to the active set)...
         assert_eq!(board_len(&n.tracker), 0);
@@ -3049,6 +3066,7 @@ mod tests {
             title: None,
             status: Some("in_progress".into()),
             priority: None,
+            description: None,
         });
         assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
         sync_all(&mut a.tracker, &mut b.tracker);

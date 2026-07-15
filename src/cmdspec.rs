@@ -367,14 +367,61 @@ fn build_sub(s: &Spec) -> Command {
 /// can pin the arg semantics without a running daemon. Returns a clap usage error
 /// for bad input, or an error naming the command if it is a `Special` handler.
 pub fn parse_to_request(argv: &[&str]) -> Result<Request> {
+    match parse_to_dispatch(argv)? {
+        ParsedCommand::Request(r) => Ok(r),
+        ParsedCommand::Special { name, .. } => {
+            Err(anyhow!("`{name}` is a special-dispatch command"))
+        }
+    }
+}
+
+/// A parsed command line, surfacing `Special` leaves instead of erroring on
+/// them — the seam the TUI command palette dispatches through (one grammar,
+/// two entry points, UI.md tenet 4). The palette decides per-`Special` whether
+/// it has a native equivalent (start/done/stop, config, spaces, …) or rejects
+/// with "CLI-only".
+pub enum ParsedCommand {
+    Request(Request),
+    Special {
+        which: Special,
+        /// The leaf's name (for messages) — e.g. "start", "set".
+        name: &'static str,
+        matches: ArgMatches,
+    },
+}
+
+/// Like [`parse_to_request`], but classifies rather than rejecting `Special`s.
+pub fn parse_to_dispatch(argv: &[&str]) -> Result<ParsedCommand> {
     let specs = specs();
     let cli = build_cli(&specs);
     let m = cli.try_get_matches_from(argv).map_err(|e| anyhow!("{e}"))?;
     let (leaf, lm) = resolve(&specs, &m).ok_or_else(|| anyhow!("no subcommand"))?;
     match &leaf.dispatch {
-        Dispatch::Request(f) => f(lm),
-        Dispatch::Special(_) => Err(anyhow!("`{}` is a special-dispatch command", leaf.name)),
+        Dispatch::Request(f) => Ok(ParsedCommand::Request(f(lm)?)),
+        Dispatch::Special(s) => Ok(ParsedCommand::Special {
+            which: *s,
+            name: leaf.name,
+            matches: lm.clone(),
+        }),
     }
+}
+
+/// The palette's completion source: every invocable leaf as `(full name, about)`
+/// — top-level verbs plus one level of group subcommands ("members approve").
+pub fn command_index() -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for s in specs() {
+        if s.subs.is_empty() {
+            out.push((s.name.to_string(), s.about));
+        } else {
+            // The group's bare form is invocable too (e.g. `members` lists).
+            out.push((s.name.to_string(), s.about));
+            for c in &s.subs {
+                out.push((format!("{} {}", s.name, c.name), c.about));
+            }
+        }
+    }
+    out
 }
 
 /// Resolve the invoked matches down to the leaf `Spec` + its `ArgMatches`,
@@ -649,12 +696,13 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "edit",
-            "Patch an issue's LWW fields (ref optional — inferred from the git branch).",
+            "Patch an issue's fields (ref optional — inferred from the git branch).",
             vec![
                 A::pos_opt("reff", "Issue ref."),
                 A::val("title", "New title."),
                 A::val("status", "New status."),
                 A::val("priority", "New priority."),
+                A::val("body", "Replace the description (whole body).").short('b'),
             ],
             |m| {
                 Ok(Request::IssueEdit {
@@ -662,6 +710,7 @@ pub fn specs() -> Vec<Spec> {
                     title: opt_str(m, "title"),
                     status: opt_str(m, "status"),
                     priority: opt_str(m, "priority"),
+                    description: opt_str(m, "body"),
                 })
             },
         ),
