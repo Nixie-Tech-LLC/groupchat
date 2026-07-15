@@ -362,3 +362,30 @@ fn daemon_off_switch_is_shutdown() {
     // `stop` now belongs to the work loop; the daemon's off-switch is `shutdown`.
     parses_to(&["lait", "shutdown"], Request::Stop);
 }
+
+#[test]
+fn comment_single_arg_is_the_body_with_explicit_ref_still_working() {
+    // Two positionals: ref + body, exactly as typed.
+    parses_to(
+        &["lait", "comment", "ENG-1", "found it"],
+        Request::Comment {
+            reff: "ENG-1".into(),
+            body: "found it".into(),
+        },
+    );
+    // One positional: it's the BODY; the ref must come from the git branch.
+    // Off a KEY-n branch that inference fails with a teaching error (this test
+    // runs on arbitrary branches, so pin only the failure shape).
+    match parse_to_request(&["lait", "comment", "just a body, no ref"]) {
+        Ok(Request::Comment { reff, body }) => {
+            // On a KEY-n branch the inference kicks in — body must be intact.
+            assert_eq!(body, "just a body, no ref");
+            assert!(reff.contains('-'), "inferred ref is a KEY-n: {reff}");
+        }
+        Ok(other) => panic!("wrong request: {other:?}"),
+        Err(e) => assert!(
+            e.to_string().contains("inferred from the git branch"),
+            "teaching error expected, got: {e}"
+        ),
+    }
+}

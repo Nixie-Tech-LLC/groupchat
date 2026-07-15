@@ -901,7 +901,9 @@ fn prio_badge(p: Priority, color: bool) -> String {
 
 fn print_rows(rows: &[Row], out: Out) {
     if rows.is_empty() {
-        println!("(no issues)");
+        println!(
+            "(no issues here — file one: `lait new \"...\"`, or `lait ls --all` to include done)"
+        );
         return;
     }
     for r in rows {

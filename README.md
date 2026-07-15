@@ -146,32 +146,132 @@ gh release download dev -R Nixie-Tech-LLC/lait
 ```
 
 A dev binary reports its commit so it's unmistakable from a tagged release:
-`lait --version` → `lait 0.4.5-dev+<sha> (<date>)`.
+`lait --version` → `lait <version>-dev+<sha> (<date>)`.
 
-## Quickstart (the tracker)
+## Use it like this
 
-```bash
-cd my-project
-lait init                                    # found a space here (named after the
-                                             # directory, first project seeded)
-lait new "fix login race" -P high --start    # file it AND claim it: assigned to you,
-                                             # in progress, on branch mp-1-fix-login-race
+Every transcript below is real output from the shipped binary.
+
+### 1 · Solo: track a repo's work without leaving it
+
+No server, no signup, no browser tab. A space lives beside your code like `.git`
+does, and founding one seeds a project so the first command already works:
+
+```console
+$ cd my-project
+$ lait init
+founded space 'my-project' (ws_01JTHLH8QT…)
+project: my-project (MP) — `lait new "..."` files into it
+
+$ lait new "fix login race" -P high --start
+MP-1  fix login race  in_progress  · you
+switched to new branch 'mp-1-fix-login-race'
+
 # ...code, commit...
-lait done                                    # ✓ — the ref comes from the branch
-lait                                         # bare lait = your focus: inbox + your issues
-lait start MP-2                              # claim the next one (branch created)
-lait comment "looking into it"               # ref inferred from the branch too
-lait board                                   # workflow columns × ordered rows
-lait new "polish header" -l ux               # labels are created on first use
-lait projects add DSN "Design"               # more projects when you need them
-lait inbox                                   # what's addressed to you (durable)
-lait tui                                     # full-screen interactive board
-lait spaces                                  # every space on this machine
-lait -w my-project board                     # target a space from anywhere
-lait config set project.default DSN          # default project for `new`/`board`
+$ lait done                     # the ref comes from the branch you're on
+MP-1  fix login race  done
 ```
 
-Scripts capture the resolved handle from `--json`:
+Bare `lait` is your focus — unread inbox + what you're working on — and
+`lait board` / `lait tui` render the columns when you want the wall view.
+
+### 2 · Two of you: onboarding is one link
+
+Invites are bearer links carrying everything a joiner needs (the space, the
+trust root, a single-use auto-admit pass). Send one over any private channel;
+`join` creates their store, admits them, and verifies the whole handshake:
+
+```console
+you$ lait invite                # → lait://join/… (+ QR, copied to clipboard)
+
+them$ cd their-checkout && lait join <link> --nick bob
+joining alice's space with an invite pass — you should be admitted automatically…
+✔ space       ws_01JTHHNM05… ('acme')
+✔ daemon      online
+✔ membership  member
+✔ peer        1 peer online
+✔ synced      1 project(s), 2 issue(s)
+you're in — get to work.
+```
+
+Everything is end-to-end encrypted; membership is a signed key graph, so
+`lait members remove bob` rotates the key and revokes future reads. Prefer a
+human gate? `lait invite --require-approval`, then `lait members approve`.
+
+### 3 · The daily loop, on a branch
+
+Branch names carry the issue (`mp-1-fix-login-race`), so the loop needs no refs
+and no context switch — and your teammate's activity finds you, you don't poll it:
+
+```console
+$ lait start MP-3               # assign me + in_progress + branch, one commit
+MP-3  flaky reconnect  in_progress  · you
+switched to new branch 'mp-3-flaky-reconnect'
+$ lait comment "root cause: reused nonce"      # ref inferred from the branch
+$ lait done
+
+$ lait                          # your focus, <50ms
+Inbox (2): bob commented on MP-2 · someone moved MP-2
+$ lait inbox
+• MP-2  bob commented on  polish header  — on it, root cause is the header cache
+• MP-2  someone moved  polish header  — backlog → in_progress
+```
+
+The inbox is durable (survives restarts, unlike a feed you scrolled past) and
+attribution-honest: comments carry their real author; state changes never guess.
+
+### 4 · Your coding agent is a teammate
+
+Membership is a keypair and an issue is a perfect unit of agent work, so an MCP
+agent files, claims, comments, and closes issues exactly like a human — same
+verbs, same audit trail:
+
+```console
+$ lait install-mcp --client claude
+$ lait new "backfill created_at on legacy rows" -b "batched, dry-run first"
+$ lait assign MP-4 agent        # any member — agents included — by name or key
+# the agent: issue_start → comment progress → issue_done, over `lait mcp`
+$ lait inbox
+• MP-4  agent commented on  backfill created_at…  — dry run: 48,112 rows. PR up.
+```
+
+### 5 · Many clients, one machine
+
+Spaces are discovered from the directory you stand in, git-style — and the
+registry makes them addressable from anywhere:
+
+```console
+$ lait spaces
+acme        ws_01JTHHNM0  founded  up    [ACME, DSN]
+  ~/code/acme/.lait
+kiln        ws_01JTGX2P1  joined   idle  [KLN]  (from mira)
+  ~/code/kiln/.lait
+
+$ lait -w kiln board            # target any space from any directory
+$ lait config set project.default DSN   # per-space default for `new`/`board`
+```
+
+Project selection is one fixed chain: explicit `-p` → your branch's key →
+`project.default` → the only project → a teaching error. Filters (`ls -p`) are
+never defaulted, and `move -p` is always explicit — nothing silently guesses.
+
+### 6 · A team that's rarely online together
+
+Sync is peer-to-peer; a team spread across timezones pins one always-on peer
+(any box running the same binary) that backfills whoever comes online:
+
+```console
+seedbox$ lait join <link> && lait daemon --seed    # never idle-shuts-down
+laptop$  lait remote add <link-for-this-space>     # sticky; dialed every start
+```
+
+The seed holds ciphertext and the signed op-graph — it can neither read (E2EE)
+nor forge (genesis-anchored signatures). See [docker-compose.yml](docker-compose.yml).
+
+### Scripting
+
+Every command emits a stable, versioned DTO under `--json` — the same shapes the
+MCP tools return:
 
 ```bash
 id=$(lait new "fix login" -p ENG --json | jq -r .reff)
@@ -220,7 +320,7 @@ lait edit --status in_progress
 | `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | Set project and/or board order |
 | `assign <ref> <userref…> [--remove]` | Add/remove assignees |
 | `label <ref> [+LABEL…] [-LABEL…]` | Add/remove labels |
-| `comment <ref> [BODY]` | Append a comment (no BODY → stdin) |
+| `comment [ref] [BODY]` | Append a comment. One arg on a KEY-n branch = the body (ref inferred); no BODY → stdin |
 | `delete <ref>` | Tombstone an issue (stays in history) |
 | `history <ref>` | The issue's derived activity feed |
 
@@ -256,7 +356,9 @@ lait install-mcp --client claude     # or: cursor | windsurf | generic
 It merges a `lait` entry into that client's `mcpServers` (preserving any
 others), using this binary's absolute path and carrying `LAIT_HOME` if set.
 `--scope user|project` picks the config location; `--print` shows the result
-without writing.
+without writing. The MCP server binds a space the same way the CLI does (cwd
+discovery or `LAIT_HOME`) — run it where a space exists (`lait init` /
+`lait join` first; nothing is created implicitly).
 
 Or add it to `.mcp.json` by hand:
 
