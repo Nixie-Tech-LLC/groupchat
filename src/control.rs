@@ -597,6 +597,32 @@ pub enum Probe {
 ///   happened to change (it was `StatusInfo.name`) and reports *that* instead of
 ///   the version. Only `kind` and `protocol_version` need to hold still.
 pub async fn probe(home: &Path) -> Probe {
+    // A probe that can hang defeats its own purpose: it exists to *diagnose* a
+    // daemon that isn't answering, so it must not become the thing that isn't
+    // answering. Neither side of the exchange is guaranteed to fail fast —
+    // connecting to a Windows named pipe with no free instance parks rather than
+    // erroring (see the teardown note in `node::run_daemon`) — and a local IPC
+    // round trip that takes seconds is already broken by any measure.
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_inner(home)).await {
+        Ok(p) => p,
+        Err(_) => Probe::Foreign {
+            why: format!(
+                "it is not answering (no reply within {}s) — it may be wedged or \
+                 shutting down; stop it and re-run",
+                PROBE_TIMEOUT.as_secs()
+            ),
+            // A daemon we never heard from is not one we can identify, and an
+            // unidentified pid is not a safe signal target.
+            replaceable: false,
+        },
+    }
+}
+
+/// How long a local control round trip may take before the daemon counts as
+/// unresponsive. Generous: the healthy path is sub-millisecond.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn probe_inner(home: &Path) -> Probe {
     let Ok(name) = control_name(home) else {
         return Probe::Absent;
     };

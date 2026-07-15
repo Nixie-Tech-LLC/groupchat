@@ -45,6 +45,11 @@ fn config_root(home: &std::path::Path) -> std::path::PathBuf {
 fn lait(home: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         .env("LAIT_CONFIG_ROOT", config_root(home))
+        // Every other integration suite pins this, and so does the CI smoke: a
+        // daemon auto-spawned for a one-off command otherwise lingers for the
+        // 30-minute idle window, and a client that connects while one is tearing
+        // down can park (see `node::run_daemon`). Tests must not race that.
+        .env("LAIT_IDLE_SECS", "0")
         .arg("--home")
         .arg(home)
         .args(args)
@@ -123,6 +128,7 @@ fn a_client_side_error_keeps_the_cli_contract() {
         Command::new(bin())
             .env("LAIT_HOME", &home)
             .env("LAIT_CONFIG_ROOT", config_root(&home))
+            .env("LAIT_IDLE_SECS", "0")
             .args(args)
             .output()
             .expect("spawn lait")

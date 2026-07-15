@@ -162,7 +162,22 @@ pub async fn run() -> std::process::ExitCode {
     // `out` has to exist before a failure can be reported the right way (the
     // `--json` DTO vs a prose line), which is why the sink sits here and not in
     // `main`.
-    match dispatch(&specs, &matches, out).await {
+    let mut result = dispatch(&specs, &matches, out).await;
+    // A daemon this build can't talk to blocks every verb, and clearing it is
+    // usually one keystroke — so offer, then retry once. Driven off the error
+    // rather than a probe before dispatch: the overwhelmingly common case is a
+    // daemon that works, and it must not pay a round trip for this. A retry is
+    // safe precisely because the failure means we never reached the daemon, so
+    // nothing was written.
+    if let Err(e) = &result {
+        if crate::cli::is_replaceable_foreign(e) {
+            match crate::cli::heal_from_error(e, out).await {
+                Ok(()) => result = dispatch(&specs, &matches, out).await,
+                Err(e) => return crate::cli::report_error(&e, out),
+            }
+        }
+    }
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => crate::cli::report_error(&e, out),
     }
@@ -333,15 +348,6 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
         }
         Err(e) => return Err(e),
     };
-
-    // A daemon that answers but speaks a different wire shape blocks every verb
-    // below it, so clear it once here rather than teaching each verb about it.
-    // The service specs are excluded: `daemon` *is* the daemon and must report
-    // the conflict rather than resolve it, and `mcp` speaks JSON-RPC on stdio
-    // where a prompt would corrupt the stream.
-    if !leaf.service {
-        crate::cli::heal_foreign_daemon(&home, out).await?;
-    }
 
     match &leaf.dispatch {
         // The uniform path: build one Request and round-trip the daemon.

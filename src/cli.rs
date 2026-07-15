@@ -5,7 +5,12 @@
 //! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
 //! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
-use std::{io::Write, path::Path, process::Stdio, time::Duration};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -86,7 +91,15 @@ impl std::error::Error for CliError {}
 /// An unclassified error is `1`, so the classification is additive: a plain
 /// `anyhow!` keeps behaving exactly as it did.
 fn exit_code_for_error(e: &anyhow::Error) -> i32 {
-    e.downcast_ref::<CliError>().map_or(1, |c| c.code)
+    if let Some(c) = e.downcast_ref::<CliError>() {
+        return c.code;
+    }
+    // Something is listening and no request will ever get through to it: `3`,
+    // daemon unreachable, in the sense that matters.
+    if e.downcast_ref::<ForeignDaemon>().is_some() {
+        return 3;
+    }
+    1
 }
 
 /// Report a failure and return the process exit code — the one place a
@@ -297,6 +310,31 @@ fn daemon_log_tail(path: &Path, lines: usize) -> Option<String> {
     )
 }
 
+/// Homes whose daemon this process has already verified.
+///
+/// One CLI invocation can reach [`client`] several times — `delete` peeks the
+/// issue's title before asking about it — and each [`control::probe`] is a fresh
+/// connect. That is not free: on Windows the control channel is a named pipe
+/// serving one client per accepted instance, and a client that connects while no
+/// instance is free can park (see the teardown note in `node::run_daemon`). Verify
+/// once per home, then stay out of the way.
+type VerifiedSet = std::sync::Mutex<std::collections::HashSet<PathBuf>>;
+static VERIFIED_DAEMONS: std::sync::OnceLock<VerifiedSet> = std::sync::OnceLock::new();
+
+fn already_verified(home: &Path) -> bool {
+    VERIFIED_DAEMONS
+        .get_or_init(VerifiedSet::default)
+        .lock()
+        .map(|s| s.contains(home))
+        .unwrap_or(false)
+}
+
+fn mark_verified(home: &Path) {
+    if let Ok(mut s) = VERIFIED_DAEMONS.get_or_init(VerifiedSet::default).lock() {
+        s.insert(home.to_path_buf());
+    }
+}
+
 /// Ensure a daemon is running for this home dir, spawning one if needed.
 ///
 /// The three outcomes of [`control::probe`] are kept distinct on purpose. Only
@@ -304,9 +342,22 @@ fn daemon_log_tail(path: &Path, lines: usize) -> Option<String> {
 /// holds this home's lock, so spawning a second one produces a child that dies
 /// instantly and a wait for a daemon that was never going to answer.
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
+    if already_verified(home) {
+        return Ok(());
+    }
     match control::probe(home).await {
-        control::Probe::Healthy => return Ok(()),
-        control::Probe::Foreign { why, .. } => return Err(foreign_daemon_error(home, &why)),
+        control::Probe::Healthy => {
+            mark_verified(home);
+            return Ok(());
+        }
+        control::Probe::Foreign { why, replaceable } => {
+            return Err(ForeignDaemon {
+                home: home.to_path_buf(),
+                why,
+                replaceable,
+            }
+            .into())
+        }
         control::Probe::Absent => {}
     }
     // A daemon can only open an initialized store — fail fast with guidance
@@ -371,28 +422,44 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
 /// Detection is at the transport level (see [`control::probe`]) because that is
 /// the one thing a wire-shape change cannot break — which matters here, since the
 /// whole condition *is* a wire-shape change.
-pub async fn heal_foreign_daemon(home: &Path, out: Out) -> Result<()> {
-    let control::Probe::Foreign { why, replaceable } = control::probe(home).await else {
-        return Ok(());
+/// `true` if `e` is a foreign daemon this build may replace — i.e. worth offering
+/// [`heal_from_error`] and retrying.
+pub fn is_replaceable_foreign(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ForeignDaemon>()
+        .is_some_and(|f| f.replaceable)
+}
+
+/// Offer to clear a daemon this build can't talk to. `Ok(())` = repaired; the
+/// caller may retry what failed.
+///
+/// Driven from the **error path**, never a probe up front: the happy path (a
+/// healthy daemon, or none) must not pay a connect for a repair it will never
+/// need. Errors are the only place this condition exists, so that is where the
+/// offer belongs.
+pub async fn heal_from_error(e: &anyhow::Error, out: Out) -> Result<()> {
+    let Some(f) = e.downcast_ref::<ForeignDaemon>() else {
+        return Err(anyhow!("{e:#}"));
     };
     // Only offer the repair when *we* are the newer side. Offering to stop a
     // daemon that is ahead of this build would be offering to break the node:
     // a downgrade at best, and an unopenable store at worst. There, the only
     // honest answer is the one the handshake already gives — upgrade.
-    if !replaceable {
-        return Err(foreign_daemon_error(home, &why));
+    if !f.replaceable {
+        return Err(anyhow!("{e:#}"));
     }
-    let pid = crate::config::daemon_pid(home)
+    let pid = crate::config::daemon_pid(&f.home)
         .map(|p| format!(" (pid {p})"))
         .unwrap_or_default();
-    // `why` now comes from the version handshake, so it names the actual mismatch
+    // `why` comes from the version handshake, so it names the actual mismatch
     // ("speaks control protocol v1, this build speaks v2") rather than whichever
-    // field happened to fail to decode. No need to guess at the cause on its
-    // behalf any more.
-    eprintln!("a daemon is already running for this space{pid}: {why}");
+    // field happened to fail to decode.
+    eprintln!(
+        "a daemon is already running for this space{pid}: {why}",
+        why = f.why
+    );
     match confirm("stop it and continue?", out) {
         Confirmed::Yes => {
-            stop_daemon_verified(home).await?;
+            stop_daemon_verified(&f.home).await?;
             eprintln!("stopped it — continuing.");
             Ok(())
         }
@@ -459,18 +526,34 @@ pub async fn stop_daemon_verified(home: &Path) -> Result<()> {
     ))
 }
 
-/// A daemon is listening on this home but we couldn't talk to it — practically
-/// always a version skew (the binary was upgraded, the daemon wasn't restarted).
-fn foreign_daemon_error(home: &Path, why: &str) -> anyhow::Error {
-    // Unreachable in the sense that matters: something is there, and no request
-    // will ever get through to it. `why` is the handshake's own diagnosis and
-    // already carries the way out (`lait shutdown` / `lait update`).
-    CliError::unreachable(format!(
-        "a daemon is already running for this space, but {why}  (home: {home})",
-        home = home.display(),
-    ))
-    .into()
+/// A daemon is listening on this home that this build cannot talk to — in
+/// practice a version skew (the binary was upgraded, the daemon wasn't restarted).
+///
+/// Typed rather than a message, so the repair can be offered from the error path
+/// (see [`heal_from_error`]) instead of probing eagerly on every command that
+/// will never need it. Exit code `3`: unreachable in the sense that matters —
+/// something is there, and no request will ever get through to it.
+#[derive(Debug)]
+pub struct ForeignDaemon {
+    pub home: PathBuf,
+    /// The handshake's own diagnosis; already carries the way out.
+    pub why: String,
+    /// Whether replacing it is the right repair — false when it is ahead of us.
+    pub replaceable: bool,
 }
+
+impl std::fmt::Display for ForeignDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a daemon is already running for this space, but {why}  (home: {home})",
+            why = self.why,
+            home = self.home.display(),
+        )
+    }
+}
+
+impl std::error::Error for ForeignDaemon {}
 
 /// The spawned daemon exited before answering — report its own last words rather
 /// than a timeout.
