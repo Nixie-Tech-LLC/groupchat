@@ -43,7 +43,6 @@ pub enum Special {
     Daemon,
     Mcp,
     InstallMcp,
-    Tui,
     Serve,
     Invite,
     Join,
@@ -1004,12 +1003,6 @@ pub fn specs() -> Vec<Spec> {
             },
         ),
         Spec::special(
-            "tui",
-            "Launch the full-screen TUI board.",
-            vec![],
-            Special::Tui,
-        ),
-        Spec::special(
             "serve",
             "Open your spaces in a browser (local, loopback-only).",
             vec![
@@ -1298,7 +1291,7 @@ pub fn specs() -> Vec<Spec> {
         s.order = match s.name {
             "new" | "start" | "done" | "stop" | "inbox" | "show" | "board" | "ls" | "edit"
             | "move" | "assign" | "label" | "comment" | "delete" | "history" | "activity"
-            | "tui" | "serve" => ORDER_DAILY,
+            | "serve" => ORDER_DAILY,
             "init" | "join" | "invite" | "spaces" | "members" | "doctor" | "status" | "who" => {
                 ORDER_SHARE
             }

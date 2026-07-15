@@ -1,7 +1,10 @@
-//! Shared list-rendering machinery (windowing + row styling), extracted from
-//! the inline `lait members` picker so every list surface — members_ui, the
-//! TUI's pickers, and the list-shaped screens — scrolls and highlights the
-//! same way.
+//! List-rendering machinery for the inline `lait members` picker: windowing
+//! (keep the selection visible) plus row styling.
+//!
+//! Originally extracted *from* `members_ui` so it could be shared with the TUI's
+//! pickers and list screens. The TUI is gone; `members_ui` is the only caller
+//! again, and this stays a separate module purely because its windowing is worth
+//! testing on its own — not because anything else needs it.
 
 use ratatui::style::Style;
 use ratatui::text::Line;

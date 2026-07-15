@@ -428,7 +428,6 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 let out_s = install::install_mcp(client, scope, &name, print)?;
                 println!("{out_s}");
             }
-            Special::Tui => crate::tui::run(&home).await?,
             Special::Invite => {
                 let email = m.get_one::<String>("email").cloned();
                 let require_approval = m.get_flag("require_approval");

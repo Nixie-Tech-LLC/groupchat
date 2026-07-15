@@ -11,7 +11,7 @@ engineering) shipped, with security review and receipt/tier hardening the main d
 
 ## The system in one screen
 
-One binary, five surfaces, one persistent node per space:
+One binary, four surfaces, one persistent node per space:
 
 - `lait daemon` — the long-lived node: owns the Loro documents (a per-space
   catalog + one doc per issue) over a git-backed durable store, plus the iroh
@@ -19,7 +19,6 @@ One binary, five surfaces, one persistent node per space:
   channel. Auto-spawned on first use; only `lait init`/`lait join` create stores.
 - `lait <cmd>` — the CLI: flat verbs on issues, plural nouns on registries;
   `--json` emits the stable, versioned DTO (S§7.3).
-- `lait tui` — a full-screen board client living off the doorbell stream (U§4).
 - `lait serve` — the same façade over loopback HTTP + SSE, so a browser can be a
   client too. The only surface that is global to the machine rather than bound to
   one store: it supervises a daemon per space ([`SERVE.md`](./SERVE.md)).
@@ -57,7 +56,7 @@ UI §4. They are the design of record, kept in sync with the shipped code.
 |---|---|---|
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | `A§` | The system: layered design, the git/iroh/Loro split, sync protocol, seed role, E2EE model, decision log. |
 | [`SCHEMA.md`](./SCHEMA.md) | `S§` | The data shapes across the three layers (CRDT storage / control protocol / wire) and **what authority each field carries**. |
-| [`UI.md`](./UI.md) | `U§` | The three drive surfaces — CLI, TUI, MCP — and the one imperative façade they share over the CRDT. |
+| [`UI.md`](./UI.md) | `U§` | The drive surfaces — CLI, web ([`SERVE.md`](./SERVE.md)), MCP — and the one imperative façade they share over the CRDT. |
 
 ## Focused designs
 
