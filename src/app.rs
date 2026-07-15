@@ -14,7 +14,7 @@
 //! its bespoke `Special` handler (below). Completions/man still generate from the
 //! same live tree (`cmdspec::build_cli`).
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::ArgMatches;
 use clap_complete::{generate, Shell};
 
@@ -289,6 +289,19 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             }
             return crate::cli::run(&home, Request::Status, out).await;
         }
+        // `serve` is global to the machine, not bound to one store: it reads the
+        // workspace registry and attaches each space's daemon lazily, so it must
+        // not resolve (or demand) a store in the cwd — running it from anywhere
+        // is the point.
+        Dispatch::Special(Special::Serve) => {
+            let port = m
+                .get_one::<String>("port")
+                .map(|p| p.parse::<u16>())
+                .transpose()
+                .context("--port must be a number 0-65535")?
+                .unwrap_or(crate::serve::DEFAULT_PORT);
+            return crate::serve::run(port, m.get_flag("open")).await;
+        }
         // The workspace registry + config: pure local state, no store/daemon.
         Dispatch::Special(Special::Workspaces) => {
             crate::cli::print_workspaces(out).await;
@@ -463,6 +476,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
             | Special::ConfigList
             | Special::Init
             | Special::Join
+            | Special::Serve
             | Special::Update => {
                 unreachable!("handled before home resolution")
             }

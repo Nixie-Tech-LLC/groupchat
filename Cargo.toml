@@ -120,6 +120,14 @@ directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# `lait serve` — the local HTTP surface (SERVE.md). axum is a thin router over
+# hyper + tower + http, all three of which are already in the tree transitively
+# (iroh, self_update), so the adapter buys routing and SSE rather than a new
+# stack. `tokio-stream`'s `sync` feature is the `broadcast::Receiver` -> `Stream`
+# bridge the doorbell multiplex needs.
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
 # mcp server (stdio)
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io"] }
 # Native `lait update`: GitHub-release self-updater. `ureq` backend + `rustls`

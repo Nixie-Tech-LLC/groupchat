@@ -41,6 +41,7 @@ pub mod node;
 pub mod presence;
 pub mod proto;
 pub mod registry;
+pub mod serve;
 pub mod store;
 pub mod sync;
 pub mod tracker;

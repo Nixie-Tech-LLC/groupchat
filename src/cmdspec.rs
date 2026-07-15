@@ -44,6 +44,7 @@ pub enum Special {
     Mcp,
     InstallMcp,
     Tui,
+    Serve,
     Invite,
     Join,
     Watch,
@@ -1008,6 +1009,15 @@ pub fn specs() -> Vec<Spec> {
             vec![],
             Special::Tui,
         ),
+        Spec::special(
+            "serve",
+            "Open your spaces in a browser (local, loopback-only).",
+            vec![
+                A::val("port", "Port to bind on 127.0.0.1 (default 7717)."),
+                A::flag("open", "Open the URL in your default browser."),
+            ],
+            Special::Serve,
+        ),
         Spec::req(
             "doctor",
             "Guided-join verifier: diagnose why you can't get to work yet.",
@@ -1288,7 +1298,7 @@ pub fn specs() -> Vec<Spec> {
         s.order = match s.name {
             "new" | "start" | "done" | "stop" | "inbox" | "show" | "board" | "ls" | "edit"
             | "move" | "assign" | "label" | "comment" | "delete" | "history" | "activity"
-            | "tui" => ORDER_DAILY,
+            | "tui" | "serve" => ORDER_DAILY,
             "init" | "join" | "invite" | "spaces" | "members" | "doctor" | "status" | "who" => {
                 ORDER_SHARE
             }
