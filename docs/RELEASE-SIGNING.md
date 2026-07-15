@@ -97,18 +97,121 @@ CI-tested without a tag.
 
 ### Required repository secrets
 
+Add these under **Settings → Secrets and variables → Actions** once the account
+setup below produces them. All certs must be issued to the legal entity **Nixie
+Solutions LLC** (distinct from the `Nixie-Tech-LLC` GitHub org slug).
+
 | Secret | For | Source |
 |---|---|---|
-| `APPLE_DEVELOPER_ID` | codesign identity ("Developer ID Application: Nixie Solutions LLC (TEAMID)") | Apple Developer (org enrollment) |
-| `APPLE_CERT_P12` | base64 of the Developer ID cert + key `.p12` | Apple Developer |
-| `APPLE_CERT_PASSWORD` | password for the `.p12` | you |
-| `APPLE_NOTARY_KEY` / `APPLE_NOTARY_KEY_ID` / `APPLE_NOTARY_ISSUER` | App Store Connect API key for `notarytool` | App Store Connect |
-| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC login for Azure Artifact Signing | Azure |
-| `AZURE_SIGNING_ACCOUNT` / `AZURE_SIGNING_PROFILE` | the Artifact Signing account + cert profile | Azure |
+| `APPLE_TEAM_ID` | 10-char Apple Team ID | Apple Developer (after enrollment) |
+| `APPLE_DEVELOPER_ID` | codesign identity, e.g. `Developer ID Application: Nixie Solutions LLC (TEAMID)` | Apple Developer |
+| `APPLE_CERT_P12` / `APPLE_CERT_PASSWORD` | base64 of the **Developer ID Application** cert+key `.p12`, and its password | Apple Developer + you |
+| `APPLE_INSTALLER_ID` | pkg-signing identity, e.g. `Developer ID Installer: Nixie Solutions LLC (TEAMID)` | Apple Developer |
+| `APPLE_INSTALLER_P12` / `APPLE_INSTALLER_PASSWORD` | base64 of the **Developer ID Installer** cert+key `.p12`, and its password | Apple Developer + you |
+| `APPLE_NOTARY_KEY` / `APPLE_NOTARY_KEY_ID` / `APPLE_NOTARY_ISSUER` | base64 of the App Store Connect API `.p8`, its Key ID, and the Issuer ID (for `notarytool`) | App Store Connect |
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC login (federated, no stored cert) | Azure / Entra ID |
+| `AZURE_SIGNING_ENDPOINT` | region endpoint, e.g. `https://wus2.codesigning.azure.net` | Azure |
+| `AZURE_SIGNING_ACCOUNT` / `AZURE_SIGNING_PROFILE` | the Artifact Signing account name + certificate profile name | Azure |
 
-All certs must be issued to the legal entity **Nixie Solutions LLC** (distinct
-from the `Nixie-Tech-LLC` GitHub org slug). Apple org enrollment needs a D-U-N-S
-number for that exact name — request it early; it is the long pole.
+## Account setup runbook (what you do)
+
+### A. Apple / macOS — start this first (the long pole)
+
+The D-U-N-S request + org enrollment can take several business days, so kick it
+off before anything else.
+
+1. **Get a D-U-N-S number** for the exact legal name **Nixie Solutions LLC**.
+   Use Apple's lookup at <https://developer.apple.com/enroll/duns-lookup/> — it
+   requests one from Dun & Bradstreet for free if you don't have one. (Up to
+   ~5 business days.)
+2. **Enroll in the Apple Developer Program as an *Organization*** ($99/yr,
+   <https://developer.apple.com/enroll/>). Needs the D-U-N-S, the legal name, and
+   your authority to bind the company. When approved you get a **Team ID**
+   (10 chars) → `APPLE_TEAM_ID`.
+3. **Create two certificates.** Generate one CSR and reuse it for both:
+   ```sh
+   openssl req -newkey rsa:2048 -nodes \
+     -keyout lait-signing.key -out lait-signing.csr \
+     -subj "/CN=Nixie Solutions LLC/C=US"
+   ```
+   At <https://developer.apple.com/account/resources/certificates> → **+**:
+   - **Developer ID Application** (signs the `lait` binary) — upload the CSR,
+     download the `.cer`.
+   - **Developer ID Installer** (signs the `.pkg`) — upload the same CSR,
+     download the `.cer`.
+   Bundle each `.cer` with the private key into a password-protected `.p12`:
+   ```sh
+   # repeat for the installer cert
+   openssl x509 -in developerID_application.cer -inform DER -out app.pem
+   openssl pkcs12 -export -out app.p12 -inkey lait-signing.key -in app.pem
+   ```
+   The identity strings (`security find-identity -v -p codesigning` once imported,
+   or from the portal) are `Developer ID Application: Nixie Solutions LLC (TEAMID)`
+   → `APPLE_DEVELOPER_ID`, and the Installer equivalent → `APPLE_INSTALLER_ID`.
+4. **Create an App Store Connect API key** for notarization: App Store Connect →
+   **Users and Access → Integrations → App Store Connect API → Team Keys → +**,
+   role **Developer**. Download the `.p8` **once** (it's unrecoverable). Record
+   the **Key ID** and the page's **Issuer ID**.
+5. **Base64 the binaries** for the secrets:
+   ```sh
+   base64 -i app.p12       | pbcopy   # → APPLE_CERT_P12
+   base64 -i installer.p12 | pbcopy   # → APPLE_INSTALLER_P12
+   base64 -i AuthKey_XXXX.p8 | pbcopy # → APPLE_NOTARY_KEY
+   ```
+   Add those plus `APPLE_CERT_PASSWORD`, `APPLE_INSTALLER_PASSWORD`,
+   `APPLE_DEVELOPER_ID`, `APPLE_INSTALLER_ID`, `APPLE_NOTARY_KEY_ID`,
+   `APPLE_NOTARY_ISSUER`, `APPLE_TEAM_ID`.
+
+### B. Azure / Windows — Artifact Signing
+
+1. **A *paid* Azure subscription** — free/trial/sponsored subs are not eligible
+   for signing. Record the **Subscription ID**.
+2. **Create an Artifact Signing account** (portal → search "Trusted Signing" /
+   "Artifact Signing" → Create). SKU **Basic** (~$9.99/mo, 5 000 signatures).
+   Choose a US region + resource group. Note the **account name** and the
+   **region endpoint** (e.g. `https://wus2.codesigning.azure.net`).
+3. **Validate identity** for **Nixie Solutions LLC** (account → Identity
+   validations → new *Organization* validation: legal name, address, etc.).
+   ⚠️ Org validation for a young LLC can trip CA/Browser young-entity checks; if
+   it stalls, the **US individual** validation path is the confirmed fallback
+   (the cert then issues under your name rather than the LLC). Allow a few days.
+4. **Create a Certificate Profile** of type **Public Trust** once validated →
+   `AZURE_SIGNING_PROFILE`.
+5. **Wire OIDC** so Actions signs with no stored cert:
+   - Create an **Entra ID app registration** (or a user-assigned managed
+     identity). Note **Tenant ID** and **Client ID**.
+   - On it, add a **federated credential** for GitHub with subject
+     `repo:Nixie-Tech-LLC/lait:ref:refs/tags/*` (restrict to tag releases; add an
+     environment-scoped one too if you gate releases on an environment).
+   - Grant that identity the **Trusted Signing Certificate Profile Signer** role
+     on the signing account (account → Access control (IAM) → Add role
+     assignment).
+6. **Add secrets**: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`,
+   `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`.
+
+## What the CI will do (what I wire once the secrets exist)
+
+Each step is gated on `secrets.<X> != ''` and soft-skips when absent. Shapes:
+
+**macOS** — inserted between *Build* and *Archive* in the `macos` job, so the
+tarball ships the signed binary; the `.pkg` is an additional stapled asset:
+```yaml
+- name: Import signing certs           # temp keychain from APPLE_CERT_P12 / APPLE_INSTALLER_P12
+- name: Codesign (hardened runtime)    # codesign --options runtime --timestamp -s "$APPLE_DEVELOPER_ID" lait
+#   (Archive step runs here → tarball now holds the signed binary)
+- name: Notarize the binary            # ditto -c -k lait notarize.zip; xcrun notarytool submit --wait (App Store Connect key)
+- name: Build + notarize + staple .pkg # pkgbuild --sign "$APPLE_INSTALLER_ID" …; notarytool submit --wait; xcrun stapler staple lait-<target>.pkg
+- name: Upload .pkg                     # extra release asset (bare Mach-O can't be stapled; the pkg can)
+```
+**Windows** — between *Build* and *Archive* in the `windows` job, so the zipped
+`lait.exe` is signed:
+```yaml
+- uses: azure/login@v2                  # OIDC via AZURE_* — no stored cert
+- uses: azure/trusted-signing-action@v0 # signs target\…\lait.exe against AZURE_SIGNING_ACCOUNT/PROFILE
+#   (Archive step zips the now-signed exe)
+```
+**Linux** — no OS signing; the build-provenance attestation (already wired)
+covers it.
 
 ## Verification strategy (given it can't run locally)
 
@@ -122,11 +225,23 @@ number for that exact name — request it early; it is the long pole.
 
 ## Migration steps (incremental, each independently valid)
 
-1. Flip `build-local-artifacts = false` + `local-artifacts-jobs`, add a
-   build-binaries.yml that reproduces **today's unsigned** archives exactly
-   (Linux/macOS/Windows), regenerate `release.yml`, confirm `dist plan` matches.
-   → releases keep working, unsigned, on the new architecture.
-2. Add macOS codesign + notarize + `.pkg`, secret-gated.
-3. Add Windows Azure signing, secret-gated.
-4. Add attestation into the custom job.
-5. Flip the first signed `-rc` release; verify; then stable.
+1. ✅ **Done** (`b3bc929`). Flip `build-local-artifacts = false` +
+   `local-artifacts-jobs`, add a build-binaries.yml that reproduces today's
+   **unsigned** archives exactly (Linux/macOS/Windows), regenerate `release.yml`,
+   confirm `dist plan` matches. Releases work, unsigned, on the new architecture.
+2. ✅ **Done** (`b3bc929`). Attestation runs inside the custom job (skipped on PR
+   test-builds).
+3. ⏳ **Blocked on accounts.** Add macOS codesign + notarize + `.pkg`, secret-gated
+   (§ "What the CI will do"). Do the Apple account setup (§A) first.
+4. ⏳ **Blocked on accounts.** Add Windows Azure signing, secret-gated. Do the
+   Azure setup (§B) first.
+5. Flip the first signed `-rc` release; run the verification checklist above;
+   then a stable tag.
+
+### Who does what next
+
+- **You:** work through §A (Apple — start the D-U-N-S now) and §B (Azure), then
+  add the secrets to the repo. Ping when they're in.
+- **Me:** once the secrets exist, wire steps 3–4 into `build-binaries.yml` at the
+  marked `SIGNING SLOT` comments, then we cut a `-rc` tag and verify signatures
+  before any stable release.
