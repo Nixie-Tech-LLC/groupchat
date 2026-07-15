@@ -71,9 +71,14 @@ pub async fn dispatch_key(app: &mut App, ev: KeyEvent) -> Result<()> {
 
 /// The context the help overlay describes (what's under it).
 pub fn underlying_ctx(app: &App) -> FocusKind {
+    use super::app::Screen;
     match (app.screen, &app.peek) {
-        (super::app::Screen::Board, Some(p)) if p.focused => FocusKind::Peek,
-        (super::app::Screen::Board, _) => FocusKind::Board,
+        (Screen::Board, Some(p)) if p.focused => FocusKind::Peek,
+        (Screen::Board, _) => FocusKind::Board,
+        (_, Some(_)) => FocusKind::Peek,
+        (Screen::Inbox, _) => FocusKind::Inbox,
+        (Screen::Members, _) => FocusKind::Members,
+        (Screen::Spaces, _) => FocusKind::Spaces,
         _ => FocusKind::List,
     }
 }

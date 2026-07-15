@@ -16,7 +16,10 @@ use crate::config::Settings;
 pub enum FocusKind {
     Board,
     Peek,
-    List, // any list-shaped screen (inbox/activity/members/spaces/…)
+    List, // generic list-shaped screens (activity, and stubs)
+    Inbox,
+    Members,
+    Spaces,
     Help,
     // Input layers (Editor/Picker/Palette/Confirm) consume raw keys and never
     // hit the keymap, except through their own explicit Submit/Cancel checks.
@@ -158,6 +161,9 @@ pub struct Keymap {
     pub board: Vec<Binding>,
     pub peek: Vec<Binding>,
     pub list: Vec<Binding>,
+    pub inbox: Vec<Binding>,
+    pub members: Vec<Binding>,
+    pub spaces: Vec<Binding>,
     pub help: Vec<Binding>,
 }
 
@@ -253,12 +259,31 @@ impl Keymap {
             bl(KeyPattern::code(K::Enter), OpenPeek, "open"),
             b(KeyPattern::ch('c'), Create, "new"),
         ];
+        let inbox = vec![
+            bl(KeyPattern::code(K::Enter), OpenPeek, "open"),
+            bl(KeyPattern::ch('C'), InboxClear, "mark all read"),
+        ];
+        let members = vec![
+            bl(KeyPattern::ch('y'), MemberApprove, "approve"),
+            b(KeyPattern::ch('n'), MemberDismiss, "dismiss"),
+            bl(KeyPattern::ch('R'), MemberRename, "rename"),
+            b(KeyPattern::ch('d'), MemberRemove, "remove"),
+            bl(KeyPattern::ch('i'), MemberInvite, "invite link"),
+        ];
+        let spaces = vec![
+            bl(KeyPattern::code(K::Enter), SpaceSwitch, "switch"),
+            bl(KeyPattern::ch('f'), SpaceForget, "forget"),
+            b(KeyPattern::ch('P'), SpacePrune, "prune missing"),
+        ];
         let help = vec![bl(KeyPattern::code(K::Enter), Submit, "run action")];
         Keymap {
             global,
             board,
             peek,
             list,
+            inbox,
+            members,
+            spaces,
             help,
         }
     }
@@ -290,6 +315,9 @@ impl Keymap {
                 &mut self.board,
                 &mut self.peek,
                 &mut self.list,
+                &mut self.inbox,
+                &mut self.members,
+                &mut self.spaces,
                 &mut self.help,
             ] {
                 for binding in table.iter_mut().filter(|b| b.action == action) {
@@ -309,6 +337,9 @@ impl Keymap {
             FocusKind::Board => &self.board,
             FocusKind::Peek => &self.peek,
             FocusKind::List => &self.list,
+            FocusKind::Inbox => &self.inbox,
+            FocusKind::Members => &self.members,
+            FocusKind::Spaces => &self.spaces,
             FocusKind::Help => &self.help,
         }
     }
@@ -337,6 +368,9 @@ impl Keymap {
             FocusKind::Board => "board",
             FocusKind::Peek => "issue",
             FocusKind::List => "list",
+            FocusKind::Inbox => "inbox",
+            FocusKind::Members => "members",
+            FocusKind::Spaces => "spaces",
             FocusKind::Help => "help",
         };
         vec![(ctx_name, self.table(ctx)), ("global", &self.global)]

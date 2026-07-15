@@ -16,7 +16,11 @@ use ratatui::layout::Rect;
 use crate::cmdspec::Special;
 use crate::control::{request, BoardPos, CatalogScope, Doorbell, Request, Response};
 use crate::diagnose::DiagnosisView;
-use crate::dto::{ActivityEvent, BoardView, IssueView, Priority, ProjectDto, Row};
+use crate::dto::{
+    ActivityEvent, BoardView, InboxEntry, IssueView, JoinRequestDto, MemberDto, Priority,
+    ProjectDto, Row,
+};
+use crate::workspaces::{self, WorkspaceEntry};
 
 use super::action::Action;
 use super::keymap::{FocusKind, Keymap};
@@ -113,6 +117,14 @@ impl Overlay {
     }
 }
 
+/// One selectable Members-screen row: a pending request (approvable) or an
+/// existing member — the members_ui domain, merged (requests always on top).
+#[derive(Clone)]
+pub enum MemberItem {
+    Request(JoinRequestDto),
+    Member(MemberDto),
+}
+
 /// Per-list cursor + scroll window for list-shaped screens.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ListCursor {
@@ -128,11 +140,20 @@ pub struct App {
     pub project_idx: usize,
     applied_default_project: bool,
     pub board: Option<BoardView>,
-    #[allow(dead_code)] // the Activity screen renders these in Stage 3
     pub activity: Vec<ActivityEvent>,
     pub inbox_unread: u64,
+    pub inbox_entries: Vec<InboxEntry>,
+    pub members: Vec<MemberDto>,
+    pub member_requests: Vec<JoinRequestDto>,
+    /// Request keys hidden from this session's view (`n`) — view-only; the
+    /// request lives in the daemon's event ring until it ages out.
+    pub dismissed_requests: HashSet<String>,
+    pub spaces: Vec<WorkspaceEntry>,
     pub diagnosis: Option<DiagnosisView>,
     pub peers_online: usize,
+    /// Set by a live space switch: the run loop re-subscribes to the (new)
+    /// daemon after the current event is handled.
+    pub needs_resubscribe: bool,
     // ---- prediction ----
     pub overlay: Overlay,
     // ---- UI state ----
@@ -165,8 +186,14 @@ impl App {
             board: None,
             activity: Vec::new(),
             inbox_unread: 0,
+            inbox_entries: Vec::new(),
+            members: Vec::new(),
+            member_requests: Vec::new(),
+            dismissed_requests: HashSet::new(),
+            spaces: Vec::new(),
             diagnosis: None,
             peers_online: 0,
+            needs_resubscribe: false,
             overlay: Overlay::default(),
             screen: Screen::Board,
             peek: None,
@@ -196,6 +223,12 @@ impl App {
         match (self.screen, &self.peek) {
             (Screen::Board, Some(p)) if p.focused => FocusKind::Peek,
             (Screen::Board, _) => FocusKind::Board,
+            // A peek opened from a list screen takes over the body — it owns
+            // motion until Esc closes it.
+            (_, Some(_)) => FocusKind::Peek,
+            (Screen::Inbox, _) => FocusKind::Inbox,
+            (Screen::Members, _) => FocusKind::Members,
+            (Screen::Spaces, _) => FocusKind::Spaces,
             _ => FocusKind::List,
         }
     }
@@ -370,6 +403,46 @@ impl App {
         }
     }
 
+    /// The full inbox (newest-first; the first `unread` entries are past the
+    /// read watermark). `clear` stamps the watermark after listing.
+    pub async fn reload_inbox(&mut self, clear: bool) -> Result<()> {
+        if let Response::Inbox { entries, unread } = self.req(Request::Inbox { clear }).await? {
+            self.inbox_entries = entries;
+            self.inbox_unread = if clear { 0 } else { unread };
+        }
+        Ok(())
+    }
+
+    pub async fn reload_activity(&mut self) -> Result<()> {
+        if let Response::Activity { events, .. } = self.req(Request::Activity { since: 0 }).await? {
+            self.activity = events;
+        }
+        Ok(())
+    }
+
+    /// Roster + pending requests. Members are authoritative; a request-list
+    /// failure (non-admin, transient) degrades to empty like members_ui.
+    pub async fn reload_members(&mut self) -> Result<()> {
+        match self.req(Request::Members).await? {
+            Response::Members { members } => self.members = members,
+            Response::Error { message, .. } => {
+                self.status.error(message);
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.member_requests = match self.req(Request::MemberRequests).await {
+            Ok(Response::JoinRequests { requests }) => requests,
+            _ => Vec::new(),
+        };
+        Ok(())
+    }
+
+    /// The local space registry — pure file read, no daemon.
+    pub fn reload_spaces(&mut self) {
+        self.spaces = workspaces::list();
+    }
+
     pub async fn reload_diagnosis(&mut self) -> Result<()> {
         if let Response::Diagnosis(v) = self
             .req(Request::Diagnose {
@@ -392,8 +465,12 @@ impl App {
     pub async fn refresh_current(&mut self) -> Result<()> {
         match self.screen {
             Screen::Board => self.reload_board().await?,
+            Screen::Inbox => self.reload_inbox(false).await?,
+            Screen::Activity => self.reload_activity().await?,
+            Screen::Members => self.reload_members().await?,
+            Screen::Spaces => self.reload_spaces(),
             Screen::Doctor => self.reload_diagnosis().await?,
-            // Later-stage screens refresh once they hold data.
+            // Stage-4 screens refresh once they hold data.
             _ => {}
         }
         Ok(())
@@ -439,6 +516,9 @@ impl App {
                 CatalogScope::Boards { project } if *project == current_project => {
                     board_dirty = true
                 }
+                CatalogScope::Acl if self.screen == Screen::Members => {
+                    self.reload_members().await?
+                }
                 _ => {}
             }
         }
@@ -450,9 +530,18 @@ impl App {
         }
         if db.activity_advanced {
             self.refresh_inbox_count().await;
+            match self.screen {
+                Screen::Inbox => self.reload_inbox(false).await?,
+                Screen::Activity => self.reload_activity().await?,
+                _ => {}
+            }
         }
         if db.presence_advanced {
             self.refresh_status_info().await;
+            // Join requests are derived from presence announcements.
+            if self.screen == Screen::Members {
+                self.reload_members().await?;
+            }
         }
         Ok(())
     }
@@ -480,6 +569,7 @@ impl App {
             }
             Goto(s) => {
                 self.screen = s;
+                self.peek = None;
                 self.refresh_current().await?;
             }
             NextProject | PrevProject => {
@@ -495,7 +585,30 @@ impl App {
                 }
             }
             Up | Down | Left | Right | Top | Bottom => self.motion(action),
-            OpenPeek => self.open_peek().await?,
+            OpenPeek => match self.screen {
+                Screen::Board => self.open_peek().await?,
+                Screen::Inbox => {
+                    let sel = self.cursor_of(Screen::Inbox);
+                    if let Some(reff) = self.inbox_entries.get(sel).map(|e| e.reff.clone()) {
+                        self.open_peek_for(&reff).await?;
+                    }
+                }
+                Screen::Activity => {
+                    // The panel renders newest-first: index into the reversed feed.
+                    let sel = self.cursor_of(Screen::Activity);
+                    if let Some(reff) = self
+                        .activity
+                        .iter()
+                        .rev()
+                        .nth(sel)
+                        .map(|e| e.reff.clone())
+                        .filter(|r| !r.is_empty())
+                    {
+                        self.open_peek_for(&reff).await?;
+                    }
+                }
+                _ => {}
+            },
             TogglePeekFocus => {
                 if let Some(p) = &mut self.peek {
                     p.focused = !p.focused;
@@ -628,10 +741,102 @@ impl App {
                     }));
                 }
             }
-            // Stage 3/4 actions — visible in help, honest about arrival.
-            InboxClear | SpaceSwitch | PinFilterAsTab | TabNext | TabPrev | Cancel => {
+            InboxClear => {
+                self.reload_inbox(true).await?;
+                self.status.info("inbox cleared — watermark stamped");
+            }
+            MemberApprove => {
+                if !self.is_admin() {
+                    self.status.error("approving needs an admin key");
+                } else if let Some(MemberItem::Request(r)) = self.selected_member_item() {
+                    self.push_editor(EditorState::new(
+                        EditorIntent::ApproveMember { key: r.key.clone() },
+                        format!(
+                            "approve {}…  — local name (optional)",
+                            &r.key[..12.min(r.key.len())]
+                        ),
+                        "",
+                    ));
+                }
+            }
+            MemberDismiss => {
+                if let Some(MemberItem::Request(r)) = self.selected_member_item() {
+                    self.dismissed_requests.insert(r.key);
+                    self.status
+                        .info("dismissed from this view (the request lingers until it ages out)");
+                }
+            }
+            MemberRename => {
+                if let Some(item) = self.selected_member_item() {
+                    let (key, current) = match item {
+                        MemberItem::Request(r) => (r.key, String::new()),
+                        MemberItem::Member(m) => (m.key.as_str().to_string(), m.alias),
+                    };
+                    self.push_editor(EditorState::new(
+                        EditorIntent::RenameMember { key },
+                        "local name (empty clears · never synced)",
+                        &current,
+                    ));
+                }
+            }
+            MemberRemove => {
+                if !self.is_admin() {
+                    self.status.error("removing needs an admin key");
+                } else if let Some(MemberItem::Member(m)) = self.selected_member_item() {
+                    let label = if m.alias.is_empty() {
+                        m.key.short()
+                    } else {
+                        m.alias.clone()
+                    };
+                    self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                        title: "remove member".into(),
+                        body: format!("Remove {label}? This rotates the space key."),
+                        intent: ConfirmIntent::RemoveMember {
+                            key: m.key.as_str().to_string(),
+                        },
+                    }));
+                }
+            }
+            MemberInvite => self.mint_invite().await,
+            SpaceSwitch => self.space_switch().await?,
+            SpaceForget => {
+                if let Some(e) = self.selected_space() {
+                    let label = if e.name.is_empty() {
+                        e.workspace.clone()
+                    } else {
+                        e.name.clone()
+                    };
+                    self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                        title: "forget space".into(),
+                        body: format!("Forget {label}? The store stays on disk — only the registry entry goes."),
+                        intent: ConfirmIntent::ForgetSpace { sel: e.path.clone() },
+                    }));
+                }
+            }
+            SpacePrune => {
+                let missing = self
+                    .spaces
+                    .iter()
+                    .filter(|e| workspaces::presence(e) == workspaces::StorePresence::Missing)
+                    .count();
+                if missing == 0 {
+                    self.status
+                        .info("nothing to prune — every store is present");
+                } else {
+                    self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                        title: "prune spaces".into(),
+                        body: format!(
+                            "Drop {missing} registry entr{} whose store is gone?",
+                            if missing == 1 { "y" } else { "ies" }
+                        ),
+                        intent: ConfirmIntent::PruneSpaces,
+                    }));
+                }
+            }
+            // Stage 4 actions — visible in help, honest about arrival.
+            PinFilterAsTab | TabNext | TabPrev | Cancel => {
                 self.status.info(format!(
-                    "'{}' lands later in this branch (stage 3+)",
+                    "'{}' lands later in this branch (stage 4)",
                     action.id()
                 ));
             }
@@ -651,9 +856,10 @@ impl App {
             }
             return;
         }
-        // Peek-focused: j/k scroll the detail.
+        // Peek-focused (or a peek over a list screen): j/k scroll the detail.
+        let peek_owns_motion = self.screen != Screen::Board;
         if let Some(p) = &mut self.peek {
-            if p.focused {
+            if p.focused || peek_owns_motion {
                 match action {
                     Down => p.scroll = p.scroll.saturating_add(1),
                     Up => p.scroll = p.scroll.saturating_sub(1),
@@ -696,9 +902,15 @@ impl App {
         let Some(row) = self.focused_row() else {
             return Ok(());
         };
+        let reff = row.reff.clone();
+        self.open_peek_for(&reff).await
+    }
+
+    /// Open the detail peek on any ref (board row, inbox entry, activity row).
+    async fn open_peek_for(&mut self, reff: &str) -> Result<()> {
         match self
             .req(Request::IssueView {
-                reff: row.reff.clone(),
+                reff: reff.to_string(),
             })
             .await?
         {
@@ -1323,7 +1535,204 @@ impl App {
                     .collect();
                 self.run_requests(reqs).await?;
             }
+            ConfirmIntent::RemoveMember { key } => {
+                match self.req(Request::MemberRemove { who: key }).await? {
+                    Response::Error { message, .. } => self.status.error(message),
+                    _ => {
+                        self.status.info("removed — space key rotated");
+                        self.reload_members().await?;
+                    }
+                }
+            }
+            ConfirmIntent::ForgetSpace { sel } => match workspaces::forget(&sel) {
+                Ok(removed) => {
+                    self.status.info(format!(
+                        "forgot {} entr{} (stores stay on disk)",
+                        removed.len(),
+                        if removed.len() == 1 { "y" } else { "ies" }
+                    ));
+                    self.reload_spaces();
+                }
+                Err(e) => self.status.error(format!("forget failed: {e:#}")),
+            },
+            ConfirmIntent::PruneSpaces => match workspaces::prune() {
+                Ok(removed) => {
+                    self.status.info(format!(
+                        "pruned {} dead entr{}",
+                        removed.len(),
+                        if removed.len() == 1 { "y" } else { "ies" }
+                    ));
+                    self.reload_spaces();
+                }
+                Err(e) => self.status.error(format!("prune failed: {e:#}")),
+            },
         }
+        Ok(())
+    }
+
+    // ---- members / spaces (Stage 3 screens) ----
+
+    /// The current list cursor for a screen (0 when never moved).
+    pub fn cursor_of(&self, s: Screen) -> usize {
+        self.list_cursors.get(&s).map(|c| c.sel).unwrap_or(0)
+    }
+
+    /// Flattened, dismissal-filtered Members rows: requests first.
+    pub fn member_items(&self) -> Vec<MemberItem> {
+        let mut items = Vec::new();
+        for r in &self.member_requests {
+            if !self.dismissed_requests.contains(&r.key) {
+                items.push(MemberItem::Request(r.clone()));
+            }
+        }
+        for m in &self.members {
+            items.push(MemberItem::Member(m.clone()));
+        }
+        items
+    }
+
+    pub fn selected_member_item(&self) -> Option<MemberItem> {
+        let items = self.member_items();
+        let sel = self
+            .cursor_of(Screen::Members)
+            .min(items.len().saturating_sub(1));
+        items.into_iter().nth(sel)
+    }
+
+    /// Whether this node holds an admin key — gates approve/remove/invite so
+    /// a plain member isn't offered chores the ACL will reject.
+    pub fn is_admin(&self) -> bool {
+        self.members.iter().any(|m| m.me && m.role == "admin")
+    }
+
+    /// Mint a fresh default invite (Pattern A: single-use, auto-admit, 7-day)
+    /// and copy the link — the TUI analogue of `lait invite` (QR in Stage 4).
+    async fn mint_invite(&mut self) {
+        if !self.is_admin() {
+            self.status.error("inviting needs an admin key");
+            return;
+        }
+        let req = Request::Invite {
+            require_approval: false,
+            reusable: false,
+            ttl_hours: None,
+        };
+        match self.req(req).await {
+            Ok(Response::Text { text }) => {
+                let token = text.trim().to_string();
+                let link = token
+                    .parse::<crate::proto::WorkspaceTicket>()
+                    .map(|t| t.link())
+                    .unwrap_or_else(|_| token.clone());
+                if crate::cli::copy_to_clipboard(&link) {
+                    self.status
+                        .info("invite link copied — single-use, auto-admit, expires in 7d");
+                } else {
+                    self.status
+                        .error("invite created, but clipboard copy failed — use `lait invite`");
+                }
+            }
+            Ok(Response::Error { message, .. }) => {
+                self.status.error(format!("invite failed: {message}"))
+            }
+            Ok(_) => self.status.error("invite failed: unexpected response"),
+            Err(e) => self.status.error(format!("invite failed: {e:#}")),
+        }
+    }
+
+    pub fn selected_space(&self) -> Option<&WorkspaceEntry> {
+        let sel = self
+            .cursor_of(Screen::Spaces)
+            .min(self.spaces.len().saturating_sub(1));
+        self.spaces.get(sel)
+    }
+
+    /// Live space switch, commit-last: nothing of the current session is torn
+    /// down until the new daemon is up and answering `Status`. On success the
+    /// app rebinds (DTOs cleared, settings/theme reloaded from the new store)
+    /// and the run loop re-subscribes.
+    async fn space_switch(&mut self) -> Result<()> {
+        let Some(e) = self.selected_space().cloned() else {
+            return Ok(());
+        };
+        let new_home = PathBuf::from(&e.path);
+        if new_home == self.home {
+            self.status.info("already in this space");
+            return Ok(());
+        }
+        if workspaces::presence(&e) == workspaces::StorePresence::Missing {
+            self.status
+                .error("that store is gone from disk — `P` prunes dead entries");
+            return Ok(());
+        }
+        self.status.info("connecting…");
+        if let Err(err) = crate::cli::ensure_daemon(&new_home).await {
+            self.status
+                .error(format!("switch aborted — daemon didn't start: {err:#}"));
+            return Ok(());
+        }
+        match request(&new_home, &Request::Status).await {
+            Ok(Response::Status(_)) => {}
+            Ok(Response::Error { message, .. }) => {
+                self.status.error(format!("switch aborted — {message}"));
+                return Ok(());
+            }
+            Ok(_) | Err(_) => {
+                self.status
+                    .error("switch aborted — the new daemon isn't answering");
+                return Ok(());
+            }
+        }
+        // Committed: rebind everything to the new store.
+        let label = if e.name.is_empty() {
+            e.workspace.clone()
+        } else {
+            e.name.clone()
+        };
+        self.rebind(new_home).await?;
+        self.status.info(format!("switched to {label}"));
+        Ok(())
+    }
+
+    /// Point the app at a new store: wipe session state, reload settings
+    /// (theme + keymap overrides come from the NEW store), re-pull everything,
+    /// and flag the run loop to re-subscribe (first frame is a Reset — U§4.1).
+    async fn rebind(&mut self, new_home: PathBuf) -> Result<()> {
+        self.home = new_home;
+        let settings = crate::config::Settings::load(Some(&self.home));
+        self.theme = Theme::load(&settings);
+        let mut km = Keymap::defaults();
+        let warnings = km.apply_overrides(&settings);
+        self.keymap = km;
+        for w in warnings {
+            self.status.error(w);
+        }
+        self.projects.clear();
+        self.project_idx = 0;
+        self.applied_default_project = false;
+        self.board = None;
+        self.activity.clear();
+        self.inbox_entries.clear();
+        self.inbox_unread = 0;
+        self.members.clear();
+        self.member_requests.clear();
+        self.dismissed_requests.clear();
+        self.diagnosis = None;
+        self.overlay = Overlay::default();
+        self.peek = None;
+        self.stack.clear();
+        self.selection.clear();
+        self.filter_text.clear();
+        self.list_cursors.clear();
+        self.col_idx = 0;
+        self.row_idx = 0;
+        self.screen = Screen::Board;
+        self.needs_resubscribe = true;
+        self.reload_projects().await?;
+        self.reload_board().await?;
+        self.refresh_inbox_count().await;
+        self.refresh_status_info().await;
+        self.reload_spaces();
         Ok(())
     }
 
@@ -1402,6 +1811,44 @@ impl App {
     /// over from the old modal, plus quick-create through the CLI grammar).
     pub async fn submit_editor(&mut self, intent: EditorIntent, content: String) -> Result<()> {
         let content_trimmed = content.trim();
+        // Member intents complete here: they refresh the roster, not the board.
+        match &intent {
+            EditorIntent::ApproveMember { key } => {
+                let as_name = Some(content_trimmed.to_string()).filter(|s| !s.is_empty());
+                let req = Request::MemberApprove {
+                    who: key.clone(),
+                    as_name,
+                };
+                match self.req(req).await? {
+                    Response::Error { message, .. } => self.status.error(message),
+                    _ => {
+                        self.status.info("approved — space key sealed to them");
+                        self.reload_members().await?;
+                    }
+                }
+                return Ok(());
+            }
+            EditorIntent::RenameMember { key } => {
+                let cleared = content_trimmed.is_empty();
+                let req = Request::MemberAlias {
+                    who: key.clone(),
+                    name: content_trimmed.to_string(),
+                };
+                match self.req(req).await? {
+                    Response::Error { message, .. } => self.status.error(message),
+                    _ => {
+                        self.status.info(if cleared {
+                            "local name cleared"
+                        } else {
+                            "renamed"
+                        });
+                        self.reload_members().await?;
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let req = match &intent {
             EditorIntent::Create => {
                 if content_trimmed.is_empty() {
@@ -1480,6 +1927,8 @@ impl App {
                 }
             }
             EditorIntent::NameTab => return Ok(()), // Stage 4
+            // Handled above (roster refresh path).
+            EditorIntent::ApproveMember { .. } | EditorIntent::RenameMember { .. } => return Ok(()),
         };
         match self.req(req).await? {
             Response::Ref { reff } => {

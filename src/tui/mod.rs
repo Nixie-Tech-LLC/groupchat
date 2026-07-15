@@ -161,6 +161,12 @@ async fn run_loop(
                 }
             }
         }
+        // A live space switch rebound the app to a new store: drop the old
+        // subscription and ride the new daemon's stream (Reset rebaselines).
+        if app.needs_resubscribe {
+            app.needs_resubscribe = false;
+            *sub = crate::control::subscribe(&app.home, 0).await.ok();
+        }
     }
 }
 
@@ -320,9 +326,15 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
                 panels::board::draw(f, app, area, true);
             }
         }
+        // A peek opened from a list screen takes the body over (esc closes).
+        _ if app.peek.is_some() => panels::peek::draw(f, app, area),
+        Screen::Inbox => panels::inbox::draw(f, app, area),
+        Screen::Activity => panels::activity::draw(f, app, area),
+        Screen::Members => panels::members::draw(f, app, area),
+        Screen::Spaces => panels::spaces::draw(f, app, area),
         Screen::Doctor => panels::doctor::draw(f, app, area),
         s => {
-            // Later-stage screens: honest stubs, never dead-ends.
+            // Stage-4 screens: honest stubs, never dead-ends.
             let name = format!("{s:?}").to_lowercase();
             f.render_widget(
                 Paragraph::new(format!(
@@ -634,6 +646,131 @@ mod tests {
         assert!(out.contains("status backlog → in_progress"));
         assert!(out.contains("mira"));
         assert!(out.contains("⚠"), "collision marker");
+    }
+
+    #[test]
+    fn inbox_screen_accents_unread_and_titles_the_count() {
+        let mut app = fixture();
+        app.screen = Screen::Inbox;
+        app.inbox_unread = 1;
+        app.inbox_entries = vec![
+            crate::dto::InboxEntry {
+                ts: 0,
+                kind: "comment".into(),
+                reff: "iss_DEMO-2".into(),
+                doc_id: "d2".into(),
+                title: "flaky reconnect".into(),
+                detail: "looks like a sleep race".into(),
+                actor: Some("k".into()),
+                actor_nick: Some("mira".into()),
+            },
+            crate::dto::InboxEntry {
+                ts: 0,
+                kind: "assigned".into(),
+                reff: "iss_DEMO-1".into(),
+                doc_id: "d1".into(),
+                title: "fix login race".into(),
+                detail: "you were assigned".into(),
+                actor: None,
+                actor_nick: None,
+            },
+        ];
+        let out = rendered(&mut app);
+        assert!(out.contains("inbox — 1 unread"), "title carries the count");
+        assert!(out.contains("mira commented"), "comment attribution");
+        assert!(out.contains("● "), "unread marker");
+        assert!(out.contains("mark all read"), "clear binding in the legend");
+    }
+
+    #[test]
+    fn activity_screen_renders_newest_first_with_collision_marker() {
+        let mut app = fixture();
+        app.screen = Screen::Activity;
+        let ev = |seq: u64, text: &str, collision: bool| crate::dto::ActivityEvent {
+            seq,
+            doc_id: None,
+            reff: "iss_DEMO-1".into(),
+            kind: "edit".into(),
+            changes: vec![],
+            actor: None,
+            actor_nick: "mira".into(),
+            text: text.into(),
+            ts: 0,
+            collision,
+        };
+        app.activity = vec![ev(1, "older event", false), ev(2, "newer event", true)];
+        let out = rendered(&mut app);
+        let newer = out.find("newer event").unwrap();
+        let older = out.find("older event").unwrap();
+        assert!(newer < older, "newest renders first");
+        assert!(out.contains("⚠"), "collision marker");
+    }
+
+    #[test]
+    fn members_screen_shows_sections_detail_and_admin_gating() {
+        let mut app = fixture();
+        app.screen = Screen::Members;
+        app.member_requests = vec![crate::dto::JoinRequestDto {
+            key: "a1b2c3d4".repeat(8),
+            nick: "alice".into(),
+            ts: 0,
+        }];
+        app.members = vec![crate::dto::MemberDto {
+            key: crate::ids::UserId::from_key_string("9f2a".repeat(16)),
+            role: "member".into(),
+            me: true,
+            alias: String::new(),
+        }];
+        let out = rendered(&mut app);
+        assert!(out.contains("PENDING JOIN REQUESTS"));
+        assert!(out.contains("MEMBERS"));
+        assert!(out.contains("claims \"alice\""));
+        assert!(
+            out.contains(&"a1b2c3d4".repeat(8)),
+            "detail strip shows the full key for out-of-band verification"
+        );
+        assert!(out.contains("confirm this key out-of-band"));
+        // We're a plain member: approving must refuse, not silently no-op.
+        futures_lite_block_on(async {
+            app.apply(action::Action::MemberApprove).await.unwrap();
+        });
+        assert!(app.status.text.contains("needs an admin key"));
+        assert!(app.stack.is_empty(), "no approve editor for a non-admin");
+    }
+
+    #[test]
+    fn spaces_screen_marks_current_and_missing() {
+        let mut app = fixture();
+        app.screen = Screen::Spaces;
+        app.home = std::path::PathBuf::from("/stores/here");
+        app.spaces = vec![
+            crate::workspaces::WorkspaceEntry {
+                workspace: "ws_aaa".into(),
+                name: "Acme".into(),
+                path: "/stores/here".into(),
+                origin: crate::workspaces::Origin::Founded,
+                host_nick: String::new(),
+                last_opened: 0,
+                projects: vec![crate::workspaces::ProjectBrief {
+                    key: "ENG".into(),
+                    name: "Engineering".into(),
+                }],
+            },
+            crate::workspaces::WorkspaceEntry {
+                workspace: "ws_bbb".into(),
+                name: "Ghost".into(),
+                path: "/stores/definitely-gone".into(),
+                origin: crate::workspaces::Origin::Joined,
+                host_nick: String::new(),
+                last_opened: 0,
+                projects: vec![],
+            },
+        ];
+        let out = rendered(&mut app);
+        assert!(out.contains("Acme"));
+        assert!(out.contains("ENG"), "project brief chips");
+        assert!(out.contains("✗"), "missing-store marker");
+        assert!(out.contains("switch"), "switch binding in the legend");
     }
 
     #[test]

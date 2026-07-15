@@ -30,6 +30,15 @@ pub enum EditorIntent {
     Comment {
         reff: String,
     },
+    /// Approve a pending join request, optionally attaching a local petname
+    /// (the buffer; empty = none) as we seal them in.
+    ApproveMember {
+        key: String,
+    },
+    /// Set (empty buffer clears) a local petname on a member key.
+    RenameMember {
+        key: String,
+    },
     /// Name a pinned tab (Stage 4).
     #[allow(dead_code)]
     NameTab,
@@ -56,7 +65,11 @@ impl EditorState {
     pub fn new(intent: EditorIntent, title: impl Into<String>, initial: &str) -> Self {
         let single_line = matches!(
             intent,
-            EditorIntent::Create | EditorIntent::EditTitle { .. } | EditorIntent::NameTab
+            EditorIntent::Create
+                | EditorIntent::EditTitle { .. }
+                | EditorIntent::ApproveMember { .. }
+                | EditorIntent::RenameMember { .. }
+                | EditorIntent::NameTab
         );
         let mut textarea = if initial.is_empty() {
             TextArea::default()

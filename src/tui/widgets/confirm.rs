@@ -11,7 +11,19 @@ use super::super::app::App;
 
 #[derive(Debug, Clone)]
 pub enum ConfirmIntent {
-    DeleteIssues { targets: Vec<String> },
+    DeleteIssues {
+        targets: Vec<String>,
+    },
+    /// Remove a member (rotates the space key).
+    RemoveMember {
+        key: String,
+    },
+    /// Drop a registry entry (`workspaces::forget`; the store stays on disk).
+    ForgetSpace {
+        sel: String,
+    },
+    /// Drop every registry entry whose store is gone (`workspaces::prune`).
+    PruneSpaces,
 }
 
 pub struct ConfirmState {
