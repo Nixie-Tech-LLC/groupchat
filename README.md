@@ -1,103 +1,47 @@
 # lait
 
-A **local-first, peer-to-peer issue tracker** — a decentralized, rapid-feedback
-alternative to Linear that runs as a native Rust node, built on
-[iroh](https://www.iroh.computer/) (P2P QUIC + NAT traversal) and
-[Loro](https://loro.dev/) CRDTs, with a git-backed durable store.
+**The issue tracker that lives in your repo.**
 
-> **Status: P0–P3 complete, verified multi-node.** A working, standalone tracker
-> (create/edit/move/assign/label/comment/close issues from a CLI, a full-screen
-> TUI, or an MCP agent over one git-backed daemon), with **live P2P sync over
-> iroh** (no central server — two nodes converge in ~2s), a **portable seed** that
-> backfills a cold client from just a ticket, and **end-to-end encryption** gated
-> by a signed membership graph with add/remove + key rotation (a non-member sees
-> only ciphertext; removal + rotation enforces lazy revocation). Remaining: P4
-> release engineering + hardening. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
-> phase status and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) /
-> [`docs/SCHEMA.md`](docs/SCHEMA.md) / [`docs/UI.md`](docs/UI.md) for the design.
+Track work at typing speed, onboard a teammate with one link, and let your
+coding agents work the board like anyone else — no server, no signup, no
+browser tab. If `cd` gets you into the project, you're already in.
 
-## What it is (the plan)
+```console
+$ cd my-project && lait init
+founded space 'my-project' — project MP seeded
 
-Issues are **Loro CRDT documents**, propagated **peer-to-peer over iroh** with no
-central server; each node keeps a durable copy in a local **git repo**. It is
-built in provable layers:
+$ lait new "fix login race" -P high --start
+MP-1  fix login race  in_progress  · you
+switched to new branch 'mp-1-fix-login-race'
 
-1. **Functionality (git-backed):** a Loro issue model + catalog + fast TUI,
-   persisted in a local git repo. A standalone tracker with Linear-grade speed —
-   no network, no crypto.
-2. **Propagation (iroh):** live P2P sync over QUIC, reactive across nodes.
-3. **Access control (E2EE):** encrypted, blind-relay sync with membership and
-   revocation.
-
-The full design, phase plan, and decision log live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the concrete data shapes and
-authority model live in [`docs/SCHEMA.md`](docs/SCHEMA.md); the CLI and TUI
-surfaces live in [`docs/UI.md`](docs/UI.md).
-
-## What runs today (P0)
-
-One binary, four surfaces, sharing one persistent node:
-
-- `lait daemon` — the long-lived node: **owns the Loro documents** (a
-  per-workspace catalog + one doc per issue) over a **git-backed durable store**,
-  plus the iroh endpoint (an ed25519 `EndpointId` identity), a signed-gossip
-  topic for announce/presence, and a local control channel. Auto-spawned on first use.
-- `lait <cmd>` — the CLI: flat verbs act on issues (`new`, `edit`, `move`,
-  `assign`, `label`, `comment`, `show`, `ls`, `board`, `history`), plural nouns
-  manage registries (`projects`, `labels`). `--json` emits a stable, versioned
-  DTO for scripts and agents.
-- `lait tui` — a full-screen [ratatui](https://ratatui.rs) board client that
-  stays live off a doorbell event stream and echoes edits optimistically.
-- `lait mcp` — an MCP (stdio) server exposing the same commands as tools, so
-  an agent files and drives issues natively (returning the same versioned DTO).
-
-Issues are addressed by a short, git-style `iss_` handle (collision-free) with a
-friendly `KEY-n` alias (`ENG-142`). Refs resolve daemon-side; an ambiguous ref
-returns a candidate list, not an error. Boards render from the catalog cache
-(no per-issue loads), so a large workspace still paints instantly.
-
-State lives in a per-repo `.lait/` store (or a self-contained `$LAIT_HOME`):
-`config.json` (local settings) and a `repo/` git store (`genesis.json`,
-`catalog.loro`, `docs/<id>.loro`); one global `secret.key` identity spans every
-store. Only public keys and Loro snapshots are stored — never secrets. Stores are
-created **only** by `lait init` (found) or `lait join` (from an invite) — nothing
-mints one implicitly.
-
-### How it maps to iroh
-
-| Piece | Mechanism |
-|---|---|
-| Identity / handle | a persistent `EndpointId` (ed25519 public key) |
-| The workspace | an `iroh-gossip` topic (derived from the workspace id) |
-| Announce + presence | signed gossip heartbeats + neighbor events + a `Bye` on shutdown |
-| Liveness probe | a direct QUIC handshake on a custom ALPN |
-| Signed messages | ed25519 `SignedMessage` sign/verify (→ signed membership ops later) |
-
-## Cross-platform
-
-The node builds and runs on **Linux, macOS, and Windows** — CI builds and tests
-all three on every change. The daemon's control channel is a Unix-domain socket
-on unix and a named pipe on Windows (via `interprocess`); the single-instance
-guard is a cross-platform advisory lock (`fs2`); TLS uses the portable `ring`
-rustls backend (CI fails if `aws-lc-rs` ever enters the tree). Prebuilt release
-binaries are produced for macOS, Linux, **and Windows** (with a PowerShell
-installer), and the per-OS CI smoke drives the real tracker flow on each.
-
-## Build (from source)
-
-```bash
-cargo build --release
+# ...code, commit...
+$ lait done
+MP-1  fix login race  done
 ```
 
-Requires **Rust 1.91+** (the floor is driven by iroh 1.0.0-rc.1).
+- **Instant** // your issues live beside your code and open in milliseconds —
+  faster than a browser tab, on a plane, in a basement
+- **One-link teams** // send an invite over any chat; `join` does the rest —
+  no accounts, no admin console, no seat licenses
+- **Agent-native** // AI agents are first-class members: they claim, comment,
+  and close issues through MCP with the same audit trail as a human
+- **Branch-native** // `lait start` cuts the branch; `done`, `comment`, and
+  `show` read the issue off the branch you're on
+- **Private by default** // everything is end-to-end encrypted between members;
+  there is no server to trust because there is no server
+- **Works everywhere** // one self-contained binary for macOS, Linux, and
+  Windows; offline-first, syncs whenever teammates are online together
 
-To catch formatting issues before they reach CI, enable the pre-push hook once
-per clone (it runs `cargo fmt --all --check` and blocks the push if it fails;
-bypass with `git push --no-verify`):
+Whether you're solo in a side project, a team replacing a heavier tracker, or
+wiring up agents that need a shared board, the whole product is the one binary
+below.
 
-```bash
-git config core.hooksPath .githooks
-```
+> Curious how it works with no server? The short version: issues are CRDTs
+> synced peer-to-peer, membership is a signed key graph, and every node keeps a
+> durable local copy. The long version — architecture, data shapes, protocol,
+> decision log — lives in [`docs/`](docs/README.md), starting with
+> [`ARCHITECTURE.md`](docs/ARCHITECTURE.md); phase status is in
+> [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Install
 
@@ -147,6 +91,15 @@ gh release download dev -R Nixie-Tech-LLC/lait
 
 A dev binary reports its commit so it's unmistakable from a tagged release:
 `lait --version` → `lait <version>-dev+<sha> (<date>)`.
+
+### Build from source
+
+```bash
+cargo build --release          # Rust 1.91+ (floor driven by iroh 1.0.0-rc.1)
+```
+
+Contributing? Enable the hooks once per clone
+(`git config core.hooksPath .githooks`) so fmt issues never reach CI.
 
 ## Use it like this
 
