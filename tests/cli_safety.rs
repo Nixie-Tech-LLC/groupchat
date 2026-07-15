@@ -176,6 +176,84 @@ fn a_spawned_daemon_does_not_hold_our_stdout_open() {
     assert!(read.is_ok(), "reading stdout failed: {read:?}");
 }
 
+/// `try_wait` must answer *both* ways: a daemon that died is reported dead, and
+/// one that is running is not reported dead.
+///
+/// This is the sensor the spawn wait leans on — "a daemon that has already exited
+/// is never going to answer", which is what turns a lock conflict into its own
+/// message instead of a 20s timeout blaming the transport. On Windows it is not
+/// `std::process::Child::try_wait` but a hand-rolled equivalent (the daemon is
+/// spawned through `CreateProcessW` to bound what it inherits), so both answers
+/// are pinned here: a false "still running" costs the fast path, and a false
+/// "exited" would blame a daemon that is coming up fine.
+#[test]
+fn a_dead_daemon_is_reported_dead_and_a_live_one_is_not() {
+    let exe = std::path::PathBuf::from(bin());
+
+    // Dead: no store to open, so the daemon exits ~immediately and non-zero.
+    let empty = tmp_home("dead");
+    let log_path = empty.join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("create log");
+    let mut child = lait::daemon_spawn::spawn(&exe, &empty, Some(log)).expect("spawn daemon");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            None => panic!(
+                "a daemon that could not open a store was never reported as exited — \
+                 the spawn wait would blame a 20s timeout instead of saying why",
+            ),
+        }
+    };
+    assert!(
+        !status.success(),
+        "a daemon that cannot open its store must exit non-zero, got {status}",
+    );
+    // The log is the daemon's stderr: `daemon_exited_error` quotes it back as the
+    // "it said:" diagnosis, so a mis-wired stderr costs the entire explanation and
+    // leaves only an exit code.
+    let said = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        said.contains("store not initialized"),
+        "the daemon's stderr must reach its log — that text is the whole \
+         diagnosis when a spawn dies; got: {said:?}",
+    );
+    std::fs::remove_dir_all(&empty).ok();
+
+    // Live: a real store, so it comes up — and must not be declared dead.
+    //
+    // It reaps itself on a short idle window rather than being told to stop: a
+    // `shutdown` races the daemon's control-channel bind, and losing that race
+    // strands a live `lait.exe`. On Windows that is not a stray process but a
+    // broken build — the linker cannot replace a running binary, so the next
+    // `cargo run` fails with "Access is denied" in some later step that has
+    // nothing to do with this test. Self-reaping means no assertion below can
+    // leak one.
+    std::env::set_var("LAIT_IDLE_SECS", "2");
+    let home = tmp_home("live");
+    init(&home);
+    let mut child = lait::daemon_spawn::spawn(&exe, &home, None).expect("spawn daemon");
+    let alive = child.try_wait().expect("try_wait");
+    assert!(
+        alive.is_none(),
+        "a daemon that had just started was reported as exited ({alive:?}) — the \
+         spawn wait would abandon a daemon that was coming up fine",
+    );
+
+    // ...and when that same daemon idles out, the sensor must notice: proof the
+    // `None` above was a live reading rather than a stuck one.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(_) => break,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+            None => panic!("a daemon that idled out was never reported as exited"),
+        }
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A selector that matches nothing is a not-found, and must answer like one on
 /// every channel: prose shape, `--json` DTO, and exit code.
 #[test]
