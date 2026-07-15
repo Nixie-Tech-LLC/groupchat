@@ -299,6 +299,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .long("home")
                 .global(true)
                 .action(ArgAction::Set)
+                .help_heading(GLOBAL_HEADING)
                 .help("Select the node's home directory (overrides $LAIT_HOME)."),
         )
         .arg(
@@ -310,6 +311,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .action(ArgAction::Set)
                 .conflicts_with("home")
                 .value_name("SEL")
+                .help_heading(GLOBAL_HEADING)
                 .help(
                     "Select a space by name, ws_ id (or prefix), or path — from any \
                      directory (see `lait spaces`).",
@@ -320,13 +322,24 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .long("json")
                 .global(true)
                 .action(ArgAction::SetTrue)
+                .help_heading(GLOBAL_HEADING)
                 .help("Emit the versioned JSON DTO instead of human output (UI.md §2.3)."),
+        )
+        .arg(
+            Arg::new("yes")
+                .short('y')
+                .long("yes")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help_heading(GLOBAL_HEADING)
+                .help("Assume yes: skip confirmation prompts (for scripts and CI)."),
         )
         .arg(
             Arg::new("no_color")
                 .long("no-color")
                 .global(true)
                 .action(ArgAction::SetTrue)
+                .help_heading(GLOBAL_HEADING)
                 .help("Disable ANSI colours."),
         );
     for s in specs {
@@ -334,6 +347,12 @@ pub fn build_cli(specs: &[Spec]) -> Command {
     }
     root
 }
+
+/// The heading the four global flags file under. Without it clap interleaves
+/// them with each command's own flags in declaration order (`--home` between
+/// `-p` and `-a` on `lait new`), so the flags that apply *everywhere* read as
+/// command-specific noise. One heading separates the two kinds.
+const GLOBAL_HEADING: &str = "Global Options";
 
 /// Help buckets (see `Spec.order`). Within a bucket, declaration order holds.
 const ORDER_DAILY: usize = 10; // the loop: new/start/done/stop/inbox/show/board/ls…

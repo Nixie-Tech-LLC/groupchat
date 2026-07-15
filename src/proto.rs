@@ -247,9 +247,16 @@ impl WorkspaceTicket {
         postcard::to_stdvec(self).expect("postcard::to_stdvec is infallible")
     }
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let t: Self = postcard::from_bytes(bytes).context(
-            "decode workspace ticket (this invite may be from an older lait — ask for a fresh one)",
-        )?;
+        // Same reason as the base32 step: postcard's own words ("Hit the end of
+        // buffer, expected more data") describe our wire format, not the user's
+        // mistake, and used to be printed under the good advice instead of it.
+        let t: Self = postcard::from_bytes(bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "that invite could not be read — it may be incomplete, or from an \
+                 older lait.\n\
+                 ask for a fresh one with `lait invite`."
+            )
+        })?;
         // Postcard has no schema: an old-format ticket can decode "successfully"
         // into garbage fields. The workspace id shape is the cheap integrity check.
         if !t.workspace.starts_with("ws_") {
@@ -277,9 +284,22 @@ impl FromStr for WorkspaceTicket {
         let s = s.trim();
         let token = s.strip_prefix("lait://join/").unwrap_or(s);
         let cleaned: String = token.chars().filter(|c| !c.is_whitespace()).collect();
+        // Replace the decoder's error rather than wrapping it: `data-encoding`
+        // explains itself in its own terms ("non-zero trailing bits at 3",
+        // "invalid length at 18"), which says nothing to someone who pasted an
+        // invite badly — and this is the first thing a new joiner ever runs. The
+        // cause is dropped on purpose; base32 is an implementation detail of the
+        // link, and the actionable part is entirely in the advice.
         let bytes = data_encoding::BASE32_NOPAD
             .decode(cleaned.to_ascii_uppercase().as_bytes())
-            .context("decode workspace ticket base32")?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "that invite link is not readable — it looks truncated or \
+                     mistyped.\n\
+                     copy the whole `lait://join/…` line (it is one long token), \
+                     or ask for a fresh one with `lait invite`."
+                )
+            })?;
         Self::from_bytes(&bytes)
     }
 }
@@ -290,6 +310,43 @@ mod tests {
 
     fn host_key() -> EndpointId {
         SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    /// A bad invite is the most likely thing to go wrong on a new joiner's very
+    /// first command, so its error is held to a higher bar: it must be about the
+    /// invite, never about how we encode one.
+    #[test]
+    fn a_bad_invite_explains_itself_without_leaking_the_codec() {
+        // Real shapes: a truncated link, an unencodable paste, and well-formed
+        // base32 whose payload isn't a ticket — these produced, respectively,
+        // "non-zero trailing bits at 3", "invalid length at 18", and "Hit the end
+        // of buffer, expected more data".
+        for bad in ["lait://join/zzzz", "not-a-real-invite!!", "aebagbaf"] {
+            let e = bad
+                .parse::<WorkspaceTicket>()
+                .expect_err("must not parse")
+                .to_string()
+                // `{:#}`-style flattening is what the reporter prints, so check the
+                // whole chain, not just the top.
+                .to_lowercase();
+            for leak in [
+                "base32",
+                "postcard",
+                "trailing bits",
+                "invalid length",
+                "end of buffer",
+                "serde",
+            ] {
+                assert!(
+                    !e.contains(leak),
+                    "invite error leaks the codec ({leak:?}) for input {bad:?}: {e}",
+                );
+            }
+            assert!(
+                e.contains("invite"),
+                "invite error must name the invite for input {bad:?}: {e}",
+            );
+        }
     }
 
     fn sample() -> WorkspaceTicket {

@@ -21,6 +21,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -295,8 +296,18 @@ pub struct DaemonLock {
 pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     use fs2::FileExt;
     let path = lock_path(home);
-    let file =
-        fs::File::create(&path).with_context(|| format!("create lock file {}", path.display()))?;
+    // NOT `File::create`: that truncates on open, i.e. *before* we know whether we
+    // won the lock — so a second daemon losing this race would first wipe the
+    // incumbent's pid stamp, blanking the lock file exactly when a client needs it
+    // to identify the daemon that's in the way. Truncate only after the lock is
+    // ours (below).
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("create lock file {}", path.display()))?;
     // Exclusive, non-blocking advisory lock held by this open file handle. The
     // OS releases it when the handle closes (process exit or crash), so the lock
     // can never go stale. A second daemon for the same home gets a would-block
@@ -308,12 +319,67 @@ pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
             home.display()
         )
     })?;
+    // Stamp our pid into the locked file. The lock itself only says *someone*
+    // holds this home; the pid says who — which is what lets a client clean up a
+    // daemon that has stopped answering. `Request::Stop` is not sufficient on its
+    // own: a v0.4.8-era daemon acknowledges `stop` and then keeps running (its
+    // `notify_one` could hand the single permit to a subscriber instead of the
+    // accept loop — see `node::signal_shutdown`), so the fallback needs a signal
+    // target. Best-effort: a failure here costs the cleanup path, not the daemon.
+    let mut file = file;
+    let _ = file
+        .set_len(0)
+        .and_then(|()| write!(file, "{}", std::process::id()))
+        .and_then(|()| file.flush());
     Ok(DaemonLock { _file: file })
+}
+
+/// The pid of the daemon holding this home's lock, if the lock file names one.
+///
+/// Best-effort and advisory: a lock file written by an older lait is empty (no
+/// pid), and the pid only means anything while the lock is actually held — so a
+/// caller must have already established that a daemon is there (see
+/// `control::probe`) before trusting it as a signal target.
+pub fn daemon_pid(home: &Path) -> Option<u32> {
+    fs::read_to_string(lock_path(home))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_stamps_the_pid_and_a_loser_does_not_blank_it() {
+        let dir = std::env::temp_dir().join(format!("gc-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let _held = acquire_daemon_lock(&dir).expect("first daemon takes the lock");
+        assert_eq!(
+            daemon_pid(&dir),
+            Some(std::process::id()),
+            "the lock holder must be identifiable by pid",
+        );
+
+        // A second daemon must lose — and must leave the winner's pid intact. It
+        // opens the same file first, so an open that truncates would blank the
+        // stamp before the lock even said no, leaving a live daemon anonymous and
+        // the cleanup path with no signal target.
+        assert!(
+            acquire_daemon_lock(&dir).is_err(),
+            "a second daemon must not get the lock",
+        );
+        assert_eq!(
+            daemon_pid(&dir),
+            Some(std::process::id()),
+            "a daemon that lost the lock race must not erase the winner's pid",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn settings_store_layer_wins_over_global() {

@@ -92,7 +92,9 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
                     }
                 })
                 .collect();
-            Err(anyhow!(
+            // A selector that resolved to nothing: exit `2`, the same answer the
+            // daemon already gives for a missing ref / user / label.
+            Err(crate::cli::CliError::not_found(format!(
                 "no space matches '{sel}' — known: {} (see `lait spaces`)",
                 if known.is_empty() {
                     "(none)".to_string()
@@ -100,6 +102,7 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
                     known.join(", ")
                 }
             ))
+            .into())
         }
         _ => {
             let cands: Vec<String> = matches
@@ -112,8 +115,13 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-/// Parse arguments and run.
-pub async fn run() -> Result<()> {
+/// Parse arguments, run, and report any failure the way the CLI contract says.
+///
+/// Returns the process exit code rather than a `Result`: handing an error back to
+/// `main` means handing it to anyhow's `Termination` impl, which Debug-prints the
+/// cause chain and always exits `1`. Every client-side failure funnels through
+/// [`crate::cli::report_error`] instead — see there for what that buys.
+pub async fn run() -> std::process::ExitCode {
     let specs = cmdspec::specs();
     let cli = cmdspec::build_cli(&specs);
     // `try_get_matches` (not `get_matches`) so a usage/parse error exits `1` — the
@@ -132,9 +140,8 @@ pub async fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
-    let resolved = cmdspec::resolve(&specs, &matches);
 
-    if !resolved.as_ref().is_some_and(|(l, _)| l.service) {
+    if !cmdspec::resolve(&specs, &matches).is_some_and(|(l, _)| l.service) {
         reset_sigpipe();
     }
 
@@ -149,7 +156,21 @@ pub async fn run() -> Result<()> {
             && !json
             && std::env::var_os("NO_COLOR").is_none()
             && std::io::stdout().is_terminal(),
+        yes: matches.get_flag("yes"),
     };
+
+    // `out` has to exist before a failure can be reported the right way (the
+    // `--json` DTO vs a prose line), which is why the sink sits here and not in
+    // `main`.
+    match dispatch(&specs, &matches, out).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => crate::cli::report_error(&e, out),
+    }
+}
+
+/// Resolve the parsed args to a leaf spec and run it.
+async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Result<()> {
+    let resolved = cmdspec::resolve(specs, matches);
 
     // Bare `lait` = the FOCUS view (inbox + your active issues, UI.md §2): the
     // most valuable keystroke answers "what's addressed to me / what am I on",
@@ -179,13 +200,13 @@ pub async fn run() -> Result<()> {
     match &leaf.dispatch {
         Dispatch::Special(Special::Completions) => {
             let shell = *m.get_one::<Shell>("shell").expect("shell is required");
-            let mut cmd = cmdspec::build_cli(&specs);
+            let mut cmd = cmdspec::build_cli(specs);
             let name = cmd.get_name().to_string();
             generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
         Dispatch::Special(Special::Man) => {
-            clap_mangen::Man::new(cmdspec::build_cli(&specs)).render(&mut std::io::stdout())?;
+            clap_mangen::Man::new(cmdspec::build_cli(specs)).render(&mut std::io::stdout())?;
             return Ok(());
         }
         _ => {}
@@ -313,11 +334,26 @@ pub async fn run() -> Result<()> {
         Err(e) => return Err(e),
     };
 
+    // A daemon that answers but speaks a different wire shape blocks every verb
+    // below it, so clear it once here rather than teaching each verb about it.
+    // The service specs are excluded: `daemon` *is* the daemon and must report
+    // the conflict rather than resolve it, and `mcp` speaks JSON-RPC on stdio
+    // where a prompt would corrupt the stream.
+    if !leaf.service {
+        crate::cli::heal_foreign_daemon(&home, out).await?;
+    }
+
     match &leaf.dispatch {
         // The uniform path: build one Request and round-trip the daemon.
         Dispatch::Request(f) => {
             let req = f(m)?;
             use std::io::IsTerminal;
+            // Ask before destroying (delete / member remove / key rotate). Gated
+            // on the Request, so the list lives in one place; everything else
+            // passes straight through.
+            if !crate::cli::confirm_destructive(&home, &req, out).await {
+                std::process::exit(1);
+            }
             // `new --start` chains the create into the work loop: file it, then
             // claim it (two honest commits = two activity rows, S§7.1).
             if leaf.name == "new" && m.get_flag("start") {
@@ -708,10 +744,30 @@ async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()>
 /// gzip/zip extraction, atomic self-replace).
 async fn run_update() -> Result<()> {
     if let Some(home) = config::existing_home() {
-        if crate::control::request(&home, &Request::Stop).await.is_ok() {
-            println!("stopped the running daemon");
-            // let the OS release the file handle before the binary is swapped
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // Only claim to have stopped something if something was there, and only
+        // after watching it go. The old check was `request(Stop).is_ok()`, which
+        // is true for any *decodable* reply — including an error, and including
+        // the "shutting down" a pre-`signal_shutdown` daemon sends and then
+        // ignores. That printed a stop that never happened and left a daemon on
+        // stale code: the exact skew `heal_foreign_daemon` now has to clean up.
+        if !matches!(
+            crate::control::probe(&home).await,
+            crate::control::Probe::Absent
+        ) {
+            match crate::cli::stop_daemon_verified(&home).await {
+                Ok(()) => {
+                    println!("stopped the running daemon");
+                    // let the OS release the file handle before the binary is swapped
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                }
+                // Worth saying out loud rather than swallowing: a daemon left
+                // running is on stale code the moment the swap lands, and on
+                // Windows it may still hold the executable open.
+                Err(e) => eprintln!(
+                    "warning: could not stop the running daemon: {e:#}\n\
+                     continuing; run `lait shutdown` after the update."
+                ),
+            }
         }
     }
 

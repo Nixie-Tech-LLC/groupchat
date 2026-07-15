@@ -52,16 +52,20 @@ same refactor-freedom the contract buys the CLI and MCP.
 
 ## 2. CLI command surface
 
-Invocation: `lait [--home DIR] [-w SEL] [--json] [--no-color] [<command> [args]]`.
+Invocation: `lait [--home DIR] [-w SEL] [--json] [--yes] [--no-color] [<command> [args]]`.
 **Bare `lait` is the focus view**: your unread inbox summary + your open issues — the
 most valuable keystroke answers "what's addressed to me / what am I on", never help.
 `--home` selects a self-contained node (`$LAIT_HOME`); `-w/--space` (alias
 `--workspace`) selects a **space** from any directory by name, `ws_` id (or unique
 prefix), or path — resolved through the registry to a store path (precedence: `--home`
 > `-w` > cwd discovery); `--json` switches every command to the versioned DTO (§2.3);
-the daemon is auto-spawned on first use (existing `ensure_daemon`). Commands never
-create a store implicitly: in a directory with no space they error with guidance
-(`init`/`join`/`-w`).
+`-y/--yes` answers every confirmation prompt (§2.4); the daemon is auto-spawned on
+first use (existing `ensure_daemon`). Commands never create a store implicitly: in a
+directory with no space they error with guidance (`init`/`join`/`-w`).
+
+These five are **global**: they apply to every command and are grouped under
+`Global Options` in `--help`, apart from each command's own flags. An override that
+improves the human or agent experience belongs here, not on one verb.
 
 > **Vocabulary:** the user-facing noun is **space**; the architecture documents keep
 > the internal term *workspace* (`WorkspaceId`, the Catalog's `workspaceId`, the
@@ -141,6 +145,59 @@ carries the `schemaVersion` gate (S§9) so a reader can detect drift.
 **Exit codes:** `0` ok · `1` usage/parse error · `2` ref not found / ambiguous (§3.2) ·
 `3` daemon unreachable. Machines branch on the code; humans read the message.
 
+The code is derived from the **type** of the failure, never from matching its message
+text: daemon-side failures carry a typed `ErrorKind` on the wire, client-side ones a
+typed `CliError`. Both meet at a single top-level reporter, which is also what keeps
+the `--json` contract above true for errors that never reached the daemon.
+
+### 2.4 Asking before doing
+
+Two situations make lait stop and ask. Both go through one prompt, so both degrade
+identically:
+
+- **Destructive verbs** — `delete`, `members remove`, `members rotate-key`. `delete` is
+  the sharp one: it takes its ref from the git branch when you omit it, so the prompt
+  names the *title*, not just the handle — "delete ENG-142?" is unanswerable if you
+  don't recall which issue that is, which is exactly the case where a stale checkout
+  destroys the wrong one.
+- **Recoverable bad state** — a daemon is running that this build cannot talk to
+  (§2.5). Informing alone would leave every verb dead until the user hand-runs a
+  command lait already knows the name of, so it offers the repair.
+
+The rule is **detect → inform → offer → verify → degrade**:
+
+- **Verify** means confirming the state actually changed, never trusting an
+  acknowledgement. A daemon from v0.4.8 answers `stop` with "shutting down" and then
+  keeps running, so the repair watches the process and escalates.
+- **Degrade** means never blocking when there is nobody to ask. With no TTY (CI, an
+  agent, a pipe) or under `--json`, lait does not prompt: it fails, naming `--yes`.
+  A prompt that hangs a CI job is worse than no prompt at all.
+- The default is always **no**, and `--yes` is the only way through non-interactively.
+
+A repair is only offered when it is the right one. lait never offers to stop a daemon
+**newer** than itself: replacing it downgrades the node, and a store already written at
+a newer `SCHEMA_VERSION` (S§9) would then refuse to open at all. There the honest answer
+is `lait update`.
+
+### 2.5 Version skew on the control channel
+
+The CLI↔daemon channel carries a `CONTROL_PROTOCOL_VERSION`, exchanged in a `hello`
+handshake before anything else — the third plane to get one, alongside the sync
+handshake's `PROTOCOL_VERSION` and the store's `SCHEMA_VERSION` (S§9). Same windowed
+policy: a daemon outside `[MIN_SUPPORTED_CONTROL_PROTOCOL, CONTROL_PROTOCOL_VERSION]`
+is named as such, and which side is behind decides who acts (`lait shutdown` vs
+`lait update`).
+
+The handshake reply is read as **raw JSON before any typed decoding**, so `kind` and
+`protocol_version` are load-bearing field names. This is the point: a mismatched daemon
+must be able to say *that* it is mismatched, without the answer depending on the very
+schema that changed. A daemon that does not answer `hello` at all identifies itself by
+rejecting it — it predates the handshake (v0.4.8 and earlier).
+
+Whether a daemon is **there** is decided at the transport level (does `connect`
+succeed), because that is a fact no wire change can alter. Only a genuinely absent
+daemon is ever spawned over.
+
 ## 3. Refs & addressing — one grammar, resolved daemon-side
 
 All three surfaces accept the **same** ref grammar (S§2, S§7). Resolution happens in the
@@ -163,8 +220,12 @@ All three surfaces accept the **same** ref grammar (S§2, S§7). Resolution happ
 Because `KEY-n` may collide (S§5.4) and a short prefix may be too short, resolution can
 return **zero or many** matches. The daemon answers:
 - **exactly one** → resolved; proceed.
-- **zero** → `Error{ "no issue matches 'ENG-9x'" }`, exit `2`.
-- **many** → `Error` listing the candidates with the shortest disambiguating prefix
+- **zero** → `Candidates{ near_miss_for: "ENG-9x" }` when any handle is within one or
+  two edits of what was typed ("did you mean"), else `Error{ "no issue matches 'ENG-9x'" }`.
+  Exit `2` either way. Typos are the common way to reach zero, so the same candidate
+  machinery serves them — but only when a guess is defensible: an unrelated ref gets no
+  suggestion at all, because a wrong suggestion invites the wrong command.
+- **many** → `Candidates` listing them with the shortest disambiguating prefix
   (`iss_3f9a…`, `iss_3f9b…`); the caller re-issues with more characters. The CLI prints the
   candidate list; the TUI shows a picker (§5.6).
 

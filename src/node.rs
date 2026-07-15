@@ -1186,6 +1186,7 @@ impl Node {
                 }
                 UserResolution::Many(c) => Err(Response::Candidates {
                     candidates: user_candidates(&c),
+                    near_miss_for: None,
                 }),
             }
         };
@@ -1358,6 +1359,7 @@ impl Node {
                     }
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
+                        near_miss_for: None,
                     }),
                 }
             }
@@ -1406,6 +1408,7 @@ impl Node {
                     ))),
                     UserResolution::Many(c) => Ok(Response::Candidates {
                         candidates: user_candidates(&c),
+                        near_miss_for: None,
                     }),
                 }
             }
@@ -1669,6 +1672,14 @@ impl Node {
                     message: Some("shutting down".to_string()),
                 })
             }
+            // Answer with our version and nothing else. The client decides
+            // whether it can talk to us (`check_control_protocol`); refusing here
+            // would only mean a client that can't understand the refusal. The
+            // dialer's `protocol_version` is recorded in the type for a future
+            // daemon-side policy — today it needs no reply beyond ours.
+            Request::Hello { .. } => Ok(Response::Hello {
+                protocol_version: crate::control::CONTROL_PROTOCOL_VERSION,
+            }),
         }
     }
 
