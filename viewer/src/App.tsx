@@ -4,8 +4,10 @@ import { PanelLeft, Plus } from "lucide-react";
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
-import { contribute, registry, type AppApi, type Ctx } from "./core/registry";
+import { contribute, registry, type AppApi, type Ctx, type View } from "./core/registry";
 import { useKeys } from "./core/useKeys";
+import { Activity } from "./ui/Activity";
+import { Board } from "./ui/Board";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
@@ -34,6 +36,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
+  const [view, setView] = useState<View>("list");
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
@@ -132,6 +135,7 @@ export function App() {
       closePalette: () => setOverlay(null),
       toggleShortcuts: () => setOverlay((o) => (o === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
+      goto: (v) => setView(v),
       toggleSidebar: () => {
         const p = sidebar.current;
         if (!p) return;
@@ -181,8 +185,8 @@ export function App() {
   );
 
   const ctx: Ctx = useMemo(
-    () => ({ spaceId: current, readOnly, selection, overlay: overlay !== null, app: api }),
-    [current, readOnly, selection, overlay, api],
+    () => ({ view, spaceId: current, readOnly, selection, overlay: overlay !== null, app: api }),
+    [view, current, readOnly, selection, overlay, api],
   );
 
   const pending = useKeys(ctx);
@@ -232,6 +236,7 @@ export function App() {
             <PanelLeft className="size-4" />
           </button>
           <h1 className="truncate font-semibold">{board?.project.name ?? "lait"}</h1>
+          <span className="text-mute capitalize">{view}</span>
           {readOnly && space?.identity.kind === "agent" && (
             <span
               className="border-line-strong text-dim rounded-sm border px-1.5 py-px text-2xs"
@@ -271,7 +276,17 @@ export function App() {
         <div className="group/list flex min-h-0 flex-1 flex-col">
           {!current ? (
             <p className="text-mute p-8 text-center">Pick a space.</p>
-          ) : board ? (
+          ) : view === "activity" ? (
+            <Activity spaceId={current} revision={revision} onError={setError} onOpen={api.select} />
+          ) : board && view === "board" ? (
+            <Board
+              board={board}
+              selection={selection}
+              onSelect={api.select}
+              onCreate={() => run("issue.create")}
+              readOnly={readOnly}
+            />
+          ) : board && view === "list" ? (
             <IssueList
               board={board}
               selection={selection}
@@ -280,11 +295,13 @@ export function App() {
               onCreate={() => run("issue.create")}
               readOnly={readOnly}
             />
-          ) : null}
+          ) : (
+            <p className="text-mute p-8 text-center">Not built yet.</p>
+          )}
         </div>
       </Panel>
 
-      {detail && selection && current && board && (
+      {detail && selection && current && board && (view === "list" || view === "board") && (
         <>
           <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
             <span className="absolute inset-y-0 -left-[3px] w-[7px]" />

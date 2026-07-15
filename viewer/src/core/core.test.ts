@@ -16,6 +16,7 @@ import { Registry, type Command, type Ctx } from "./registry";
 import { resolve, shouldHandle } from "./resolve";
 
 const ctx = (over: Partial<Ctx> = {}): Ctx => ({
+  view: "list",
   spaceId: "s1",
   readOnly: false,
   selection: null,
@@ -201,6 +202,31 @@ describe("the seam", () => {
     });
     expect(r.active(ctx({ readOnly: true }))).toHaveLength(0);
     expect(resolve(r.active(ctx({ readOnly: true })), [], key("c")).kind).toBe("none");
+  });
+});
+
+describe("the core's g-sequences", () => {
+  it("navigates on g+key without g meaning anything alone", async () => {
+    const { registry } = await import("./registry");
+    await import("../commands");
+
+    const active = registry.active(ctx());
+    const go = active.filter((b) => b.command.id.startsWith("go."));
+    expect(go.map((b) => b.command.id).sort()).toEqual([
+      "go.activity",
+      "go.board",
+      "go.inbox",
+      "go.list",
+      "go.members",
+    ]);
+    // Every one is a two-chord sequence, not a bare letter — otherwise `g` and
+    // `i` would each fire something on their own.
+    for (const b of go) expect(b.bindings[0]).toHaveLength(2);
+
+    // `g` alone pends rather than running.
+    expect(resolve(active, [], key("g")).kind).toBe("pending");
+    const done = resolve(active, [key("g")], key("i"));
+    expect(done.kind === "run" && done.command.id).toBe("go.inbox");
   });
 });
 

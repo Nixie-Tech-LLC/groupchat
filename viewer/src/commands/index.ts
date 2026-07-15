@@ -52,6 +52,27 @@ export const coreCommands = contribute({
       run: (c) => c.app.closePalette(),
     },
 
+    // ---- navigation -------------------------------------------------------
+    // `g` sequences, because that is the grammar a tracker's users already have
+    // in their fingers. The prefix is never pre-empted by a shorter match that
+    // shares it, so `g` can start `g i` and still mean nothing on its own.
+    ...(
+      [
+        ["list", "l", "Issues"],
+        ["board", "b", "Board"],
+        ["inbox", "i", "Inbox"],
+        ["activity", "a", "Activity"],
+        ["members", "m", "Members"],
+      ] as const
+    ).map(([view, key, title]) => ({
+      id: `go.${view}`,
+      title: `Go to ${title}`,
+      group: "Navigation",
+      keys: [`g ${key}`],
+      when: (c: Ctx) => !c.overlay,
+      run: (c: Ctx) => c.app.goto(view),
+    })),
+
     // ---- motion -----------------------------------------------------------
     {
       id: "nav.down",

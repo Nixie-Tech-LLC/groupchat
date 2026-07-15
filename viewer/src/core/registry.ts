@@ -25,8 +25,14 @@
 
 import { parseBinding, type Binding } from "./keys";
 
+/** The root surfaces. A view is not a route — there is no URL to be wrong about,
+ *  and the browser's back button belongs to the browser. */
+export type View = "list" | "board" | "inbox" | "activity" | "members";
+
 /** Everything a command can touch. The app supplies it; extensions receive it. */
 export interface Ctx {
+  /** The root surface on screen. */
+  view: View;
   /** The selected space, or null. */
   spaceId: string | null;
   /** An agent's space: the engine refuses writes, so the UI must not offer them. */
@@ -45,6 +51,7 @@ export interface AppApi {
   toggleShortcuts(): void;
   toggleSidebar(): void;
   toggleDetail(): void;
+  goto(view: View): void;
   toast(message: string): void;
   refresh(): void;
   select(reff: string | null): void;

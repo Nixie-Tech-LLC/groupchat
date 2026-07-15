@@ -3,8 +3,15 @@ import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown, Trash2 } from "lucide-react";
 
 import { rpc } from "../api";
-import { PRIORITY_ORDER, tsToDate, type IssueView, type Priority, type WorkflowState } from "../types";
+import {
+  PRIORITY_ORDER,
+  tsToDate,
+  type IssueView,
+  type Priority,
+  type WorkflowState,
+} from "../types";
 import { catalogColor } from "./colors";
+import { short, when } from "./time";
 import { PriorityIcon, StatusIcon } from "./icons";
 
 /**
@@ -369,23 +376,6 @@ function Picker({
       </Dropdown.Portal>
     </Dropdown.Root>
   );
-}
-
-/** Keys are 64 hex chars; nobody reads more than the head of one. */
-const short = (key: string) => key.slice(0, 8);
-
-/** Relative time, unix seconds in. Coarse on purpose — "3d" is what you want on a
- *  row, and the exact stamp is one hover away via `<time dateTime>`. */
-function when(ts: number): string {
-  const secs = Math.max(0, Math.floor(Date.now() / 1000) - ts);
-  if (secs < 60) return "just now";
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  return tsToDate(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 export type { Priority };
