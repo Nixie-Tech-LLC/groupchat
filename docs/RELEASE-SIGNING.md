@@ -112,6 +112,9 @@ Solutions LLC** (distinct from the `Nixie-Tech-LLC` GitHub org slug).
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC login (federated, no stored cert) | Azure / Entra ID |
 | `AZURE_SIGNING_ENDPOINT` | region endpoint, e.g. `https://wus2.codesigning.azure.net` | Azure |
 | `AZURE_SIGNING_ACCOUNT` / `AZURE_SIGNING_PROFILE` | the Artifact Signing account name + certificate profile name | Azure |
+| `GPG_SIGNING_KEY` | base64 of the exported **release signing subkey** (private) | your offline keyring (§C) |
+| `GPG_SIGNING_KEY_ID` | fingerprint of that signing subkey | `gpg --list-secret-keys` |
+| `GPG_PASSPHRASE` | passphrase for the subkey (omit if none) | you |
 
 ## Account setup runbook (what you do)
 
@@ -189,6 +192,50 @@ off before anything else.
 6. **Add secrets**: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`,
    `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`.
 
+### C. GPG release key — source provenance for redistributors
+
+This is **separate** from the OS code signing above. It lets a downstream
+provider (a distro packager, Homebrew, Nix, …) verify lait's source is
+authentically ours and build + ship their *own* binary — so their users aren't
+locked into the Nixie-built artifacts. It's the model core git uses: upstream
+signs the source, distributors build from it.
+
+Use a **master key kept offline** and a **signing subkey** in CI, so a leaked CI
+secret is revocable without losing the identity.
+
+1. **Generate the key** (do this on a trusted machine, once):
+   ```sh
+   gpg --quick-generate-key "lait release signing (Nixie Solutions LLC) <releases@…>" ed25519 sign 2y
+   FPR=<the printed fingerprint>
+   # a dedicated signing SUBKEY with its own 1-year expiry:
+   gpg --quick-add-key "$FPR" ed25519 sign 1y
+   ```
+2. **Export the public key** into the repo so verifiers have it:
+   ```sh
+   gpg --armor --export "$FPR" > docs/lait-release-key.asc   # commit this
+   ```
+   Optionally publish it to keyservers (`gpg --send-keys "$FPR"`).
+3. **Export only the SIGNING SUBKEY's private half** for CI (note the trailing
+   `!` — it exports just that subkey, not the master):
+   ```sh
+   SUBFPR=<the subkey fingerprint from `gpg --list-secret-keys --with-subkey-fingerprints`>
+   gpg --armor --export-secret-subkeys "${SUBFPR}!" | base64 | pbcopy   # → GPG_SIGNING_KEY
+   ```
+   Add `GPG_SIGNING_KEY`, `GPG_SIGNING_KEY_ID` (= `$SUBFPR`), and `GPG_PASSPHRASE`
+   (if you set one) as repo secrets. **Keep the master key + its revocation
+   certificate offline** (a hardware token or an encrypted backup).
+4. **Sign release tags going forward.** Configure once, then `git tag -s`:
+   ```sh
+   git config user.signingkey "$FPR"
+   git tag -s vX.Y.Z -m "lait vX.Y.Z"      # instead of `git tag vX.Y.Z`
+   ```
+   The existing release ritual (bump `Cargo.toml` + `CHANGELOG`, push the tag)
+   is unchanged except the tag is now `-s`.
+
+**Rotation:** when the subkey nears expiry, `gpg --quick-add-key` a new one, swap
+`GPG_SIGNING_KEY`/`GPG_SIGNING_KEY_ID`, re-export the public key. The master —
+and thus the published trust anchor — never changes.
+
 ## What the CI will do (what I wire once the secrets exist)
 
 Each step is gated on `secrets.<X> != ''` and soft-skips when absent. Shapes:
@@ -212,6 +259,31 @@ tarball ships the signed binary; the `.pkg` is an additional stapled asset:
 ```
 **Linux** — no OS signing; the build-provenance attestation (already wired)
 covers it.
+
+**Source (GPG)** — already wired, `.github/workflows/publish-signatures.yml`
+(decoupled, `workflow_run`, soft-skips until `GPG_SIGNING_KEY` exists). It
+GPG-signs `sha256.sum` and `source.tar.gz` and attaches `.asc` sidecars. Since
+`sha256.sum` covers every artifact, one verified signature transitively vouches
+for all of them.
+
+## Verifying lait's source (for redistributors)
+
+A packager verifies provenance without trusting our binaries at all:
+
+```sh
+# one-time: import the release key
+curl -sSL https://raw.githubusercontent.com/Nixie-Tech-LLC/lait/main/docs/lait-release-key.asc | gpg --import
+
+# verify a release you downloaded
+gpg --verify sha256.sum.asc sha256.sum        # the manifest is ours
+sha256sum -c sha256.sum                         # the artifacts match it
+# and/or verify the tag directly in a clone:
+git verify-tag vX.Y.Z
+```
+
+Then build from the verified `source.tar.gz` (or the tag) and package however you
+like — the GPG chain is independent of the Apple/Azure code signing on our own
+binaries.
 
 ## Verification strategy (given it can't run locally)
 
@@ -240,8 +312,10 @@ covers it.
 
 ### Who does what next
 
-- **You:** work through §A (Apple — start the D-U-N-S now) and §B (Azure), then
-  add the secrets to the repo. Ping when they're in.
-- **Me:** once the secrets exist, wire steps 3–4 into `build-binaries.yml` at the
-  marked `SIGNING SLOT` comments, then we cut a `-rc` tag and verify signatures
-  before any stable release.
+- **You:** work through §A (Apple — start the D-U-N-S now), §B (Azure), and §C
+  (GPG — quick, fully local), then add the secrets and commit
+  `docs/lait-release-key.asc`. Start signing tags with `git tag -s`.
+- **Me:** the GPG source-signing workflow is already wired (it soft-skips until
+  `GPG_SIGNING_KEY` lands). Once the Apple/Azure secrets exist I'll wire the
+  binary-signing steps into `build-binaries.yml` at the marked `SIGNING SLOT`
+  comments, then we cut a `-rc` tag and verify everything before a stable release.
