@@ -100,6 +100,10 @@ pub enum Request {
         status: Option<String>,
         #[serde(default)]
         priority: Option<String>,
+        /// Full-buffer description replace (P0, UI.md §5.3 — the client holds
+        /// no `LoroText` cursor; the daemon applies it as a text update).
+        #[serde(default)]
+        description: Option<String>,
     },
     IssueMove {
         reff: String,

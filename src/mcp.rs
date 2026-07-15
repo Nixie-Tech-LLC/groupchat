@@ -142,6 +142,9 @@ pub struct IssueEditArgs {
     pub status: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// Replace the whole description (full-buffer, S§5.1/U§5.3).
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -396,6 +399,7 @@ impl LaitMcp {
             title: a.title,
             status: a.status,
             priority: a.priority,
+            description: a.description,
         })
         .await
     }

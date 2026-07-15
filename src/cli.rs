@@ -1115,8 +1115,8 @@ pub(crate) fn copy_to_clipboard(s: &str) -> bool {
 /// Render a scannable QR of the invite link as terminal half-block glyphs. Uses
 /// the lowest error-correction level (`L`) so a long invite ticket yields the
 /// smallest module count — the QR still scans, but takes far fewer lines than the
-/// default level.
-fn render_qr(data: &str) -> Result<String> {
+/// default level. `pub(crate)`: the TUI invite panel renders the same QR.
+pub(crate) fn render_qr(data: &str) -> Result<String> {
     use qrcode::{render::unicode, EcLevel, QrCode};
     let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
         .context("build QR code")?;

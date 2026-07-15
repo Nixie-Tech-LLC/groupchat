@@ -342,123 +342,179 @@ of an escalated message, so this rung is the P2 receipt/tier model's input, not 
 
 ## 5. Views
 
-Five views, one modal command palette. Navigation is a stack (`Esc` pops); the board is the
-root.
+**Board-centric with a co-visible detail peek.** The board is the root screen; the issue
+detail is a right-side *peek* panel rendered **beside** it (not stacked over it), so board
+context never disappears while reading an issue. Everything modal — editor, pickers, palette,
+confirm, help — lives on an **overlay stack** above the body; `Esc` pops the stack, then the
+peek, then returns to the board, then quits. Focus is *derived* (top of stack → peek-vs-board
+→ screen), never stored.
 
-### 5.1 Board — the root view
+The full screen set (number keys jump; every screen refreshes off its doorbell scope, §4.2):
+
+| Key | Screen | Shows |
+|---|---|---|
+| `1` | **Board** (root) | workflow columns + peek |
+| `2` | **Inbox** | remote changes addressed to you (S§8.1), unread watermark |
+| `3` | **Activity** | the whole-space feed, ⚠ collision notes |
+| `4` | **Members** | join requests (key-first approve) + ACL roster + full-key detail strip |
+| `5` | **Spaces** | the machine-wide registry; live switch |
+| `!` | **Doctor** | the guided-join gate readout |
+| — | **Config**, **Remotes**, **Log** | reachable via `:` (`config` / `remote ls` / `watch`) |
+
+### 5.1 Board — the root screen
 
 Columns are `Catalog.workflow` states in order; each column is the rows whose
 `Issue.projectId == P` in `boards[P]` order, **deduplicated, belonging-but-unlisted rows
 appended, listed-but-not-belonging ignored** (S§5.5 render rule). Done column via the append
-rule, wall-clock desc (S§5.7).
+rule, wall-clock desc (S§5.7). Workflow colors tint column chrome; the project's color tints
+its active tab.
 
 ```
- ENG · lait                                    [/] filter  [:] cmd  [?] help
- ┌ Backlog ──────┐ ┌ In Progress ──┐ ┌ In Review ────┐ ┌ Done ─────────┐
- │ ENG-142 ·H·   │ │ ENG-140 ·U·▲  │ │ ENG-133 ·M·   │ │ ENG-131       │
- │ parse ticket… │ │ fix login rc… │ │ catalog diff… │ │ seed rooting  │
- │ ○ iss_3f9     │ │ ● you  iss_7a1│ │ ● ab +1 iss_c2│ │ ✓ iss_9e0     │
- │               │ │               │ │               │ │               │
- │ ENG-145 ·L·   │ │ ENG-141 ·H·   │ │               │ │ ENG-128       │
- │ …             │ │ …             │ │               │ │ …             │
- └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘
-  ●=assigned to you  ▲=optimistic  ·U/H/M/L·=priority   3 selected · x
+ ENG │ mine  urgent                 [board]  ⇅ 2 peers  inbox 3   /race
+ ┌ Backlog ──────┐ ┌ In Progress ──┐ ┌─ peek: ENG-140 ──────────────────┐
+ │ ENG-142 ·H·   │ │ ENG-140 ·U· ▲ │ │ fix login race    ·In Progress·  │
+ │  parse ticket…│ │  fix login…   │ │ priority urgent   assignees you  │
+ │               │ │               │ │                                  │
+ │ ▣ ENG-145 ·L· │ │ ENG-141 ·H·   │ │ description…                     │
+ │  …            │ │  …            │ │ comments (2) · history           │
+ └───────────────┘ └───────────────┘ └──────────────────────────────────┘
+  [c] new [enter] peek [S] start [D] done [?] help        ▲=optimistic
 ```
 
-- `h`/`l` move focus across columns, `j`/`k` within a column.
-- `J`/`K` **reorder** the focused issue within its column — a real board op: `IssueMove`
-  with `--before`/`--after` the neighbor, mutating `boards[P]` (the movable list, the native
-  win of A§9). Optimistic overlay reorders the row instantly.
-- `H`/`L` **move status**: `IssueEdit --status` to the prev/next workflow column.
-- Quick actions on the focused issue: `a` assign, `l` label, `p` priority, `m` move project,
-  `s` set status (picker), `Enter` open detail, `x` toggle multi-select (then the same keys
-  act on the selection — one `Request` per issue).
+- `h`/`l` move focus across columns, `j`/`k` within a column; `Tab` toggles focus into the
+  peek (there `j`/`k` scroll, `Enter`/`o` expands it to full width).
+- `J`/`K` **reorder** within the column — `IssueMove` before/after the neighbor, mutating
+  `boards[P]` (the movable list, A§9); the swap is optimistic, an error reloads.
+- `H`/`L` **move status** to the prev/next workflow column (optimistic overlay).
+- `S`/`D`/`O` — the work-state verbs `start`/`done`/`stop` on the focused issue (one commit
+  each; no git-branch step in the TUI).
+- Quick actions: `a` assign, `b` label, `p` priority, `s` set status, `m` move project (all
+  pickers, §5.5), `e` title, `C` comment, `y` yank ref, `x` multi-select.
+- **Multi-select & bulk**: `x` marks (`▣` on the card, a count badge in the header); any
+  issue verb then runs over the whole selection — **one `Request` per issue, sequential**,
+  summarized as `7 ok · 1 failed`. Full success clears the selection.
+- **Narrow terminals**: under ~70 columns the peek takes the body over; `Esc` returns.
 
-### 5.2 List
+### 5.2 Filter & saved view tabs
 
-A flat, dense, filterable table (the `ls` view). Same rows, no columns; sortable by
-priority/updated/created. Good for triage and for `--mine`. Shares all quick-action keys
-with the board.
+`/` opens a **live text filter** (title/ref/alias, keystroke-by-keystroke; `Enter` keeps it,
+`Esc` restores). The active filter shows as a header chip; column counts reflect it.
 
-### 5.3 Issue detail
+`P` **pins** the current filter as a **saved tab** (named inline), persisted as JSON under
+the store-layer `tui.tabs` config key. `[`/`]` cycle `(all) → tab1 → tab2 → (all)`; clicking
+a chip toggles it. A tab carries a client text filter **plus** a daemon-side `Filter`
+(mine/status/label); the board applies the daemon filter by **doc-id intersection** with a
+`List` fetch — mine/label semantics stay server truth, never re-implemented client-side.
 
-Lazy-loaded via `IssueView`. Title, `description` (rendered `LoroText`), metadata
-(project/status/priority/assignees/labels), comments, and a collapsible **activity feed**
-(the derived history, A§5).
+### 5.3 Issue peek
 
-```
- ENG-140  fix login race condition                      iss_7a1  ·In Progress·
- ─────────────────────────────────────────────────────────────────────────────
- Priority Urgent     Assignees ● you, ab      Labels  bug, auth
- Project  ENG                                 Created ab · 2026-07-08
+Lazy-loaded via `IssueView` + `History`. Title, metadata, label chips (label colors), the
+`description` (full-buffer replace on edit — the client holds no `LoroText` cursor; the
+daemon applies it as a text update), comments, and the derived **history timeline** with ⚠
+collision notes (A§9). `e` title · `d` description · `C` comment — all in-TUI editors
+(tui-textarea): real cursor movement, bracketed paste, multi-line for description/comment
+(`Ctrl+S` saves), single-line for titles (`Enter` saves). A quick-create parse error reopens
+the editor with the line intact and the clap error inline — a typo never eats the line.
 
- ## Description
- The token refresh and the initial auth race when… (LoroText, co-editable)
+### 5.4 Inbox & Activity
 
- ## Comments (2)
- ab · 09:14   repro is flaky, ~1 in 5 cold starts
- you · 09:31  looks like the refresh lock isn't held across the await
+**Inbox (`2`)** is the durable, addressed-to-you feed (S§8.1): assignments, comments, and
+status moves on your work, newest first. The read watermark renders honestly — unread rows
+accented with `●`, read rows dim; `C` clears (stamps the watermark, survives restart).
+**Activity (`3`)** is everything, ordered by `seq`/wall-clock (advisory, S§2), **never by
+Lamport**. Both are **pulled, not pushed** (§4.2): `activity_advanced` rings once, the open
+view pulls. `Enter` on any row peeks the issue.
 
- ## Activity
- 09:31 you   status  In Review → In Progress   ⚠ concurrent with ab's edit
- 09:14 ab    comment added
- ─────────────────────────────────────────────────────────────────────────────
- [e]dit title  [d]escription  [C]omment  [a]ssign  [l]abel  [t]imeline  [Esc]
-```
+### 5.5 Command palette, pickers & disambiguation
 
-- `e` edit title (single-line register, LWW — S§5.1), `d` edit description (opens a
-  multi-line editor; on P0 a full-buffer replace, since the client holds no `LoroText`
-  cursor — the daemon applies it as a text update).
-- `C` comment, `t` expand the full time-travel timeline (A§5), `y` yank the ref.
+`:` (or `Ctrl-K`) opens the palette: a one-line input with fuzzy completion over every CLI
+verb (top-level + group subcommands), dispatched through the **same clap grammar** as the
+shell (`cmdspec::parse_to_dispatch`) — one grammar, two entry points (tenet 4). `Tab`
+completes the verb without clobbering typed args; a parse error reopens the line with the
+error inline. `Special` (non-Request) commands map to native equivalents:
 
-### 5.4 Activity (workspace feed)
+| Palette input | Behaves as |
+|---|---|
+| `start`/`done`/`stop [ref]` | native work verbs (focused row when no ref; no git step) |
+| `invite [flags]` | mints the ticket, copies the link, pops a QR overlay |
+| `config` / `get` / `set` / `unset` | config panel; set/unset execute immediately |
+| `spaces` / `forget` / `prune` | Spaces screen (+ confirm) |
+| `watch` | Log screen |
+| `id` | round-trips `Request::Id` into the status line |
+| `init`/`join`/`daemon`/`update`/… | honest "CLI-only — run it in a shell" |
 
-Every transition across the workspace, newest first, ordered by `seq`/wall-clock (advisory,
-S§2), **never by Lamport** (that would be unreadable — S§2's two-orderings rule). This is
-where LWW collision notes (A§9) surface as `⚠` lines. **The feed is pulled, not pushed
-(§4.2):** the doorbell stream only sets `activity_advanced` ("there are new rows"); when this
-view is open it materializes rows lazily via `Activity { since }`, so a 300-doc remote import
-never floods the stream with 300 transition frames — it rings once and the view pulls what it
-can show.
+**Pickers** (assign/label/status/priority/move-project) are one component: type-to-filter
+(fuzzy), `Space` toggles in multi-select, `Enter` applies. Assign and label **pre-check the
+issue's current state** and submit the *diff* (add + remove); bulk over a selection is
+add-only (removing from N issues whose state you can't see would be a guess). A ref that
+resolves to **many** candidates (§3.2) — from any entry point — opens a disambiguation picker
+that substitutes the chosen canonical ref and retries.
 
-### 5.5 Command palette
+### 5.6 Members, Spaces, Config, Remotes, Log
 
-`:` (or `Ctrl-K`) opens a fuzzy palette over **commands + issues + projects**: type
-`assign ENG-140 @me`, or jump to an issue by title/ref. Every CLI verb is reachable here, so
-the palette is the CLI grammar (§2, §3) with fuzzy completion — one grammar, two entry
-points (tenet 4).
+- **Members (`4`)** — the roster with pending join requests on top. Approve is key-first
+  (`y`, optional local petname attached as they're sealed in); the full key is always visible
+  in a detail strip for out-of-band verification. `R` rename (local petname), `d` remove
+  (confirmed — rotates the space key), `i` mint an invite. Admin chores refuse loudly for
+  plain members. The inline `lait members` picker (members_ui) shares this list machinery.
+- **Spaces (`5`)** — the registry, newest-opened first, `●` current / `✗` store-missing.
+  `Enter` switches **live and commit-last**: `ensure_daemon` + a `Status` round-trip must
+  succeed before anything is torn down; then the app rebinds (settings/theme/keymap/tabs from
+  the new store) and re-subscribes (first frame `Reset` rebaselines). `f` forget, `P` prune.
+- **Config** (`: config`) — every key with its effective value and origin layer
+  (store > global > default), plus set `tui.key.*` overrides. `Enter` edits the store layer
+  (empty unsets); daemon-read keys `ConfigReload` live, `tui.*` keys re-theme/re-bind on the
+  spot.
+- **Remotes** (`: remote ls`) — pinned seeds with live reachability; `d` unpins (confirmed);
+  pin via `: seed add <ticket|id>`.
+- **Log** (`: watch`) — the presence/system event ring, tailed live off `presence_advanced`.
 
-### 5.6 Pickers & disambiguation
+## 6. Keymap, mouse & theming
 
-Assign/label/project/status open a fuzzy picker over the relevant registry. A ref that
-resolves to **many** candidates (§3.2) opens a disambiguation picker rather than erroring.
-
-## 6. Keymap
-
-Vim-familiar motion, Linear-familiar actions. Global keys work in every view; view-specific
-keys layer on top.
+Vim-familiar motion, Linear-familiar actions. **The keymap is data**: per-context binding
+tables are the single source that the bottom legend, the `?` help, and dispatch all project
+from (lazygit-style). The `?` overlay is **actionable** — `j`/`k` move, `Enter` runs the
+highlighted action in the underlying context.
 
 | Scope | Key | Action |
 |---|---|---|
-| Global | `?` | help overlay |
+| Global | `?` | actionable help overlay |
 | Global | `:` / `Ctrl-K` | command palette (§5.5) |
-| Global | `/` | filter / search |
-| Global | `q` / `Esc` | pop view / quit at root |
+| Global | `/` | live filter (§5.2) |
+| Global | `q` / `Esc` | pop overlay → close peek → board → quit |
 | Global | `r` | force snapshot reload (self-heal) |
-| Global | `1`/`2`/`3` | board / list / activity view |
-| Motion | `j`/`k` `h`/`l` | move focus (down/up, col left/right) |
+| Global | `1`–`5` / `!` | board / inbox / activity / members / spaces / doctor |
+| Global | `Tab`/`Shift-Tab` | next / prev project |
+| Global | `[` / `]` | cycle saved tabs (§5.2) |
+| Motion | `j`/`k` `h`/`l` (+arrows) | move focus |
 | Motion | `g`/`G` | top / bottom |
-| Board | `J`/`K` | reorder issue within column (`IssueMove`) |
+| Board | `J`/`K` | reorder within column (`IssueMove`) |
 | Board | `H`/`L` | move issue to prev/next status |
-| Issue op | `c` | create issue (quick-create modal) |
-| Issue op | `Enter` | open detail |
-| Issue op | `a`·`l`·`p`·`m`·`s` | assign · label · priority · move · status |
-| Issue op | `x` | toggle multi-select |
-| Detail | `e`·`d`·`C`·`t`·`y` | edit title · description · comment · timeline · yank ref |
+| Board | `S`/`D`/`O` | start / done / stop (work-state verbs) |
+| Board | `P` | pin the current filter as a tab |
+| Issue op | `c` | quick-create (title, then `-p`/`-a`/`-P`/`-l` tokens — `new`'s grammar) |
+| Issue op | `Enter` | open peek / expand |
+| Issue op | `a`·`b`·`p`·`s`·`m` | assign · label · priority · status · move project |
+| Issue op | `x` / `X` | toggle / clear multi-select |
+| Peek | `e`·`d`·`C`·`y` | edit title · description · comment · yank ref |
+| Members | `y`·`n`·`R`·`d`·`i` | approve · dismiss · rename · remove · invite |
+| Spaces | `Enter`·`f`·`P` | switch · forget · prune |
 
-**Quick-create (`c`)** is a single modal: title line, then optional `-p`/`-a`/`-P`/`-l`
-inline tokens parsed with the same grammar as `new` (§2). One `Enter` = one `IssueNew` = one
-issue = one activity row.
+**Rebinding.** Every action has a stable kebab-case id (shown in `?`); the config keys
+`tui.key.<action-id> = <chord>` (e.g. `tui.key.open-palette = ctrl+p`) rebind at startup —
+a bad override warns in the status line, never gates.
+
+**Mouse.** Clicks land on render-time hit regions (overlays win): project/saved tabs, column
+headers, rows (double-click peeks), the peek, legend chips, palette/picker rows. The wheel
+scrolls the panel under the cursor. All progressive enhancement — a console that rejects
+mouse capture still gets the full keyboard client.
+
+**Theming.** `tui.theme = dark | light | auto` (auto = the zero-dependency `COLORFGBG`
+heuristic). Every renderer takes styles from the one `Theme`; the DTO-carried color strings
+(workflow states, projects, labels) map through `parse_color` (named + `#rrggbb`) into
+column tints, tab accents, and label chips. Terminal lifecycle is panic-safe: a RAII guard
+plus a panic hook restore raw mode/alt screen/mouse capture exactly once, so a crash message
+is readable and the shell survives.
 
 ## 7. Conflict & limitation surfacing
 
