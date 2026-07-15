@@ -1,4 +1,4 @@
-//! Wire protocol: signed gossip messages, the room ticket, and topic derivation.
+//! Wire protocol: signed gossip messages, the workspace ticket, and topic derivation.
 //!
 //! Messages broadcast on the gossip topic are postcard-encoded `SignedMessage`s
 //! carrying an ed25519 signature over a `Payload`. This mirrors the canonical
@@ -20,11 +20,16 @@ use serde_byte_array::ByteArray;
 const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
 type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 
-/// Derive a stable gossip topic id from a human room name, so everyone who
-/// types the same room name lands in the same room.
-pub fn topic_for_room(room: &str) -> TopicId {
-    let hash = blake3::hash(room.as_bytes());
-    TopicId::from_bytes(*hash.as_bytes())
+/// Derive the gossip topic id from the workspace id. The topic is a pure
+/// function of the genesis identity — there is no user-settable network name,
+/// so it can never drift, be renamed apart, or collide across workspaces the
+/// way the old folder-seeded "room" string could. Domain-separated so the
+/// topic space is disjoint from any other blake3 use.
+pub fn topic_for_workspace(workspace: &str) -> TopicId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lait/topic/v1");
+    hasher.update(workspace.as_bytes());
+    TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// Length of an invite nonce — a random single-use id (128 bits).
@@ -189,23 +194,26 @@ impl SignedMessage {
     }
 }
 
-/// A compact, base32-encoded invite to join a room. It carries only what a
-/// joiner cannot derive on its own: the room name (the topic is
-/// `topic_for_room(room)`), the host's endpoint id, and the host's nick (for
+/// A compact, base32-encoded invite to join a workspace. It carries only what a
+/// joiner cannot derive on its own: the workspace id (the topic is
+/// `topic_for_workspace(workspace)` and the genesis trust anchor, A§6/A§10),
+/// the workspace's display name (so the joiner sees what they're joining before
+/// the catalog arrives), the host's endpoint id, and the host's nick (for
 /// one-step `connect`). We deliberately do NOT ship relay/socket addresses —
 /// iroh discovery resolves a reachable address from the pubkey — so the ticket
 /// stays short enough to survive copy-paste as a single line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoomTicket {
-    pub room: String,
+pub struct WorkspaceTicket {
+    /// The workspace id the joiner bootstraps from (required — a brand-new
+    /// client establishes the whole workspace from nothing but this ticket: it
+    /// roots on the id, then backfills the catalog + docs over sync).
+    pub workspace: String,
+    /// The workspace's display name at mint time (cosmetic; the synced catalog
+    /// value is authoritative once it arrives).
+    pub name: String,
     pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
-    /// The workspace id the joiner adopts (the genesis trust anchor, A§6/A§10).
-    /// A brand-new client establishes the whole workspace from nothing but this
-    /// ticket: it adopts the id, then backfills the catalog + docs over sync.
-    #[serde(default)]
-    pub workspace: String,
     /// An optional pre-authorization capability (Pattern A). Present ⇒ a joiner is
     /// auto-admitted on `join` (the seal happens without a manual `members
     /// approve`). Absent ⇒ the classic request→approve flow. The joiner echoes it
@@ -214,10 +222,10 @@ pub struct RoomTicket {
     pub invite: Option<SignedInvite>,
 }
 
-impl RoomTicket {
-    /// The gossip topic this ticket joins (derived from the room name).
+impl WorkspaceTicket {
+    /// The gossip topic this ticket joins (derived from the workspace id).
     pub fn topic(&self) -> TopicId {
-        topic_for_room(&self.room)
+        topic_for_workspace(&self.workspace)
     }
 
     /// The `lait://` link form of this ticket, for humans/chat apps.
@@ -229,11 +237,21 @@ impl RoomTicket {
         postcard::to_stdvec(self).expect("postcard::to_stdvec is infallible")
     }
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        postcard::from_bytes(bytes).context("decode room ticket")
+        let t: Self = postcard::from_bytes(bytes).context(
+            "decode workspace ticket (this invite may be from an older lait — ask for a fresh one)",
+        )?;
+        // Postcard has no schema: an old-format ticket can decode "successfully"
+        // into garbage fields. The workspace id shape is the cheap integrity check.
+        if !t.workspace.starts_with("ws_") {
+            anyhow::bail!(
+                "decode workspace ticket: not a valid workspace id (this invite may be from an older lait — ask for a fresh one)"
+            );
+        }
+        Ok(t)
     }
 }
 
-impl fmt::Display for RoomTicket {
+impl fmt::Display for WorkspaceTicket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut text = data_encoding::BASE32_NOPAD.encode(&self.to_bytes());
         text.make_ascii_lowercase();
@@ -241,7 +259,7 @@ impl fmt::Display for RoomTicket {
     }
 }
 
-impl FromStr for RoomTicket {
+impl FromStr for WorkspaceTicket {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         // Accept a bare token or a `lait://join/<token>` link, and tolerate
@@ -251,7 +269,7 @@ impl FromStr for RoomTicket {
         let cleaned: String = token.chars().filter(|c| !c.is_whitespace()).collect();
         let bytes = data_encoding::BASE32_NOPAD
             .decode(cleaned.to_ascii_uppercase().as_bytes())
-            .context("decode room ticket base32")?;
+            .context("decode workspace ticket base32")?;
         Self::from_bytes(&bytes)
     }
 }
@@ -264,12 +282,12 @@ mod tests {
         SecretKey::from_bytes(&[7u8; 32]).public()
     }
 
-    fn sample() -> RoomTicket {
-        RoomTicket {
-            room: "demo".into(),
+    fn sample() -> WorkspaceTicket {
+        WorkspaceTicket {
+            workspace: "ws_00000000000000000000000000".into(),
+            name: "demo".into(),
             host: host_key(),
             host_nick: "alice".into(),
-            workspace: "ws_00000000000000000000000000".into(),
             invite: None,
         }
     }
@@ -277,11 +295,38 @@ mod tests {
     #[test]
     fn ticket_roundtrips_through_base32() {
         let t = sample();
-        let back: RoomTicket = t.to_string().parse().unwrap();
-        assert_eq!(back.room, "demo");
+        let back: WorkspaceTicket = t.to_string().parse().unwrap();
+        assert_eq!(back.workspace, "ws_00000000000000000000000000");
+        assert_eq!(back.name, "demo");
         assert_eq!(back.host, host_key());
         assert_eq!(back.host_nick, "alice");
-        assert_eq!(back.topic(), topic_for_room("demo"));
+        assert_eq!(
+            back.topic(),
+            topic_for_workspace("ws_00000000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn topic_is_a_pure_function_of_the_workspace_id() {
+        // Same id → same topic; different ids → different topics. The display
+        // name plays no part (renaming never re-topics).
+        assert_eq!(topic_for_workspace("ws_A"), topic_for_workspace("ws_A"));
+        assert_ne!(topic_for_workspace("ws_A"), topic_for_workspace("ws_B"));
+        let mut a = sample();
+        a.name = "renamed".into();
+        assert_eq!(a.topic(), sample().topic());
+    }
+
+    #[test]
+    fn garbage_ticket_errors_with_the_older_lait_hint() {
+        // A structurally-valid base32 blob that isn't a new-format ticket must
+        // fail with the "older lait" hint, not decode into garbage fields.
+        let blob = data_encoding::BASE32_NOPAD.encode(b"\x04demo\x00\x00\x00");
+        let err = blob.parse::<WorkspaceTicket>().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("older lait"),
+            "error should carry the stale-invite hint, got: {err:#}"
+        );
     }
 
     #[test]
@@ -299,7 +344,7 @@ mod tests {
         let t = sample();
         let link = t.link();
         assert!(link.starts_with("lait://join/"));
-        let back: RoomTicket = link.parse().unwrap();
+        let back: WorkspaceTicket = link.parse().unwrap();
         assert_eq!(back.host, host_key());
     }
 
@@ -308,7 +353,7 @@ mod tests {
         let s = sample().to_string();
         // Simulate a terminal wrapping the token across lines on copy.
         let mangled = format!("  {}\n   {}  ", &s[..s.len() / 2], &s[s.len() / 2..]);
-        let back: RoomTicket = mangled.parse().unwrap();
+        let back: WorkspaceTicket = mangled.parse().unwrap();
         assert_eq!(back.host, host_key());
     }
 
@@ -335,7 +380,7 @@ mod tests {
         let grant = InviteGrant::mint("ws_00000000000000000000000000".into(), 0, 604_800, true);
         let mut t = sample();
         t.invite = Some(SignedInvite::sign(&sk, &grant).unwrap());
-        let back: RoomTicket = t.to_string().parse().unwrap();
+        let back: WorkspaceTicket = t.to_string().parse().unwrap();
         let (issuer, g) = back
             .invite
             .expect("invite survives roundtrip")

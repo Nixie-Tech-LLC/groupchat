@@ -8,7 +8,7 @@
 //!   * **enter** — detail view (a member's ACL standing, or a request's full key)
 //!   * **y / n** — approve / dismiss a highlighted request (admin)
 //!   * **r** — rename: set a local petname (`MemberAlias`; empty clears)
-//!   * **d** — remove a member (admin; rotates the workspace key — confirmed)
+//!   * **d** — remove a member (admin; rotates the space key — confirmed)
 //!   * **i** — mint a fresh invite link and copy it to the clipboard (admin)
 //!   * **q / esc** — quit
 //!
@@ -46,7 +46,7 @@ use ratatui::{
 use crate::cli::ensure_daemon;
 use crate::control::{request, Request, Response};
 use crate::dto::{JoinRequestDto, MemberDto};
-use crate::proto::RoomTicket;
+use crate::proto::WorkspaceTicket;
 
 /// One selectable row: a pending request (approvable) or an existing member.
 #[derive(Clone)]
@@ -68,7 +68,7 @@ enum Mode {
     /// Setting a local petname on the highlighted key (`MemberAlias`). Empty
     /// clears it. Local-only, never synced.
     Rename { buffer: String },
-    /// Confirming removal of the highlighted member (rotates the workspace key).
+    /// Confirming removal of the highlighted member (rotates the space key).
     ConfirmRemove,
 }
 
@@ -195,7 +195,7 @@ impl App {
             who: key.to_string(),
             as_name,
         };
-        self.mutate(req, "approved — workspace key sealed to them")
+        self.mutate(req, "approved — space key sealed to them")
             .await;
     }
 
@@ -214,12 +214,12 @@ impl App {
         self.mutate(req, ok).await;
     }
 
-    /// Remove the member at `key` (admin-only) — rotates the workspace key.
+    /// Remove the member at `key` (admin-only) — rotates the space key.
     async fn remove(&mut self, key: &str) {
         let req = Request::MemberRemove {
             who: key.to_string(),
         };
-        self.mutate(req, "removed — workspace key rotated").await;
+        self.mutate(req, "removed — space key rotated").await;
     }
 
     /// Send a mutating request, set a success/failure status, and re-read the
@@ -250,7 +250,7 @@ impl App {
             Ok(Response::Text { text }) => {
                 let token = text.trim().to_string();
                 let link = token
-                    .parse::<RoomTicket>()
+                    .parse::<WorkspaceTicket>()
                     .map(|t| t.link())
                     .unwrap_or_else(|_| token.clone());
                 self.status = Some(if crate::cli::copy_to_clipboard(&link) {
@@ -634,7 +634,7 @@ fn confirm_remove_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         header("REMOVE MEMBER"),
         Line::styled(
-            "  ⚠ removes them and rotates the workspace key.",
+            "  ⚠ removes them and rotates the space key.",
             Style::default().fg(Color::Yellow),
         ),
         Line::styled(
@@ -836,7 +836,7 @@ mod tests {
         app.mode = Mode::ConfirmRemove;
         let out = rendered(&app);
         assert!(out.contains("REMOVE MEMBER"));
-        assert!(out.contains("rotates the workspace key"));
+        assert!(out.contains("rotates the space key"));
         assert!(out.contains("Remove"));
     }
 

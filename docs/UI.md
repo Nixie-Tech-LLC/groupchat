@@ -1,12 +1,14 @@
 # UI — lait: CLI & TUI
 
-> **Status:** design draft, pre-build. The third design leg, companion to
+> **Status:** implemented (v0.4.8); this is the design of record, kept in sync with
+> the shipped surfaces. The third design leg, companion to
 > [`ARCHITECTURE.md`](./ARCHITECTURE.md) (refs `A§`) and [`SCHEMA.md`](./SCHEMA.md)
 > (refs `S§`). Covers the two human surfaces of the tracker — the **CLI** and the
-> **TUI** — plus the agent surface (MCP) they share a contract with. Scoped to a
-> **P0-complete** design (single node, git-backed, no network); P1/P3/P4 surfaces are
-> **named and slotted, not built** (§8), matching the phasing in A§13. Live decisions
-> are flagged **[DECISION]** with the chosen default in bold, same as S§.
+> **TUI** — plus the agent surface (MCP) they share a contract with. The full
+> **P0-complete** surface (single node, git-backed) is built, and the P1/P3 surfaces
+> it slotted (§8 — live sync/presence, membership) have since landed; P4 polish is the
+> remaining work. Decisions are flagged **[DECISION]** with the shipped default in bold,
+> same as S§.
 
 ## 1. Scope & the one-façade rule
 
@@ -43,16 +45,27 @@ same refactor-freedom the contract buys the CLI and MCP.
 4. **Same nouns everywhere.** A `Ref` means the same thing in the CLI, the TUI command
    palette, and an MCP tool argument (§3).
 
-> Today's `src/control.rs` still carries the **chat-era** `Request`/`Response` enum
-> (`Status/Invite/Join/Connect/Log/Wait/Who/Stop`). This document specifies the **tracker**
-> Layer B (the S§7 enum) that supersedes it; the transport/presence verbs survive as the
-> P1 networking surface (§8). Where a verb is new it is marked **[new]**.
+> `src/control.rs` now carries the **tracker** Layer B specified here (the S§7 enum):
+> the issue verbs, the membership/ACL verbs, `Subscribe`, and `Diagnose`. The chat-era
+> transport/presence verbs (`Status/Invite/Join/Connect/Log/Who/Stop`) survive
+> alongside as the P1 networking surface (§8).
 
 ## 2. CLI command surface
 
-Invocation: `lait [--home DIR] [--json] [--no-color] <command> [args]`. `--home`
-selects the node (`$LAIT_HOME`); `--json` switches every command to the versioned DTO
-(§2.3); the daemon is auto-spawned on first use (existing `ensure_daemon`).
+Invocation: `lait [--home DIR] [-w SEL] [--json] [--no-color] [<command> [args]]`.
+**Bare `lait` is the focus view**: your unread inbox summary + your open issues — the
+most valuable keystroke answers "what's addressed to me / what am I on", never help.
+`--home` selects a self-contained node (`$LAIT_HOME`); `-w/--space` (alias
+`--workspace`) selects a **space** from any directory by name, `ws_` id (or unique
+prefix), or path — resolved through the registry to a store path (precedence: `--home`
+> `-w` > cwd discovery); `--json` switches every command to the versioned DTO (§2.3);
+the daemon is auto-spawned on first use (existing `ensure_daemon`). Commands never
+create a store implicitly: in a directory with no space they error with guidance
+(`init`/`join`/`-w`).
+
+> **Vocabulary:** the user-facing noun is **space**; the architecture documents keep
+> the internal term *workspace* (`WorkspaceId`, the Catalog's `workspaceId`, the
+> `workspace` doctor-gate id). Same thing, two altitudes.
 
 ### 2.1 Command table
 
@@ -61,30 +74,47 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 
 | Command | `Request` (S§7) | Description |
 |---|---|---|
-| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). |
-| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | `List` | List rows from the Catalog cache only (no issue-doc loads). `--all` includes done/tombstoned. |
-| `board <PROJ>` | `Board` | Render the project's columns (workflow states × ordered rows). |
+| `init [--name N] [--nick N]` | — | **Found a workspace here** (`cwd/.lait`): mints the genesis, names it (default: the directory), seeds a first project so `new` works immediately. Errors inside an existing workspace. |
+| `new <title> [-p PROJ] [-a USER…] [-P PRIO] [-l LABEL…] [-b BODY] [--start]` | `IssueNew` | Create an issue; echoes the resolved handle (`Response::Ref`). `-p` optional — the S§7.6 chain (branch key → `project.default` → sole project). Unknown `-l` labels are **created on first use** (vocabulary, not ceremony). `--start` chains straight into the work loop. |
+| `start [ref] [--no-branch]` | `IssueStart` | **Claim + activate + branch** in one intent: assign yourself, move to the first Active-category status (one commit = one activity row), then create+checkout `key-n-slug`. Ref inferred from the branch when omitted; branch step is best-effort, skipped outside git. Returns the fresh `Response::Issue` (the one writes-echo-Ref deviation — the CLI needs the title for the slug). |
+| `done [ref]` | `IssueDone` | Finish: first Done-category status (assignee kept, S§5.7 board removal). Ref inferred from the branch — the loop closes with no ref typed. |
+| `stop [ref]` | `IssueStop` | Put it down gracefully: first Backlog-category status, unassign yourself. |
+| `inbox [--clear]` | `Inbox` | The **durable, addressed-to-you** inbox (S§8.1): remote assignments, comments on your work, `@nick` mentions, status moves — newest-first with an unread watermark. Sits BESIDE `activity` (the workspace firehose): two different questions, two commands. |
+| `ls [-p PROJ] [--mine] [--status S] [--label L] [--all]` | `List` | List rows from the Catalog cache only (no issue-doc loads). `-p` is a pure filter (never defaulted); `--all` includes done/tombstoned. |
+| `board [PROJ]` | `Board` | Render the project's columns (workflow states × ordered rows). Positional optional — the S§7.6 chain. |
 | `show <ref>` | `IssueView` | Full issue — **lazy-loads the issue doc**. Body, comments, activity. |
 | `edit <ref> [--title T] [--status S] [--priority P]` | `IssueEdit` | Patch the LWW fields. Multiple flags = **one** commit = one activity row (S§7.1). |
-| `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | `IssueMove` | Set project (truth) and/or board position (order). |
+| `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | `IssueMove` | Set project (truth) and/or board position (order). `-p` explicit only — membership is never inferred. |
 | `assign <ref> <userref…> [--remove]` | `Assign` | Add/remove assignees (present-key set, S§5.2). |
 | `label <ref> [+LABEL…] [-LABEL…]` | `Label` | Add (`+`) / remove (`-`) labels on an issue. |
 | `comment <ref> [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). No arg → open `$EDITOR`. |
+| `delete <ref>` | `IssueDelete` | Tombstone an issue (S§5.6); it stays in `docs` for history/backfill, `ls`/`board` hide it. |
 | `history <ref>` | `History` | The issue's derived activity/time-travel feed (free from Loro op history, A§5). |
-| `projects [new <name> --key KEY \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). |
+| `projects [add KEY [NAME] \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). Key-first, name optional (defaults to the title-cased key); `new` kept as an alias of the same shape. |
 | `labels [new <name> --color C \| ls]` | `LabelNew`/`LabelList` | Manage the label registry (`Catalog.labels`). |
+| `members [add\|remove\|requests\|approve\|name\|rotate-key\|ls]` | `MemberAdd`/`MemberRemove`/… | Manage E2EE membership (the signed ACL, S§6): `add` seals the key, `remove` rotates it, `approve` admits a pending joiner, `name` sets a local alias (§8, P3). |
 | `activity [--since N]` | `Activity` | Workspace-wide recent transitions (ex-`log`; ring-buffer `seq`). |
-| `wait [--since N] [--timeout-ms M]` | `Wait` | Block until the next event; prints it. The scripting primitive. |
-| `watch [--since N] [--exec CMD] [--notify]` | `Wait`-loop | Follow forever; run a hook / desktop-notify per event (existing). |
-| `tui` | — **[new]** | Launch the full-screen board (§4). |
-| `status` · `stop` | `Status`/`Stop` | Node status; stop the daemon. |
-| `invite` · `join` · `connect` · `who` · `id` | (P1 transport) | Kept from the skeleton; the networking surface (§8, A§8). |
+| `watch [--since N] [--exec CMD] [--notify]` | `Subscribe`-stream | Follow forever; run a hook / desktop-notify per event. The scripting primitive. |
+| `tui` | — | Launch the full-screen board (§4). |
+| `doctor` (alias `verify`) | `Diagnose` | Guided-join verifier: names the one onboarding gate that's blocking ([`GUIDED-JOIN.md`](./GUIDED-JOIN.md)). Auto-tails `join`. |
+| `spaces [ls\|forget <sel>\|prune]` (alias `workspaces`) | — | Every space on this machine (founded + joined): name, id, origin, live status (`up`/`idle`/`missing`), project keys, path. `forget` deregisters (never touches disk); `prune` drops missing entries. |
+| `config [get\|set\|unset\|ls]` | — | Layered local settings, git-style: global `config.json` + per-store `config.json` (store wins). Keys: `user.nick` (daemon-read → live `ConfigReload` on set), `project.default`; `workspace.*` reserved for future synced settings. Daemon-free. |
+| `profiles` (alias `agents`) · `resume <name>` | — | List / switch named profiles (each a separate identity + store). |
+| `status` · `shutdown` · `id` | `Status`/`Stop`/`Id` | Node/space status; stop the daemon (`stop` the word belongs to the work loop); print the endpoint id. |
+| `invite` · `join [--dir D]` (alias `connect`) · `who` · `remote` (alias `seed`) | (P1 transport, §8/A§8) | The networking surface: invite/join a workspace, list peers, pin a seed. `join` **creates** the joiner's store (cwd or `--dir`) from the ticket before the daemon runs; joining from a directory bound to a different workspace is a hard exit-2 error. |
 
 ### 2.2 Notable behaviors
 
 - **Writes echo the resolved handle.** `new`/`edit`/`move`/… return `Response::Ref{reff}`
   so a script can capture the canonical handle (`iss_…` short prefix, §3) it just touched:
   `id=$(lait new "fix login" -p ENG --json | jq -r .reff)`.
+- **Branch-inferred refs.** On a git branch whose name embeds a `KEY-n` (e.g.
+  `eng-142-fix-login`), the `<ref>` is **optional** for `show`/`edit`/`move`/`history`/
+  `delete` — lait infers `ENG-142` from the branch, mirroring the git-companion workflow.
+- **Branch-inferred project.** The same branch also yields the project KEY (`ENG`),
+  shipped to the daemon as a separate `project_hint` for `new`/`board` (S§7.6): used only
+  if it resolves to a real project, so a branch like `wip-2` never breaks anything, and an
+  explicit `-p` miss still errors loudly.
 - **No compare-and-swap (S§7.2).** There is no `--if-status open` flag and there never will
   be one; a `Response` is a snapshot with no cursor back into the doc, edits merge, and
   "close only if still open" is inexpressible. Stated here so nobody adds optimistic
@@ -179,14 +209,14 @@ connections over the one socket:
 - **Subscribe channel:** one long-lived connection carrying the live doorbell stream. This is
   the one Layer-B addition the TUI needs (S§7):
 
-  > **`Subscribe { since: u64 }`  [new]** — turns the one-shot handler into a **streaming
+  > **`Subscribe { since: u64 }`** — turns the one-shot handler into a **streaming
   > mode**: the daemon reads the request, then instead of returning after one response, parks
-  > on the `EventLog` `Notify` and writes newline-delimited **`Doorbell` frames** until the
-  > client hangs up or the daemon stops. Mechanically it is the existing `Wait` loop
-  > (`node.rs`) that never returns. **[DECISION] streaming Subscribe** over re-polling `Wait`:
-  > it pushes with no per-round request overhead and is a forward-compatible superset of
-  > `Wait`, which remains the documented fallback (and is exactly what CLI `watch` already
-  > does), so the daemon supports both.
+  > on the doorbell `Notify` and writes newline-delimited **`Doorbell` frames** until the
+  > client hangs up or the daemon stops. **[DECISION] streaming Subscribe is the one live
+  > channel**: it pushes with no per-round request overhead, and every plane rings it — the
+  > tracker dirty-set, `activity_advanced`, and `presence_advanced` (the presence/join plane
+  > CLI `watch` follows). The re-polling `Wait` verb it superseded is gone: it duplicated the
+  > wake path with a worse restart story (no epoch, so a stale cursor went silently deaf).
 
 **Reconnect, restart, and gaps all collapse to one path — `Reset`.** `seq` is per-daemon
 *session*, not durable (S§2): a daemon restart (crash, or the routine idle-shutdown) resets
@@ -450,23 +480,24 @@ The UI must make the CRDT's honest limitations legible rather than hiding them:
 - **Attribution is advisory (A§ non-goal 6).** Authorship (`createdBy`, comment authors) is
   shown as data, not a verified badge; the UI does not imply cryptographic provenance.
 
-## 8. Forward hooks (P1+) — named, slotted, not built
+## 8. Forward hooks (P1+) — slotted onto the P0 grammar
 
-The P0 surface is designed so later phases **add panels and columns, never reshape the
-grammar**. Where each lands:
+The P0 surface was designed so later phases **add panels and columns, never reshape the
+grammar** — and that held: P1 (live sync/presence) and P3 (membership) landed without
+touching the issue grammar. Where each attaches:
 
 - **P1 — live sync & presence.** A status bar gains a **sync indicator** (peers online,
   catalog-head freshness, "syncing N docs") fed by the existing presence/gossip events
-  (A§8); `who`/`invite`/`connect` (already in the skeleton) become the TUI's peers panel.
+  (A§8); `who`/`invite`/`connect` become the TUI's peers panel.
   No new issue grammar — sync is ambient.
 - **P1/P2 — receipts & tiers ([`HARDENING.md`]).** `send`/`ack`/`receipts`/`focus` and the
   tier ladder (`ambient…interrupt`) attach to the **activity/notification** surface, not the
   issue model: `watch --min-tier/--on-interrupt` is the CLI teeth; the TUI shows receipt
   badges (`✓delivered ✓seen ✓acked`) and honors `mute_below`. Designed there, slotted here.
-- **P3 — membership UI.** A **members view** over `Catalog.acl` (S§6): roles, add/remove,
-  key rotation — read-only until the signed-op grammar lands, then `MemberAdd/Remove`,
-  `KeyRotate` (S§7). The ACL is the only signed structure, so this view is the only one
-  showing verified identity. Join-request approval rides on the same op-graph: `members
+- **P3 — membership UI (landed).** A **members view** over `Catalog.acl` (S§6): roles,
+  add/remove, key rotation, driven by `MemberAdd/Remove`, `KeyRotate` (S§7). The ACL is
+  the only signed structure, so this view is the only one showing verified identity.
+  Join-request approval rides on the same op-graph: `members
   requests` lists announced joiners (authenticated key + an *unverified* nick claim) and
   `members approve <prefix|key> [--as <name>]` signs the `AddMember` op — resolving
   **key-first**, never by the self-asserted nick (an unauthenticated name must not select
@@ -482,11 +513,13 @@ grammar**. Where each lands:
   the **same `Response` DTOs** the CLI `--json` emits (S§7.3), so agent and human surfaces
   never drift. TUI polish (themes, resize, wide-table horizontal scroll) is P4.
 
-## 9. Open decisions (mirror of A§14 / S§10)
+## 9. Decisions — settled (mirror of A§14 / S§10)
 
 - **§4 TUI substrate — ratatui** (default, agreed) vs any other Rust TUI lib. Settled.
-- **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Both
-  supported; Subscribe is the TUI path, Wait the scripting/`watch` path. Settled.
+- **§4.1 live channel — streaming `Subscribe`** (default) vs re-polling `Wait`. Originally
+  settled as "both supported" (Subscribe for the TUI, Wait for scripting/`watch`); **revised**
+  once the doorbell grew a presence plane — `watch` now rides `Subscribe` and `Wait` is
+  deleted. One wake path, one rebaseline story (`Reset`/`epoch`).
 - **§4.2 event shape — batched, project-keyed doorbells** (agreed) vs value-carrying deltas.
   Settled: doorbells carry a dirty-set, never state; the client re-reads.
 - **§4.3 reconciliation — correlation-free, accept the flicker** (agreed) vs op-id-correlated
@@ -519,8 +552,8 @@ grammar**. Where each lands:
   CLI, palette, and MCP; ambiguity (short prefix / colliding `KEY-n`) is a first-class
   outcome with a candidate list, not a crash (§3). Canonical handle is always the short
   `DocId`; `KEY-n` is a friendly alias (S§5.4).
-- **`Subscribe` is the one new Layer-B verb the TUI needs** — a streaming superset of `Wait`,
-  forward-compatible, with `Wait`-loop as the documented fallback (§4.1). The rest of the TUI
+- **`Subscribe` is the one live Layer-B verb** — the single streaming wake path for the TUI
+  *and* CLI `watch`; the `Wait` long-poll it superseded is deleted (§4.1). The rest of the TUI
   is built from `Board`/`List`/`IssueView` + the doorbell stream over the S§7 surface — no new
   domain schema.
 - **The event stream is doorbells, not deltas** — a frame rings "these scopes are dirty," the
@@ -541,8 +574,9 @@ grammar**. Where each lands:
 - **The cursor is ephemeral; `Reset` unifies every gap** — `seq` is per-daemon-session (S§2
   reworded), so first-connect, reconnect, restart, and ring-overrun all collapse to one "snapshot
   + rebaseline" path signalled by a `Reset` doorbell + a per-boot epoch nonce (§4.1). `seq`
-  never needs persisting. This also fixes a pre-existing `watch`/`wait`/`poll` deafness across
-  the routine idle-shutdown.
+  never needs persisting. This also fixes a pre-existing `watch` deafness across
+  the routine idle-shutdown (the old `Wait` poll loop held a stale cursor with no epoch to
+  void it).
 - **A `Subscribe`-pinned daemon is a feature; the only leak is false availability** — an open
   TUI keeps the node alive, densifying the mesh toward the seed role (A§10). Honesty is restored
   by input-driven three-state presence (`online`/`away`/`offline`), and `away` is precisely
@@ -561,5 +595,5 @@ grammar**. Where each lands:
 
 **Companion sources:** [`ARCHITECTURE.md`](./ARCHITECTURE.md) (A§) ·
 [`SCHEMA.md`](./SCHEMA.md) (S§) · [`HARDENING.md`](./HARDENING.md) (receipts/tiers) ·
-[ratatui](https://ratatui.rs) · existing `src/control.rs`, `src/cli.rs` (the skeleton this
-extends).
+[`GUIDED-JOIN.md`](./GUIDED-JOIN.md) (onboarding) · [ratatui](https://ratatui.rs) ·
+`src/control.rs`, `src/cli.rs`, `src/tui/`.
