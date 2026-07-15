@@ -280,6 +280,12 @@ fn lock_path(home: &Path) -> PathBuf {
     home.join("daemon.lock")
 }
 
+/// Path to the file naming the daemon that holds a home. Deliberately not the
+/// lock file — see `acquire_daemon_lock`.
+fn pid_path(home: &Path) -> PathBuf {
+    home.join("daemon.pid")
+}
+
 /// A held single-instance lock for a daemon home. The underlying OS advisory
 /// lock (`flock(2)` on unix, `LockFileEx` on Windows, via `fs2`) is released
 /// automatically when this value is dropped or the process exits — even on a
@@ -308,12 +314,68 @@ pub fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
             home.display()
         )
     })?;
+    // Name ourselves *beside* the lock, never inside it. The lock says only that
+    // *someone* holds this home; the pid says who, which is what lets a client
+    // clean up a daemon that has stopped answering (`Request::Stop` alone is not
+    // enough — a v0.4.8-era daemon acknowledges `stop` and keeps running, see
+    // `node::signal_shutdown`, so the fallback needs a signal target).
+    //
+    // Writing it into the lock file itself is a unix-only assumption, not a
+    // unix-only API — which is why it compiled everywhere and only failed on
+    // Windows CI. `flock(2)` is *advisory*, so any handle may read a locked file;
+    // `LockFileEx` is **mandatory** and blocks other handles from reading the
+    // locked range, making the pid unreadable by precisely the client that needs
+    // it. A separate file is readable on both.
+    //
+    // Best-effort: a failure here costs the cleanup path, not the daemon.
+    let _ = fs::write(pid_path(home), std::process::id().to_string());
     Ok(DaemonLock { _file: file })
+}
+
+/// The pid of the daemon that last held this home, if one recorded itself.
+///
+/// Only meaningful once a caller has *independently* established that a daemon is
+/// there (`control::probe` answering anything but `Absent`). This file outlives a
+/// crashed daemon, and a pid is reused; the probe is what rules out signalling a
+/// stranger. A daemon that predates the stamp simply returns `None`.
+pub fn daemon_pid(home: &Path) -> Option<u32> {
+    fs::read_to_string(pid_path(home)).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lock_holder_stays_identifiable_while_it_holds_the_lock() {
+        let dir = std::env::temp_dir().join(format!("gc-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let _held = acquire_daemon_lock(&dir).expect("first daemon takes the lock");
+        // Readable *while the lock is held* — the only moment it is worth
+        // anything, and the reason the pid cannot live inside the lock file:
+        // Windows locks are mandatory, so that read would fail there while
+        // passing on unix.
+        assert_eq!(
+            daemon_pid(&dir),
+            Some(std::process::id()),
+            "the daemon holding a home must be identifiable while it holds it",
+        );
+
+        // A second daemon must lose, and must not disturb the winner's identity —
+        // it never gets far enough to write one.
+        assert!(
+            acquire_daemon_lock(&dir).is_err(),
+            "a second daemon must not get the lock",
+        );
+        assert_eq!(
+            daemon_pid(&dir),
+            Some(std::process::id()),
+            "a daemon that lost the lock race must not blank the winner's pid",
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn settings_store_layer_wins_over_global() {

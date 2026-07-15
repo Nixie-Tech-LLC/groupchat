@@ -1480,7 +1480,7 @@ impl App {
     pub async fn dispatch_request(&mut self, req: Request) -> Result<()> {
         let resp = self.req(req.clone()).await?;
         match resp {
-            Response::Candidates { candidates } => {
+            Response::Candidates { candidates, .. } => {
                 let items: Vec<PickItem> = candidates
                     .iter()
                     .map(|c| PickItem {
@@ -2513,6 +2513,9 @@ pub fn substitute_reff(req: Request, new: &str) -> Request {
 /// One status-line summary per response shape (the palette's success line).
 pub fn summarize_response(resp: &Response) -> String {
     match resp {
+        // Transport-plane handshake — the TUI never issues one (`probe` does,
+        // before the TUI is up), so there is nothing to summarize.
+        Response::Hello { protocol_version } => format!("control protocol v{protocol_version}"),
         Response::Ok { message } => message.clone().unwrap_or_else(|| "ok".into()),
         Response::Ref { reff } => format!("✓ {reff}"),
         Response::Issue(v) => format!(

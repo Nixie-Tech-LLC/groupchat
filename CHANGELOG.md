@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased — CLI ergonomics: ask before doing, and say what actually went wrong
+
+Additive within epoch 1 — no flag day. The new `hello` handshake and the
+`Candidates.near_miss_for` field both decode on clients that predate them.
+
+- **The control channel has a version.** `CONTROL_PROTOCOL_VERSION`, exchanged in a
+  `hello` handshake, completes the set the previous release started: the sync plane
+  had `PROTOCOL_VERSION` and the store had `SCHEMA_VERSION`, but the CLI↔daemon
+  channel had nothing — so a client meeting a daemon of another vintage found out by
+  failing to decode its answer. That read as "no daemon", spawned a doomed second one
+  over the held lock, and blamed a timeout 20s later. The reply is read as raw JSON
+  *before* any typed decoding, so a mismatched daemon can say that it is mismatched
+  without the answer depending on the schema that changed. A daemon that does not know
+  `hello` identifies itself by rejecting it (v0.4.8 and earlier).
+- **Upgrading no longer strands you.** `lait update` announced "stopped the running
+  daemon" on any *decodable* reply — including an error, and including the "shutting
+  down" a pre-`signal_shutdown` daemon sends and then ignores. It now verifies the
+  process is actually gone. This was the bug that *delivered* the stale daemon that
+  then couldn't be diagnosed.
+- **A daemon this build can't talk to is now offered up for repair** rather than
+  reported as a timeout: detected in ~0.02s (was 20.4s), named, and — with your
+  consent — stopped and replaced, verifying it really stopped rather than trusting its
+  acknowledgement. Never for a daemon *newer* than this build: replacing it downgrades
+  the node, and a store written at a newer `SCHEMA_VERSION` would then refuse to open.
+  There the answer is `lait update`. A spawned daemon that dies now fails fast with its
+  own words (kept in `daemon.log`) instead of a 20s timeout.
+- **lait asks before destroying** (`delete`, `members remove`, `members rotate-key`),
+  and `-y/--yes` is the way through. `delete` names the issue's **title**: its ref comes
+  from the git branch when omitted, so a stale checkout could tombstone the wrong issue
+  with nothing on screen to notice it by. With no TTY (CI, an agent, a pipe) or under
+  `--json`, nothing ever prompts — it fails naming `--yes`. See UI.md §2.4.
+- **Errors report in one voice.** `main` returning `Result` handed every client-side
+  failure to anyhow's `Termination`: a capitalised `Error:` beside the daemon path's
+  lowercase `error:`, a `Caused by:` chain that leaked `data-encoding` and `postcard`
+  internals ("non-zero trailing bits at 3") to anyone who pasted an invite badly,
+  `--json` ignored (prose on stderr, *nothing* on stdout — indistinguishable from an
+  empty result), and exit `1` for everything, including the not-founds UI.md §2.3
+  documents as `2`. All four are fixed at one reporter; exit codes now derive from the
+  error's type, never its prose.
+- **Bad invites explain themselves** in terms of the invite, not our encoding.
+- **"Did you mean" on a ref that matched nothing** — the candidate machinery already
+  existed for ambiguous refs; typos are the more common way to get there. Suggestions
+  only when a guess is defensible.
+- **`--help` separates global flags from each command's own**, under `Global Options`.
+- **A captured command on Windows no longer hangs forever.** `CreateProcess` inherits
+  *every* inheritable handle, not just the three in `STARTUPINFO`, so the daemon a
+  command auto-spawns came up holding a write-end of that command's stdout — its own
+  `Stdio::null()` notwithstanding. The command exited, the pipe never closed, and
+  anything reading to EOF (`$(lait new …)`, a test harness, an MCP client) waited on an
+  EOF that could not arrive. lait now clears `HANDLE_FLAG_INHERIT` on its own stdio at
+  startup, which children given stdio explicitly still inherit (std duplicates the
+  handle for them). Unix was never affected — those fds are `CLOSE_ON_EXEC`.
+
 ## Unreleased — protocol version negotiation, schema gate & release hardening
 
 Composes with the workspace re-architecture break below — the same epoch-1 wire

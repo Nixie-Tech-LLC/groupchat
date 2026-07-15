@@ -5,7 +5,12 @@
 //! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
 //! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
-use std::{io::Write, path::Path, process::Stdio, time::Duration};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -17,11 +22,13 @@ use crate::{
     workspaces::{self, StorePresence, WorkspaceEntry},
 };
 
-/// Output mode threaded from the global `--json` / `--no-color` flags.
+/// Output mode threaded from the global `--json` / `--no-color` / `--yes` flags.
 #[derive(Debug, Clone, Copy)]
 pub struct Out {
     pub json: bool,
     pub color: bool,
+    /// `--yes`: assume yes at every confirmation prompt. See [`confirm`].
+    pub yes: bool,
 }
 
 impl Default for Out {
@@ -29,7 +36,154 @@ impl Default for Out {
         Out {
             json: false,
             color: true,
+            yes: false,
         }
+    }
+}
+
+/// A client-side failure that carries its own exit code.
+///
+/// Daemon-side failures already travel with a typed [`ErrorKind`], and
+/// `exit_code_for_kind` derives their code "from the typed kind, not the message
+/// text". This extends the same rule to failures that never reach the daemon —
+/// the alternative is a top-level reporter pattern-matching prose, which is
+/// exactly what that rule exists to prevent. Plain `anyhow` errors stay code `1`,
+/// so classifying is opt-in and nothing has to be reclassified at once.
+#[derive(Debug)]
+pub struct CliError {
+    /// The documented exit code (UI.md §2.3) this failure means.
+    pub code: i32,
+    pub message: String,
+}
+
+impl CliError {
+    /// `2` — a selector resolved to nothing. Matches what the daemon already
+    /// returns for a missing ref, user, or label, so a missing *space* doesn't
+    /// answer differently to the same kind of mistake.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        CliError {
+            code: 2,
+            message: message.into(),
+        }
+    }
+
+    /// `3` — the daemon could not be reached, or could not be understood.
+    pub fn unreachable(message: impl Into<String>) -> Self {
+        CliError {
+            code: 3,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// The exit code a client-side error means (UI.md §2.3). Split from
+/// [`report_error`] so the mapping is testable without a process to exit —
+/// `ExitCode` is deliberately opaque and can't be read back.
+///
+/// An unclassified error is `1`, so the classification is additive: a plain
+/// `anyhow!` keeps behaving exactly as it did.
+fn exit_code_for_error(e: &anyhow::Error) -> i32 {
+    if let Some(c) = e.downcast_ref::<CliError>() {
+        return c.code;
+    }
+    // Something is listening and no request will ever get through to it: `3`,
+    // daemon unreachable, in the sense that matters.
+    if e.downcast_ref::<ForeignDaemon>().is_some() {
+        return 3;
+    }
+    1
+}
+
+/// Report a failure and return the process exit code — the one place a
+/// client-side error becomes output.
+///
+/// `main` used to be `async fn main() -> Result<()>`, which handed every such
+/// error to anyhow's `Termination` impl. That broke four contracts at once, all
+/// of which this fixes:
+///
+/// * **One voice.** `Error:` (anyhow's `Debug`) and `error:` (the daemon path)
+///   both shipped in one binary. Now everything is the lowercase form.
+/// * **No internals.** `Debug` prints the `Caused by:` chain, which surfaced raw
+///   `data-encoding` and `postcard` text ("non-zero trailing bits at 3") on a
+///   truncated invite. `{e:#}` is the single-line `context: cause` form.
+/// * **`--json` is a contract.** A consumer got prose on stderr and *nothing* on
+///   stdout, unable to tell failure from an empty result.
+/// * **Exit codes are typed.** `Termination` exits `1` for everything, so a
+///   not-found answered `1` while the documented code is `2`.
+pub fn report_error(e: &anyhow::Error, out: Out) -> std::process::ExitCode {
+    let code = exit_code_for_error(e);
+    // The single-line form: "context: cause", never the multi-line chain.
+    let message = format!("{e:#}");
+    if out.json {
+        // Same DTO shape the daemon path emits, so a script parses one thing.
+        let resp = if code == 2 {
+            Response::not_found(message)
+        } else {
+            Response::err(message)
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into())
+        );
+    } else {
+        eprintln!("error: {message}");
+    }
+    std::process::ExitCode::from(code as u8)
+}
+
+/// What a confirmation prompt decided, and why — so the caller can tell "the
+/// user said no" (a clean exit) from "we couldn't ask" (an error that must
+/// name the flag that would have worked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmed {
+    /// Go ahead: the user typed `y`, or `--yes` was passed.
+    Yes,
+    /// The user answered, and the answer was no.
+    No,
+    /// We could not ask — no TTY (CI, a pipe, the MCP server), or `--json`.
+    /// Never block in these; the caller must fail and print the `--yes` form.
+    CannotAsk,
+}
+
+/// Ask a yes/no question, defaulting to **no**.
+///
+/// The one place lait prompts, so every destructive verb and every repair offer
+/// degrades identically:
+///
+/// * `--yes` → [`Confirmed::Yes`] without asking (scripts, CI, agents).
+/// * `--json` or no TTY on **stdin or stdout** → [`Confirmed::CannotAsk`]. A
+///   prompt written into a pipe is invisible, and reading a reply from a
+///   redirected stdin would eat data meant for the command (`lait comment`
+///   reads stdin) or block forever with no visible question. Both checks matter:
+///   stdout carries the question, stdin carries the answer.
+/// * otherwise → ask on **stderr** (stdout is the data channel; a prompt must
+///   never land in `lait ls | cat`), read one line, `y`/`yes` is yes and
+///   everything else — including a bare Enter or EOF — is no.
+pub fn confirm(question: &str, out: Out) -> Confirmed {
+    if out.yes {
+        return Confirmed::Yes;
+    }
+    use std::io::IsTerminal;
+    if out.json || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Confirmed::CannotAsk;
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut reply = String::new();
+    if std::io::stdin().read_line(&mut reply).is_err() {
+        return Confirmed::No;
+    }
+    match reply.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Confirmed::Yes,
+        _ => Confirmed::No,
     }
 }
 
@@ -55,13 +209,160 @@ fn paint(on: bool, code: &str, s: &str) -> String {
     }
 }
 
+/// The confirmation question for a request that destroys something, or `None`
+/// for the ones that don't.
+///
+/// Deliberately keyed on the `Request` rather than the command name: this is the
+/// single list of what lait asks before doing, so adding a destructive verb means
+/// adding it here, not remembering to prompt at a call site.
+fn destructive_question(req: &Request) -> Option<String> {
+    match req {
+        // The ref is inferred from the git branch when omitted, so this is the
+        // one verb that can destroy something you never named.
+        Request::IssueDelete { reff } => Some(format!("delete {reff}?")),
+        Request::MemberRemove { who } => Some(format!(
+            "remove {who} from this space and rotate the space key?"
+        )),
+        Request::KeyRotate => Some("rotate the space key?".to_string()),
+        _ => None,
+    }
+}
+
+/// Best-effort title lookup for a ref, to name what a prompt is about to destroy.
+/// A failure just returns `None` — the prompt falls back to the bare ref rather
+/// than blocking on a lookup that isn't essential.
+async fn peek_title(home: &Path, reff: &str) -> Option<String> {
+    match client(
+        home,
+        Request::IssueView {
+            reff: reff.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(Response::Issue(v)) => Some(v.title),
+        _ => None,
+    }
+}
+
+/// Gate a destructive request behind a confirmation. `true` = go ahead.
+///
+/// Non-destructive requests pass straight through, so this can sit on the uniform
+/// dispatch path without every verb paying for it.
+pub async fn confirm_destructive(home: &Path, req: &Request, out: Out) -> bool {
+    let Some(question) = destructive_question(req) else {
+        return true;
+    };
+    // Name the thing, not just its handle: `lait delete` on a `eng-142-…` branch
+    // takes its ref from the branch, so "delete ENG-142?" is unanswerable if you
+    // don't remember which issue that is — which is exactly the case where a
+    // stale checkout deletes the wrong one.
+    let question = match req {
+        Request::IssueDelete { reff } => match peek_title(home, reff).await {
+            Some(t) => format!("delete {reff} “{t}”? this tombstones it for every peer"),
+            None => question,
+        },
+        _ => question,
+    };
+    match confirm(&question, out) {
+        Confirmed::Yes => true,
+        Confirmed::No => {
+            eprintln!("aborted.");
+            false
+        }
+        Confirmed::CannotAsk => {
+            eprintln!(
+                "error: {question}\n       \
+                 this needs confirmation and there is no terminal to ask on — \
+                 re-run with `--yes` to confirm."
+            );
+            false
+        }
+    }
+}
+
+/// Where a spawned daemon's stderr goes. Truncated per spawn (we only spawn when
+/// none is running, so it holds exactly the current daemon's life), and inside
+/// `home`, which is `*`-gitignored.
+pub fn daemon_log_path(home: &Path) -> std::path::PathBuf {
+    home.join("daemon.log")
+}
+
+/// The last few lines of the daemon log — a dying daemon's own account of why,
+/// which is otherwise thrown away.
+fn daemon_log_tail(path: &Path, lines: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let tail: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(lines)
+        .collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(
+        tail.into_iter()
+            .rev()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Homes whose daemon this process has already verified.
+///
+/// One CLI invocation can reach [`client`] several times — `delete` peeks the
+/// issue's title before asking about it — and each [`control::probe`] is a fresh
+/// connect. That is not free: on Windows the control channel is a named pipe
+/// serving one client per accepted instance, and a client that connects while no
+/// instance is free can park (see the teardown note in `node::run_daemon`). Verify
+/// once per home, then stay out of the way.
+type VerifiedSet = std::sync::Mutex<std::collections::HashSet<PathBuf>>;
+static VERIFIED_DAEMONS: std::sync::OnceLock<VerifiedSet> = std::sync::OnceLock::new();
+
+fn already_verified(home: &Path) -> bool {
+    VERIFIED_DAEMONS
+        .get_or_init(VerifiedSet::default)
+        .lock()
+        .map(|s| s.contains(home))
+        .unwrap_or(false)
+}
+
+fn mark_verified(home: &Path) {
+    if let Ok(mut s) = VERIFIED_DAEMONS.get_or_init(VerifiedSet::default).lock() {
+        s.insert(home.to_path_buf());
+    }
+}
+
 /// Ensure a daemon is running for this home dir, spawning one if needed.
+///
+/// The three outcomes of [`control::probe`] are kept distinct on purpose. Only
+/// `Absent` may spawn: a daemon that is listening but unintelligible already
+/// holds this home's lock, so spawning a second one produces a child that dies
+/// instantly and a wait for a daemon that was never going to answer.
 pub async fn ensure_daemon(home: &Path) -> Result<()> {
-    if request(home, &Request::Status).await.is_ok() {
+    if already_verified(home) {
         return Ok(());
     }
+    match control::probe(home).await {
+        control::Probe::Healthy => {
+            mark_verified(home);
+            return Ok(());
+        }
+        control::Probe::Foreign { why, replaceable } => {
+            return Err(ForeignDaemon {
+                home: home.to_path_buf(),
+                why,
+                replaceable,
+            }
+            .into())
+        }
+        control::Probe::Absent => {}
+    }
     // A daemon can only open an initialized store — fail fast with guidance
-    // instead of spawning a doomed process and timing out 20s later.
+    // instead of spawning a doomed process and timing out 20s later. This is a
+    // missing store, not an unreachable daemon: `1`, not `3`.
     if !crate::store::initialized_at(home) {
         return Err(anyhow!(
             "no space at {} — found one with `lait init`, or join one with `lait join <link>`",
@@ -69,16 +370,25 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
         ));
     }
     let exe = std::env::current_exe().context("locate own executable")?;
+    // Keep the daemon's stderr instead of discarding it: when a spawn fails, its
+    // own message ("another lait daemon is already running for this home …") is
+    // the whole diagnosis, and `Stdio::null()` used to throw exactly that away.
+    let log_path = daemon_log_path(home);
+    let log = std::fs::File::create(&log_path).ok();
+    let stderr = match log.as_ref().and_then(|f| f.try_clone().ok()) {
+        Some(f) => Stdio::from(f),
+        None => Stdio::null(),
+    };
     // Pin the resolved store for the spawned daemon so it binds the exact same
     // store regardless of its cwd (DUR-5). LAIT_HOME, when set (self-
     // contained / --home / resume), is inherited from our env and takes
     // precedence, so this is a no-op in that mode.
-    std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .arg("daemon")
         .env("LAIT_STORE", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .context("spawn daemon")?;
     for _ in 0..100 {
@@ -86,14 +396,189 @@ pub async fn ensure_daemon(home: &Path) -> Result<()> {
         if request(home, &Request::Status).await.is_ok() {
             return Ok(());
         }
+        // A daemon that has already exited is never going to answer. Without this
+        // the common failures (lock held, bind failure) each cost the full 20s
+        // and then blame a timeout.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(daemon_exited_error(status, &log_path));
+        }
     }
-    Err(anyhow!("daemon did not come online in time"))
+    Err(CliError::unreachable(format!(
+        "daemon did not come online within 20s — it is running but not answering.\n\
+         see {log}, or run `lait daemon` in the foreground to watch it start.",
+        log = log_path.display(),
+    ))
+    .into())
+}
+
+/// Detect a daemon this build can't talk to and offer to clear it.
+///
+/// The house pattern for a recoverable bad state: **detect** it precisely,
+/// **inform** in the user's terms, **offer** the fix, **verify** it worked, and
+/// **degrade** without blocking when there's nobody to ask. Informing alone would
+/// leave every verb dead until the user hand-runs a command we already know the
+/// name of.
+///
+/// Detection is at the transport level (see [`control::probe`]) because that is
+/// the one thing a wire-shape change cannot break — which matters here, since the
+/// whole condition *is* a wire-shape change.
+/// `true` if `e` is a foreign daemon this build may replace — i.e. worth offering
+/// [`heal_from_error`] and retrying.
+pub fn is_replaceable_foreign(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ForeignDaemon>()
+        .is_some_and(|f| f.replaceable)
+}
+
+/// Offer to clear a daemon this build can't talk to. `Ok(())` = repaired; the
+/// caller may retry what failed.
+///
+/// Driven from the **error path**, never a probe up front: the happy path (a
+/// healthy daemon, or none) must not pay a connect for a repair it will never
+/// need. Errors are the only place this condition exists, so that is where the
+/// offer belongs.
+pub async fn heal_from_error(e: &anyhow::Error, out: Out) -> Result<()> {
+    let Some(f) = e.downcast_ref::<ForeignDaemon>() else {
+        return Err(anyhow!("{e:#}"));
+    };
+    // Only offer the repair when *we* are the newer side. Offering to stop a
+    // daemon that is ahead of this build would be offering to break the node:
+    // a downgrade at best, and an unopenable store at worst. There, the only
+    // honest answer is the one the handshake already gives — upgrade.
+    if !f.replaceable {
+        return Err(anyhow!("{e:#}"));
+    }
+    let pid = crate::config::daemon_pid(&f.home)
+        .map(|p| format!(" (pid {p})"))
+        .unwrap_or_default();
+    // `why` comes from the version handshake, so it names the actual mismatch
+    // ("speaks control protocol v1, this build speaks v2") rather than whichever
+    // field happened to fail to decode.
+    eprintln!(
+        "a daemon is already running for this space{pid}: {why}",
+        why = f.why
+    );
+    match confirm("stop it and continue?", out) {
+        Confirmed::Yes => {
+            stop_daemon_verified(&f.home).await?;
+            eprintln!("stopped it — continuing.");
+            Ok(())
+        }
+        Confirmed::No => Err(anyhow!(
+            "left it running — `lait shutdown` stops it when you're ready"
+        )),
+        Confirmed::CannotAsk => Err(anyhow!(
+            "run `lait shutdown` to stop it, or re-run with `--yes` to stop it \
+             automatically"
+        )),
+    }
+}
+
+/// Poll until nothing is listening on this home, or `within` elapses.
+/// `true` = the daemon is really gone.
+async fn wait_until_absent(home: &Path, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if matches!(control::probe(home).await, control::Probe::Absent) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Stop the daemon for `home` and **verify** it actually stopped.
+///
+/// Never trusts the acknowledgement. A v0.4.8-era daemon answers `stop` with
+/// "shutting down" and then keeps running — its `notify_one` could hand the lone
+/// permit to a subscriber instead of the accept loop (fixed in
+/// `node::signal_shutdown`, but the daemons that need stopping are precisely the
+/// ones that predate the fix). So: ask, watch, and escalate if it lied.
+pub async fn stop_daemon_verified(home: &Path) -> Result<()> {
+    // Read the pid before asking — a daemon that honours `stop` takes its lock
+    // file with it, and we'd rather have the signal target than race for it.
+    let pid = crate::config::daemon_pid(home);
+    let _ = control::request(home, &Request::Stop).await;
+    if wait_until_absent(home, Duration::from_secs(3)).await {
+        return Ok(());
+    }
+    let Some(pid) = pid else {
+        return Err(anyhow!(
+            "the daemon ignored `stop` and its lock file names no pid (it predates \
+             the pid stamp) — find it with `ps aux | grep 'lait daemon'` and kill it"
+        ));
+    };
+    #[cfg(unix)]
+    {
+        for sig in [libc::SIGTERM, libc::SIGKILL] {
+            // SAFETY: kill(2) with a pid read from this home's lock file, sending
+            // a standard termination signal. An already-dead pid just returns
+            // ESRCH, which the wait below treats as gone.
+            unsafe { libc::kill(pid as libc::pid_t, sig) };
+            if wait_until_absent(home, Duration::from_secs(3)).await {
+                return Ok(());
+            }
+        }
+    }
+    Err(anyhow!(
+        "could not stop the daemon (pid {pid}) — kill it by hand and re-run"
+    ))
+}
+
+/// A daemon is listening on this home that this build cannot talk to — in
+/// practice a version skew (the binary was upgraded, the daemon wasn't restarted).
+///
+/// Typed rather than a message, so the repair can be offered from the error path
+/// (see [`heal_from_error`]) instead of probing eagerly on every command that
+/// will never need it. Exit code `3`: unreachable in the sense that matters —
+/// something is there, and no request will ever get through to it.
+#[derive(Debug)]
+pub struct ForeignDaemon {
+    pub home: PathBuf,
+    /// The handshake's own diagnosis; already carries the way out.
+    pub why: String,
+    /// Whether replacing it is the right repair — false when it is ahead of us.
+    pub replaceable: bool,
+}
+
+impl std::fmt::Display for ForeignDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a daemon is already running for this space, but {why}  (home: {home})",
+            why = self.why,
+            home = self.home.display(),
+        )
+    }
+}
+
+impl std::error::Error for ForeignDaemon {}
+
+/// The spawned daemon exited before answering — report its own last words rather
+/// than a timeout.
+fn daemon_exited_error(status: std::process::ExitStatus, log_path: &Path) -> anyhow::Error {
+    match daemon_log_tail(log_path, 5) {
+        Some(tail) => anyhow!(
+            "the daemon exited immediately ({status}). it said:\n{tail}\n\
+             full log: {log}",
+            log = log_path.display(),
+        ),
+        None => anyhow!(
+            "the daemon exited immediately ({status}) without saying why (see {log})",
+            log = log_path.display(),
+        ),
+    }
 }
 
 /// Ensure the daemon is up, then send one request.
 pub async fn client(home: &Path, req: Request) -> Result<Response> {
     ensure_daemon(home).await?;
-    request(home, &req).await
+    // The daemon answered the probe a moment ago, so a failure here is the
+    // transport giving out mid-exchange: `3`, daemon unreachable.
+    request(home, &req)
+        .await
+        .map_err(|e| CliError::unreachable(format!("{e:#}")).into())
 }
 
 /// Run a request, print the response, and exit with the right code (UI.md §2.3).
@@ -106,11 +591,12 @@ pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
             }
             Ok(())
         }
-        Err(e) => {
-            // daemon unreachable / spawn failure
-            eprintln!("error: {e:#}");
-            std::process::exit(3);
-        }
+        // Propagate rather than reporting here: `client` errors are already
+        // classified (`CliError::unreachable`), and the top-level reporter is what
+        // honours `--json`. This arm used to print and `exit(3)` itself, which
+        // hardcoded "daemon unreachable" onto conditions that weren't — including
+        // `ensure_daemon`'s "no space at …", a missing store.
+        Err(e) => Err(e),
     }
 }
 
@@ -621,6 +1107,14 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         };
     }
     match resp {
+        // Not a user-facing outcome: the handshake belongs to `control::probe`,
+        // which reads it as raw JSON before anything is typed. Rendered plainly
+        // rather than `unreachable!()` — a panic here would turn a diagnostic
+        // into a crash on exactly the mismatched-daemon path this exists for.
+        Response::Hello { protocol_version } => {
+            println!("control protocol v{protocol_version}");
+            0
+        }
         Response::Ok { message } => {
             println!("{}", message.as_deref().unwrap_or("ok"));
             0
@@ -773,8 +1267,14 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
-        Response::Candidates { candidates } => {
-            eprintln!("ambiguous ref — {} candidates:", candidates.len());
+        Response::Candidates {
+            candidates,
+            near_miss_for,
+        } => {
+            match near_miss_for {
+                Some(input) => eprintln!("no issue matches '{input}' — did you mean:"),
+                None => eprintln!("ambiguous ref — {} candidates:", candidates.len()),
+            }
             for c in candidates {
                 let alias = c
                     .key_alias
@@ -1400,6 +1900,104 @@ pub async fn watch(
 mod tests {
     use super::*;
     use crate::dto::Priority;
+
+    #[test]
+    fn client_side_exit_codes_come_from_the_type_not_the_prose() {
+        // Classified errors carry their documented code (UI.md §2.3)...
+        assert_eq!(
+            exit_code_for_error(&CliError::not_found("no space matches 'x'").into()),
+            2,
+        );
+        assert_eq!(
+            exit_code_for_error(&CliError::unreachable("daemon is deaf").into()),
+            3,
+        );
+        // ...and anything unclassified stays 1, so this is additive rather than a
+        // reclassification of every existing `anyhow!`.
+        assert_eq!(exit_code_for_error(&anyhow!("something went wrong")), 1);
+        // The code must survive `.context()`: callers add context freely, and a
+        // wrapped not-found is still a not-found. (This is the whole reason the
+        // class is a type and not a prefix on the message.)
+        let wrapped = Err::<(), _>(anyhow::Error::from(CliError::not_found("gone")))
+            .context("while resolving -w")
+            .unwrap_err();
+        assert_eq!(exit_code_for_error(&wrapped), 2);
+    }
+
+    #[test]
+    fn destructive_verbs_ask_and_the_rest_do_not() {
+        // The three that destroy something ask. This list IS the policy, so a new
+        // destructive verb that forgets to register here fails this test rather
+        // than silently shipping without a prompt.
+        for req in [
+            Request::IssueDelete {
+                reff: "ENG-1".into(),
+            },
+            Request::MemberRemove { who: "ada".into() },
+            Request::KeyRotate,
+        ] {
+            assert!(
+                destructive_question(&req).is_some(),
+                "{req:?} destroys something and must be confirmed",
+            );
+        }
+        // Reads and ordinary writes must never prompt — prompting on these would
+        // break every script that files or lists issues.
+        for req in [
+            Request::List {
+                project: None,
+                filter: Default::default(),
+            },
+            Request::IssueView {
+                reff: "ENG-1".into(),
+            },
+            Request::IssueNew {
+                title: "t".into(),
+                project: None,
+                project_hint: None,
+                body: None,
+                assignees: vec![],
+                priority: None,
+                labels: vec![],
+            },
+        ] {
+            assert!(
+                destructive_question(&req).is_none(),
+                "{req:?} is not destructive and must not prompt",
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_never_blocks_without_a_way_to_ask() {
+        // `--yes` is the scripted path: yes, without touching the terminal.
+        assert_eq!(
+            confirm(
+                "x?",
+                Out {
+                    yes: true,
+                    ..Out::default()
+                }
+            ),
+            Confirmed::Yes,
+        );
+        // `--json` is a machine contract — a prompt would corrupt the stream, so
+        // it reports CannotAsk instead of asking. The caller turns that into an
+        // error naming `--yes`; it must never wait on stdin.
+        assert_eq!(
+            confirm(
+                "x?",
+                Out {
+                    json: true,
+                    ..Out::default()
+                }
+            ),
+            Confirmed::CannotAsk,
+        );
+        // Under `cargo test` stdin/stdout are not terminals, which is exactly the
+        // CI/agent shape: no TTY → CannotAsk, never a silent hang.
+        assert_eq!(confirm("x?", Out::default()), Confirmed::CannotAsk);
+    }
 
     #[test]
     fn paint_is_gated_on_color() {

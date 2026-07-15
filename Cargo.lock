@@ -2597,6 +2597,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-textarea",
+ "windows-sys 0.61.2",
  "x25519-dalek",
 ]
 

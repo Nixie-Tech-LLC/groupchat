@@ -303,6 +303,85 @@ pub fn resolve_ref(catalog: &CatalogDoc, aliases: &AliasTable, input: &str) -> R
     RefResolution::Zero
 }
 
+/// Levenshtein distance. Hand-rolled to match the rest of this module's
+/// no-dependency parsing (cf. `cmdspec::parse_key_n`); the inputs are refs of a
+/// dozen-odd characters, so the classic two-row DP is far below the noise floor.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Issues whose handle is a near miss for `input` — the "did you mean" set for a
+/// ref that matched nothing.
+///
+/// [`RefResolution::Many`] already gives an ambiguous ref a candidate list; this
+/// gives the same courtesy to a ref that matched *nothing*, which is the far more
+/// common mistake (a typo, or a half-remembered number).
+pub fn near_misses(
+    catalog: &CatalogDoc,
+    aliases: &AliasTable,
+    input: &str,
+    limit: usize,
+) -> Vec<Candidate> {
+    let needle = input.trim().to_ascii_uppercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    // One edit for a short handle, two for a longer one: enough to catch a
+    // dropped, doubled, or transposed character, tight enough that an unrelated
+    // issue never gets suggested. A suggestion that isn't what you meant is worse
+    // than no suggestion — it invites you to run the wrong command.
+    let budget = if needle.len() <= 4 { 1 } else { 2 };
+    let mut scored: Vec<(usize, Candidate)> = catalog
+        .doc_ids()
+        .into_iter()
+        .filter_map(|d| {
+            let alias = aliases.alias_for(&d);
+            let canonical = aliases.canonical_for(&d);
+            // Score against whichever handle they were likelier aiming at: people
+            // type `ENG-142`, but `iss_01J…` is equally legal input.
+            let dist = alias
+                .as_deref()
+                .map(|a| edit_distance(&needle, &a.to_ascii_uppercase()))
+                .into_iter()
+                .chain(std::iter::once(edit_distance(
+                    &needle,
+                    &canonical.to_ascii_uppercase(),
+                )))
+                .min()?;
+            (dist <= budget).then(|| {
+                (
+                    dist,
+                    Candidate {
+                        reff: canonical,
+                        key_alias: alias,
+                        title: catalog.row(&d).map(|r| r.title).unwrap_or_default(),
+                    },
+                )
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.reff.cmp(&b.1.reff)));
+    scored.into_iter().take(limit).map(|(_, c)| c).collect()
+}
+
 fn finalize(catalog: &CatalogDoc, aliases: &AliasTable, mut matches: Vec<DocId>) -> RefResolution {
     matches.sort();
     matches.dedup();
@@ -488,6 +567,55 @@ mod tests {
         }
         c.doc().commit();
         id
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("ENG-1", "ENG-1"), 0);
+        assert_eq!(edit_distance("ENG-1", "ENG-2"), 1); // substitution
+        assert_eq!(edit_distance("ENG-1", "EN-1"), 1); // deletion
+        assert_eq!(edit_distance("ENG-1", "ENG-12"), 1); // insertion
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn near_misses_suggest_typos_but_never_reach() {
+        let (c, p, ws) = setup();
+        add_issue(&c, &ws, &p, "one", true);
+        add_issue(&c, &ws, &p, "two", true);
+        let aliases = AliasTable::build(&c);
+
+        // A wrong digit is one edit from ENG-1 and ENG-2 — both are fair guesses.
+        let near = near_misses(&c, &aliases, "ENG-3", 5);
+        let aliases_of = |v: &[Candidate]| -> Vec<String> {
+            v.iter().filter_map(|c| c.key_alias.clone()).collect()
+        };
+        assert!(
+            aliases_of(&near).contains(&"ENG-1".to_string()),
+            "a one-character typo must be suggested, got {:?}",
+            aliases_of(&near),
+        );
+
+        // Case shouldn't matter — the resolver is case-insensitive, so the
+        // suggester must be too, or a lowercase typo gets no help.
+        assert!(
+            !near_misses(&c, &aliases, "eng-3", 5).is_empty(),
+            "suggestions must be case-insensitive",
+        );
+
+        // Nothing close: suggesting *something* here would invite the user to run
+        // a command against an issue they never meant. Silence is the right answer.
+        assert!(
+            near_misses(&c, &aliases, "ZZZZ-999", 5).is_empty(),
+            "an unrelated ref must not be given a suggestion",
+        );
+
+        // An empty ref has nothing to be near.
+        assert!(near_misses(&c, &aliases, "", 5).is_empty());
+
+        // The cap is honoured.
+        assert!(near_misses(&c, &aliases, "ENG-3", 1).len() <= 1);
     }
 
     #[test]

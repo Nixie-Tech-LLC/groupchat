@@ -511,8 +511,24 @@ impl Tracker {
     fn resolve_issue(&self, reff: &str) -> std::result::Result<DocId, Response> {
         match index::resolve_ref(&self.catalog, &self.aliases, reff) {
             RefResolution::One(id) => Ok(id),
-            RefResolution::Zero => Err(Response::not_found(format!("no issue matches '{reff}'"))),
-            RefResolution::Many(cands) => Err(Response::Candidates { candidates: cands }),
+            // Nothing matched — offer the closest handles rather than a dead end.
+            // The candidate machinery already exists for the ambiguous case; a
+            // typo is the more common way to get here.
+            RefResolution::Zero => {
+                let near = index::near_misses(&self.catalog, &self.aliases, reff, 5);
+                if near.is_empty() {
+                    Err(Response::not_found(format!("no issue matches '{reff}'")))
+                } else {
+                    Err(Response::Candidates {
+                        candidates: near,
+                        near_miss_for: Some(reff.to_string()),
+                    })
+                }
+            }
+            RefResolution::Many(cands) => Err(Response::Candidates {
+                candidates: cands,
+                near_miss_for: None,
+            }),
         }
     }
 

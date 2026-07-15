@@ -92,7 +92,9 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
                     }
                 })
                 .collect();
-            Err(anyhow!(
+            // A selector that resolved to nothing: exit `2`, the same answer the
+            // daemon already gives for a missing ref / user / label.
+            Err(crate::cli::CliError::not_found(format!(
                 "no space matches '{sel}' — known: {} (see `lait spaces`)",
                 if known.is_empty() {
                     "(none)".to_string()
@@ -100,6 +102,7 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
                     known.join(", ")
                 }
             ))
+            .into())
         }
         _ => {
             let cands: Vec<String> = matches
@@ -112,8 +115,15 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
     }
 }
 
-/// Parse arguments and run.
-pub async fn run() -> Result<()> {
+/// Parse arguments, run, and report any failure the way the CLI contract says.
+///
+/// Returns the process exit code rather than a `Result`: handing an error back to
+/// `main` means handing it to anyhow's `Termination` impl, which Debug-prints the
+/// cause chain and always exits `1`. Every client-side failure funnels through
+/// [`crate::cli::report_error`] instead — see there for what that buys.
+pub async fn run() -> std::process::ExitCode {
+    // Before anything can spawn — every command, service or not.
+    disinherit_stdio();
     let specs = cmdspec::specs();
     let cli = cmdspec::build_cli(&specs);
     // `try_get_matches` (not `get_matches`) so a usage/parse error exits `1` — the
@@ -132,9 +142,8 @@ pub async fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
-    let resolved = cmdspec::resolve(&specs, &matches);
 
-    if !resolved.as_ref().is_some_and(|(l, _)| l.service) {
+    if !cmdspec::resolve(&specs, &matches).is_some_and(|(l, _)| l.service) {
         reset_sigpipe();
     }
 
@@ -149,7 +158,36 @@ pub async fn run() -> Result<()> {
             && !json
             && std::env::var_os("NO_COLOR").is_none()
             && std::io::stdout().is_terminal(),
+        yes: matches.get_flag("yes"),
     };
+
+    // `out` has to exist before a failure can be reported the right way (the
+    // `--json` DTO vs a prose line), which is why the sink sits here and not in
+    // `main`.
+    let mut result = dispatch(&specs, &matches, out).await;
+    // A daemon this build can't talk to blocks every verb, and clearing it is
+    // usually one keystroke — so offer, then retry once. Driven off the error
+    // rather than a probe before dispatch: the overwhelmingly common case is a
+    // daemon that works, and it must not pay a round trip for this. A retry is
+    // safe precisely because the failure means we never reached the daemon, so
+    // nothing was written.
+    if let Err(e) = &result {
+        if crate::cli::is_replaceable_foreign(e) {
+            match crate::cli::heal_from_error(e, out).await {
+                Ok(()) => result = dispatch(&specs, &matches, out).await,
+                Err(e) => return crate::cli::report_error(&e, out),
+            }
+        }
+    }
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => crate::cli::report_error(&e, out),
+    }
+}
+
+/// Resolve the parsed args to a leaf spec and run it.
+async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Result<()> {
+    let resolved = cmdspec::resolve(specs, matches);
 
     // Bare `lait` = the FOCUS view (inbox + your active issues, UI.md §2): the
     // most valuable keystroke answers "what's addressed to me / what am I on",
@@ -179,13 +217,13 @@ pub async fn run() -> Result<()> {
     match &leaf.dispatch {
         Dispatch::Special(Special::Completions) => {
             let shell = *m.get_one::<Shell>("shell").expect("shell is required");
-            let mut cmd = cmdspec::build_cli(&specs);
+            let mut cmd = cmdspec::build_cli(specs);
             let name = cmd.get_name().to_string();
             generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
         Dispatch::Special(Special::Man) => {
-            clap_mangen::Man::new(cmdspec::build_cli(&specs)).render(&mut std::io::stdout())?;
+            clap_mangen::Man::new(cmdspec::build_cli(specs)).render(&mut std::io::stdout())?;
             return Ok(());
         }
         _ => {}
@@ -318,6 +356,12 @@ pub async fn run() -> Result<()> {
         Dispatch::Request(f) => {
             let req = f(m)?;
             use std::io::IsTerminal;
+            // Ask before destroying (delete / member remove / key rotate). Gated
+            // on the Request, so the list lives in one place; everything else
+            // passes straight through.
+            if !crate::cli::confirm_destructive(&home, &req, out).await {
+                std::process::exit(1);
+            }
             // `new --start` chains the create into the work loop: file it, then
             // claim it (two honest commits = two activity rows, S§7.1).
             if leaf.name == "new" && m.get_flag("start") {
@@ -708,10 +752,30 @@ async fn run_config(dispatch: &Dispatch, m: &ArgMatches, out: Out) -> Result<()>
 /// gzip/zip extraction, atomic self-replace).
 async fn run_update() -> Result<()> {
     if let Some(home) = config::existing_home() {
-        if crate::control::request(&home, &Request::Stop).await.is_ok() {
-            println!("stopped the running daemon");
-            // let the OS release the file handle before the binary is swapped
-            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        // Only claim to have stopped something if something was there, and only
+        // after watching it go. The old check was `request(Stop).is_ok()`, which
+        // is true for any *decodable* reply — including an error, and including
+        // the "shutting down" a pre-`signal_shutdown` daemon sends and then
+        // ignores. That printed a stop that never happened and left a daemon on
+        // stale code: the exact skew `heal_foreign_daemon` now has to clean up.
+        if !matches!(
+            crate::control::probe(&home).await,
+            crate::control::Probe::Absent
+        ) {
+            match crate::cli::stop_daemon_verified(&home).await {
+                Ok(()) => {
+                    println!("stopped the running daemon");
+                    // let the OS release the file handle before the binary is swapped
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                }
+                // Worth saying out loud rather than swallowing: a daemon left
+                // running is on stale code the moment the swap lands, and on
+                // Windows it may still hold the executable open.
+                Err(e) => eprintln!(
+                    "warning: could not stop the running daemon: {e:#}\n\
+                     continuing; run `lait shutdown` after the update."
+                ),
+            }
         }
     }
 
@@ -791,6 +855,50 @@ fn reset_sigpipe() {
 }
 #[cfg(not(unix))]
 fn reset_sigpipe() {}
+
+/// Stop our own stdio from leaking into processes we never handed it to.
+///
+/// On Windows `CreateProcess` is called with `bInheritHandles=TRUE`, and that is
+/// all-or-nothing: a child inherits *every* inheritable handle in this process,
+/// not just the three named in `STARTUPINFO`. When our stdout/stderr are pipes
+/// (any captured run — `Command::output()`, `$(lait ...)`, a test harness) those
+/// pipe handles are inheritable, so `ensure_daemon`'s spawn hands the daemon a
+/// write-end of *our* stdout even though its own stdio is `Stdio::null()`. The
+/// daemon outlives us, the write-end never closes, and our caller waits on an EOF
+/// that can never come — a captured `lait new` hangs forever. Unix is immune:
+/// those fds are `CLOSE_ON_EXEC`.
+///
+/// Clearing `HANDLE_FLAG_INHERIT` on our end fixes it at the source. It does not
+/// break children we *do* want to inherit stdio: for `Stdio::inherit()` std
+/// duplicates the handle with `bInheritHandle=TRUE` into the child's
+/// `STARTUPINFO`, so their output still lands on our stdout.
+///
+/// Unlike [`reset_sigpipe`], this runs for the services too — `lait mcp` speaks
+/// its protocol over stdio pipes and spawns a daemon, which is the same hang.
+#[cfg(windows)]
+fn disinherit_stdio() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for h in handles {
+        if h.is_null() {
+            continue;
+        }
+        // SAFETY: `h` is a live std handle we own, borrowed for this call only.
+        // Best-effort: a std stream can be closed or invalid (a detached service),
+        // and failing to clear a handle we never had is not an error.
+        unsafe {
+            SetHandleInformation(h as _, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+#[cfg(not(windows))]
+fn disinherit_stdio() {}
 
 #[cfg(test)]
 mod tests {

@@ -134,6 +134,14 @@ tui-textarea = "0.7"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# windows-only: clear HANDLE_FLAG_INHERIT on our own stdio so a spawned daemon
+# can't inherit it and hold a captured parent's pipe open forever (the other
+# half of the same "fix the platform default at startup" pair as libc above —
+# see `disinherit_stdio` in app.rs). Already present transitively (iroh/tokio);
+# declared directly for that call.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 # property-based convergence testing (random op sequences across N peers).
 proptest = "1"

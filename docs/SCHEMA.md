@@ -360,6 +360,7 @@ enum Request {
   Subscribe { since: u64 },                          // §7.5 — the one live channel (TUI + watch)
   Diagnose  { expected_workspace: Option<WorkspaceId> },   // guided-join verifier (GUIDED-JOIN.md)
   ConfigReload,                                      // transport-plane; re-read local settings
+  Hello     { protocol_version: u32 },               // §7.7 — version handshake, sent first
   // transport (P1): Invite, Join, Connect, Who, SeedAdd/List/Remove
   // membership (P3): MemberAdd/Remove, KeyRotate, Members, MemberRequests/Approve/Alias
   Status, Id, Stop,
@@ -367,10 +368,12 @@ enum Request {
 
 // snapshot projections (stable, versioned — NOT a dump of Layer A)
 enum Response {
+  Hello { protocol_version: u32 },       // §7.7 — read as raw JSON, before typed decoding
   Ok { message: Option<String> },
   Ref { reff: String },                 // writes echo the resolved handle
   Issue(IssueView), List(Vec<Row>), Board(BoardView),
   Events { events: Vec<IssueEvent>, last: u64 },
+  Candidates { candidates: Vec<Candidate>, near_miss_for: Option<String> },  // UI§3.2
   Error { message: String },
 }
 
@@ -456,6 +459,30 @@ precedence, in `Tracker::choose_project`:
 The two hint-free commands are deliberate: `ls -p` is a **pure filter** (a
 defaulted filter silently hides issues), and `move -p` is **explicit only**
 (a silently-inferred membership write is data damage).
+
+### 7.7 The `hello` handshake — the one reply that must never drift
+
+`CONTROL_PROTOCOL_VERSION` versions this plane, the third to get one alongside the
+sync handshake's `PROTOCOL_VERSION` and `SCHEMA_VERSION` (§9). Windowed the same way:
+a daemon outside `[MIN_SUPPORTED_CONTROL_PROTOCOL, CONTROL_PROTOCOL_VERSION]` is
+refused with a diagnostic naming which side must move.
+
+Two invariants, and both exist because this handshake has to work when nothing else
+does:
+
+1. **`Response::Hello` is read as raw JSON, before typed decoding.** `kind` and
+   `protocol_version` are therefore frozen names — the §9 add-only rule is not enough
+   for them, because they must remain readable by a client whose `Response` type no
+   longer matches ours at all. Probing with a typed request is what made the original
+   failure unreadable: it died on whichever field had changed and reported *that*.
+2. **Absence is decided at the transport level** — whether `connect` succeeds, a fact
+   no wire change can alter. Only a genuinely absent daemon is spawned over; a daemon
+   that answers unintelligibly holds the lock, so spawning a second one just produces
+   a corpse and a timeout.
+
+A daemon that does not implement `Hello` rejects it as an unknown variant, which is
+itself the identification: it predates the handshake (v0.4.8 and earlier). That
+rejection is load-bearing and must keep decoding as an `Error`.
 
 ## 8. Layer C — git repo layout & iroh framing
 
