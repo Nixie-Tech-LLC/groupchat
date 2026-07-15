@@ -1,12 +1,48 @@
 # lait docs
 
 Design and operator documentation for **lait**, a local-first, peer-to-peer issue
-tracker (Loro CRDTs · git-backed store · iroh P2P). For the project overview and
-quickstart, see the top-level [`README.md`](../README.md); for per-version detail, see
+tracker (Loro CRDTs · git-backed store · iroh P2P). The top-level
+[`README.md`](../README.md) deliberately stays plain-language and scenario-driven;
+this index is where the technical depth starts. Per-version detail:
 [`CHANGELOG.md`](../CHANGELOG.md).
 
-**Current state (v0.4.8):** P0–P3 complete and verified multi-node; P4 (release
+**Current state:** P0–P3 complete and verified multi-node; P4 (release
 engineering) shipped, with security review and receipt/tier hardening the main deferrals.
+
+## The system in one screen
+
+One binary, four surfaces, one persistent node per space:
+
+- `lait daemon` — the long-lived node: owns the Loro documents (a per-space
+  catalog + one doc per issue) over a git-backed durable store, plus the iroh
+  endpoint, a signed-gossip topic for announce/presence, and a local control
+  channel. Auto-spawned on first use; only `lait init`/`lait join` create stores.
+- `lait <cmd>` — the CLI: flat verbs on issues, plural nouns on registries;
+  `--json` emits the stable, versioned DTO (S§7.3).
+- `lait tui` — a full-screen board client living off the doorbell stream (U§4).
+- `lait mcp` — the same commands as MCP tools for agents, same DTOs.
+
+Issues carry a collision-free short `iss_` handle plus a friendly `KEY-n` alias;
+refs resolve daemon-side, and ambiguity returns candidates, not errors. State
+lives in a per-repo `.lait/` (or self-contained `$LAIT_HOME`): local
+`config.json` + a `repo/` git store; one global `secret.key` identity spans
+every store. Only public keys and Loro snapshots touch disk — never secrets.
+
+How the network maps onto iroh:
+
+| Piece | Mechanism |
+|---|---|
+| Identity / handle | a persistent `EndpointId` (ed25519 public key) |
+| The space | an `iroh-gossip` topic (derived from the workspace id) |
+| Announce + presence | signed gossip heartbeats + neighbor events + a `Bye` on shutdown |
+| Liveness probe | a direct QUIC handshake on a custom ALPN |
+| Sync | catalog-first VV-diff, per-doc frames on a custom ALPN (A§8) |
+| Signed messages | ed25519 `SignedMessage` sign/verify (+ the signed membership op-graph, S§6) |
+
+Cross-platform is CI-enforced on Linux/macOS/Windows: the control channel is a
+Unix socket / named pipe (`interprocess`), the single-instance guard a portable
+advisory lock (`fs2`), TLS the `ring` rustls backend (`aws-lc-rs` is banned), and
+a per-OS smoke drives the real tracker flow on every change (A§15).
 
 ## The three design legs
 

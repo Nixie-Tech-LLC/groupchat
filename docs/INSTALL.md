@@ -120,10 +120,14 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 ## After installing
 
 ```sh
-lait projects new "Engineering" --key ENG
-lait new "fix login race" -p ENG -P high
+cd your-project
+lait init                                  # found a space here (seeds a project)
+lait new "fix login race" -P high --start  # file it + claim it + branch
 lait tui
 ```
+
+Joining a teammate's space instead? `lait join <their-invite-link>` — it creates
+the store and verifies the whole handshake. See the README's scenarios.
 
 Register the MCP server with an AI agent in one step:
 

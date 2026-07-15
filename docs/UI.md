@@ -87,7 +87,7 @@ Verbs act on **issues**; plural nouns manage **registries**. Each maps to exactl
 | `move <ref> [-p PROJ] [--top\|--bottom\|--before R\|--after R]` | `IssueMove` | Set project (truth) and/or board position (order). `-p` explicit only — membership is never inferred. |
 | `assign <ref> <userref…> [--remove]` | `Assign` | Add/remove assignees (present-key set, S§5.2). |
 | `label <ref> [+LABEL…] [-LABEL…]` | `Label` | Add (`+`) / remove (`-`) labels on an issue. |
-| `comment <ref> [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). No arg → open `$EDITOR`. |
+| `comment [ref] [BODY]` | `Comment` | Append a comment (immutable body, S§5.3). One arg on a KEY-n branch = the body, ref inferred (the branch-native loop); no BODY → read stdin. |
 | `delete <ref>` | `IssueDelete` | Tombstone an issue (S§5.6); it stays in `docs` for history/backfill, `ls`/`board` hide it. |
 | `history <ref>` | `History` | The issue's derived activity/time-travel feed (free from Loro op history, A§5). |
 | `projects [add KEY [NAME] \| ls]` | `ProjectNew`/`ProjectList` | Manage the project registry (`Catalog.projects`). Key-first, name optional (defaults to the title-cased key); `new` kept as an alias of the same shape. |

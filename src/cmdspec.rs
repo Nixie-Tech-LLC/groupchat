@@ -788,13 +788,32 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "comment",
-            "Append a comment (immutable body). No BODY → read stdin.",
+            "Append a comment (immutable body). One arg on a KEY-n branch = the body (ref inferred). No BODY → read stdin.",
             vec![
-                A::pos("reff", "Issue ref."),
+                A::pos_opt("reff", "Issue ref (optional on a KEY-n branch when a body is given)."),
                 A::pos_opt("body", "Comment body (omit to read stdin)."),
             ],
             |m| {
-                let body = match opt_str(m, "body") {
+                // Grammar: `comment [ref] [body]`. With ONE positional, it's
+                // ambiguous — resolve it as the BODY and infer the ref from the
+                // git branch (the branch-native loop: `lait comment "found it"`).
+                // A ref that happens to look like a body still works explicitly:
+                // `lait comment ENG-1 "body"`.
+                let (reff, body) = match (opt_str(m, "reff"), opt_str(m, "body")) {
+                    (Some(r), Some(b)) => (Some(r), Some(b)),
+                    (Some(only), None) => (None, Some(only)),
+                    _ => (None, None),
+                };
+                let reff = match reff {
+                    Some(r) => r,
+                    None => infer_ref_from_git_branch().ok_or_else(|| {
+                        anyhow!(
+                            "no issue ref given, and none could be inferred from the git branch — \
+                             pass one: `lait comment ENG-142 \"...\"`"
+                        )
+                    })?,
+                };
+                let body = match body {
                     Some(b) => b,
                     None => {
                         use std::io::Read;
@@ -803,10 +822,7 @@ pub fn specs() -> Vec<Spec> {
                         s.trim_end().to_string()
                     }
                 };
-                Ok(Request::Comment {
-                    reff: req_str(m, "reff"),
-                    body,
-                })
+                Ok(Request::Comment { reff, body })
             },
         ),
         Spec::req(
