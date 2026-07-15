@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 
 import { formatBinding } from "../core/keys";
 import { registry, type Bound, type Ctx } from "../core/registry";
+import { IconButton, Kbd } from "./primitives";
 
 /**
  * The `?` overlay — the registry's second projection.
@@ -37,9 +38,9 @@ export function Shortcuts({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
       >
         <header className="border-line flex items-center border-b px-4 py-3">
           <h2 className="flex-1 text-lg font-semibold">Keyboard shortcuts</h2>
-          <button onClick={onClose} className="text-mute hover:text-fg" aria-label="Close">
+          <IconButton label="Close" chord="Esc" onClick={onClose}>
             <X className="size-4" />
-          </button>
+          </IconButton>
         </header>
 
         {registry.warnings.length > 0 && (
@@ -64,12 +65,7 @@ export function Shortcuts({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
                     <span className="flex-1">{b.command.title}</span>
                     <span className="flex gap-1">
                       {b.bindings.map((k, i) => (
-                        <kbd
-                          key={i}
-                          className="border-line-strong bg-bg text-dim rounded-sm border px-1 font-mono text-2xs"
-                        >
-                          {formatBinding(k, { glyphs: true })}
-                        </kbd>
+                        <Kbd key={i}>{formatBinding(k, { glyphs: true })}</Kbd>
                       ))}
                     </span>
                   </li>

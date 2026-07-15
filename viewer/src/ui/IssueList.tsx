@@ -4,6 +4,7 @@ import { Plus } from "lucide-react";
 import type { BoardColumn, BoardView, Row } from "../types";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
+import { IconButton, Kbd } from "./primitives";
 
 /**
  * The default view: one flat, grouped list.
@@ -94,15 +95,14 @@ function Group({
         <h2 className="text-base font-semibold">{col.state.name}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
         {!readOnly && (
-          <button
+          <IconButton
+            label={`New issue in ${col.state.name}`}
             onClick={() => onCreate(col.state.id)}
             // Revealed on hover/focus: present when wanted, silent otherwise.
-            className="text-mute hover:bg-hover hover:text-fg ml-auto grid size-5 place-items-center rounded-sm opacity-0 transition group-hover/list:opacity-100 focus-visible:opacity-100"
-            title={`New issue in ${col.state.name}`}
-            aria-label={`New issue in ${col.state.name}`}
+            className="ml-auto opacity-0 transition group-hover/list:opacity-100 focus-visible:opacity-100"
           >
             <Plus className="size-3.5" />
-          </button>
+          </IconButton>
         )}
       </header>
       <ul>
@@ -189,10 +189,4 @@ function clsxish(parts: Array<string | false | undefined>): string {
   return parts.filter(Boolean).join(" ");
 }
 
-function Kbd({ children }: { children: React.ReactNode }) {
-  return (
-    <kbd className="border-line-strong bg-raised text-dim rounded-sm border px-1 font-mono text-xs">
-      {children}
-    </kbd>
-  );
-}
+

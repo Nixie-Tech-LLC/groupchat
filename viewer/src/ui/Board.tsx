@@ -4,6 +4,7 @@ import { Plus } from "lucide-react";
 import type { BoardColumn, BoardView, Row } from "../types";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
+import { IconButton } from "./primitives";
 
 /**
  * The board — the same fetch as the list, laid out sideways.
@@ -71,13 +72,13 @@ function Column({
         <h2 className="text-base font-semibold">{col.state.name}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
         {!readOnly && (
-          <button
+          <IconButton
+            label={`New issue in ${col.state.name}`}
             onClick={() => onCreate(col.state.id)}
-            className="text-mute hover:bg-hover hover:text-fg ml-auto grid size-5 place-items-center rounded-sm opacity-0 transition group-hover/col:opacity-100 focus-visible:opacity-100"
-            aria-label={`New issue in ${col.state.name}`}
+            className="ml-auto opacity-0 transition group-hover/col:opacity-100 focus-visible:opacity-100"
           >
             <Plus className="size-3.5" />
-          </button>
+          </IconButton>
         )}
       </header>
       <ul className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">

@@ -5,6 +5,7 @@ import { Check, Copy, KeyRound, Link2, Pencil, ShieldCheck, UserPlus, X } from "
 import { ConfirmRequired, rpc } from "../api";
 import type { JoinRequestDto, MemberDto } from "../types";
 import { when } from "./time";
+import { Button, IconButton } from "./primitives";
 
 /**
  * Members, join requests, and the invite link.
@@ -97,7 +98,7 @@ export function Members({
                       claims to be “{r.nick || "—"}” · {when(r.ts)}
                     </span>
                   </span>
-                  <button
+                  <Button
                     disabled={busy === r.key}
                     onClick={() =>
                       void act(r.key, async () => {
@@ -115,11 +116,11 @@ export function Members({
                         });
                       })
                     }
-                    className="border-line-strong hover:bg-hover flex shrink-0 items-center gap-1.5 rounded border px-2 py-1 text-sm font-medium disabled:opacity-50"
+                    variant="outline"
                   >
                     <Check className="size-3.5" />
                     Approve
-                  </button>
+                  </Button>
                 </li>
               ))}
             </ul>
@@ -171,7 +172,7 @@ export function Members({
                     {!m.me && (
                       <IconButton
                         label="Remove (rotates the space key)"
-                        danger
+                        variant="danger"
                         onClick={() =>
                           void act(m.key, async () => {
                             try {
@@ -209,31 +210,6 @@ export function Members({
         )}
       </div>
     </div>
-  );
-}
-
-function IconButton({
-  label,
-  onClick,
-  danger,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  danger?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={label}
-      aria-label={label}
-      className={`grid size-6 place-items-center rounded ${
-        danger ? "text-mute hover:text-danger" : "text-mute hover:text-fg"
-      } hover:bg-hover`}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -298,13 +274,10 @@ function Invite({
                 — otherwise the link admits them automatically
               </span>
             </label>
-            <button
-              onClick={() => void mint()}
-              className="border-line-strong hover:bg-hover flex w-fit items-center gap-1.5 rounded border px-2 py-1 font-medium"
-            >
+            <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
               <UserPlus className="size-3.5" />
               Create invite link
-            </button>
+            </Button>
           </>
         ) : (
           <>
@@ -326,18 +299,18 @@ function Invite({
                   lait join {link}
                 </code>
                 <div className="flex gap-2">
-                  <button
+                  <Button
+                    variant="outline"
                     onClick={() => {
                       void navigator.clipboard.writeText(link).then(() => {
                         setCopied(true);
                         window.setTimeout(() => setCopied(false), 1500);
                       });
                     }}
-                    className="border-line-strong hover:bg-hover flex items-center gap-1.5 rounded border px-2 py-1 text-sm"
                   >
                     {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
                     {copied ? "Copied" : "Copy link"}
-                  </button>
+                  </Button>
                   <a
                     href={mailto(link)}
                     className="border-line-strong hover:bg-hover flex items-center gap-1.5 rounded border px-2 py-1 text-sm"
@@ -345,13 +318,10 @@ function Invite({
                     <Link2 className="size-3.5" />
                     Email it
                   </a>
-                  <button
-                    onClick={() => setTicket(null)}
-                    className="text-mute hover:text-fg ml-auto flex items-center gap-1.5 text-sm"
-                  >
+                  <Button onClick={() => setTicket(null)} className="ml-auto">
                     <KeyRound className="size-3.5" />
                     New link
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>

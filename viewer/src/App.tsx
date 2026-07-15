@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
-import { Inbox as InboxIcon, LayoutGrid, List, PanelLeft, Plus } from "lucide-react";
+import {
+  Inbox as InboxIcon,
+  LayoutGrid,
+  List,
+  ListFilter,
+  PanelLeft,
+  Plus,
+  Search,
+} from "lucide-react";
 
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
@@ -15,8 +23,15 @@ import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
+import { IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
-import { applyFilter, EMPTY_FILTER, needsServer, type FilterState } from "./core/filter";
+import {
+  applyFilter,
+  EMPTY_FILTER,
+  isActive,
+  needsServer,
+  type FilterState,
+} from "./core/filter";
 import { applyOverlay, Overlay, PREDICTION_TTL_MS, type Field } from "./core/overlay";
 import { isReadOnly, type BoardView, type LabelDto, type Row, type SpaceRow } from "./types";
 import "./commands";
@@ -326,6 +341,7 @@ export function App() {
   const run = (id: string) => void registry.get(id)?.run(ctx);
 
   return (
+    <TooltipProvider>
     <Group
       orientation="horizontal"
       // Persisted per-user: a sidebar width you set once should survive a reload,
@@ -352,69 +368,85 @@ export function App() {
       </Separator>
 
       <Panel id="main" className="flex min-w-0 flex-col">
-        <header className="border-line flex h-11 shrink-0 items-center gap-3 border-b px-3">
-          <button
-            onClick={() => run("view.sidebar")}
-            className="text-mute hover:bg-hover hover:text-fg grid size-6 place-items-center rounded"
-            title="Toggle sidebar"
-            aria-label="Toggle sidebar"
-          >
+        {/*
+          Chrome recedes. Linear's header is a breadcrumb and a few ghost icons —
+          no bordered CTA competing with the content, no permanently-lit status
+          badge. Ours had a segmented control, a primary button, and a `Ctrl K`
+          chip all shouting at once; the work is the content, not the toolbar.
+        */}
+        <header className="border-line flex h-11 shrink-0 items-center gap-1 border-b px-2">
+          <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
             <PanelLeft className="size-4" />
-          </button>
-          <h1 className="truncate font-semibold">{board?.project.name ?? "lait"}</h1>
-          <span className="text-mute sr-only capitalize">{view}</span>
-          <nav className="border-line ml-2 flex items-center gap-px rounded border p-px">
-            {(
-              [
-                ["list", List, "Issues", "g l"],
-                ["board", LayoutGrid, "Board", "g b"],
-                ["inbox", InboxIcon, "Inbox", "g i"],
-              ] as const
-            ).map(([v, Icon, label, chord]) => (
-              <button
-                key={v}
-                onClick={() => run(`go.${v}`)}
-                aria-pressed={view === v}
-                title={`${label} (${chord})`}
-                aria-label={label}
-                className={`relative grid size-6 place-items-center rounded-sm ${
-                  view === v ? "bg-active text-fg" : "text-mute hover:bg-hover hover:text-fg"
-                }`}
-              >
-                <Icon className="size-3.5" />
-                {v === "inbox" && unread > 0 && (
-                  <span className="bg-accent absolute -top-0.5 -right-0.5 size-1.5 rounded-full" />
-                )}
-              </button>
-            ))}
-          </nav>
-          {readOnly && space?.identity.kind === "agent" && (
-            <span
-              className="border-line-strong text-dim rounded-sm border px-1.5 py-px text-2xs"
-              title="A write here would be signed as this agent"
-            >
-              {space.identity.name}’s space · read-only
-            </span>
-          )}
+          </IconButton>
 
-          <span className="ml-auto flex items-center gap-3">
-            <Liveness state={liveness} />
-            {!readOnly && current && (
-              <button
-                onClick={() => run("issue.create")}
-                className="border-line-strong bg-bg hover:bg-hover flex items-center gap-1.5 rounded border px-2 py-1 font-medium"
+          <h1 className="ml-1 flex min-w-0 items-baseline gap-1.5">
+            <span className="truncate font-semibold">{board?.project.name ?? "lait"}</span>
+            <span className="text-mute shrink-0">/</span>
+            <span className="text-dim shrink-0 capitalize">{view}</span>
+          </h1>
+
+          <span className="ml-auto flex items-center gap-1">
+            {/* Only when it is worth saying. A permanently-lit "live" is noise;
+                a silent failure is worse. So: nothing when healthy, a warning
+                when not. */}
+            {liveness !== "live" && (
+              <span
+                className="text-warn mr-1 flex items-center gap-1.5 text-xs"
+                title={`Doorbell stream: ${liveness}`}
+                role="status"
               >
-                <Plus className="size-3.5" />
-                New issue
-              </button>
+                <span className="bg-warn size-1.5 animate-pulse rounded-full" />
+                {liveness}
+              </span>
             )}
-            <button
-              onClick={() => run("palette.open")}
-              className="border-line-strong text-mute hover:text-fg rounded border px-1.5 py-0.5 font-mono text-2xs"
-              title="Command palette"
-            >
-              {navigator.platform.startsWith("Mac") ? "⌘K" : "Ctrl K"}
-            </button>
+
+            <IconButton label="Search commands" chord="⌘K" onClick={() => run("palette.open")}>
+              <Search className="size-4" />
+            </IconButton>
+
+            {(view === "list" || view === "board") && (
+              <IconButton
+                label="Filter"
+                chord="/"
+                variant={isActive(filter) ? "active" : "ghost"}
+                onClick={() => run("filter.open")}
+              >
+                <ListFilter className="size-4" />
+              </IconButton>
+            )}
+
+            {/* A segmented group without a box around it: adjacency does the
+                grouping, the active fill does the state. */}
+            <span className="mx-1 flex items-center gap-0.5">
+              {(
+                [
+                  ["list", List, "Issues", "G L"],
+                  ["board", LayoutGrid, "Board", "G B"],
+                  ["inbox", InboxIcon, "Inbox", "G I"],
+                ] as const
+              ).map(([v, Icon, label, chord]) => (
+                <IconButton
+                  key={v}
+                  label={label}
+                  chord={chord}
+                  variant={view === v ? "active" : "ghost"}
+                  aria-pressed={view === v}
+                  onClick={() => run(`go.${v}`)}
+                  className="relative"
+                >
+                  <Icon className="size-4" />
+                  {v === "inbox" && unread > 0 && (
+                    <span className="bg-accent absolute top-0.5 right-0.5 size-1.5 rounded-full" />
+                  )}
+                </IconButton>
+              ))}
+            </span>
+
+            {!readOnly && current && (
+              <IconButton label="New issue" chord="C" onClick={() => run("issue.create")}>
+                <Plus className="size-4" />
+              </IconButton>
+            )}
           </span>
         </header>
 
@@ -520,19 +552,7 @@ export function App() {
         </div>
       )}
     </Group>
-  );
-}
-
-function Liveness({ state }: { state: "connecting" | "live" | "retrying" }) {
-  const dot = { live: "bg-ok", connecting: "bg-mute", retrying: "bg-warn" }[state];
-  return (
-    <span
-      className={`flex items-center gap-1.5 text-sm ${state === "retrying" ? "text-warn" : "text-mute"}`}
-      title={`Doorbell stream: ${state}`}
-    >
-      <span className={`size-1.5 rounded-full ${dot}`} />
-      {state}
-    </span>
+    </TooltipProvider>
   );
 }
 

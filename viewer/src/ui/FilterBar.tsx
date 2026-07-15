@@ -5,6 +5,7 @@ import { Check, ListFilter, X } from "lucide-react";
 import { isActive, type FilterState } from "../core/filter";
 import type { LabelDto } from "../types";
 import { catalogColor } from "./colors";
+import { IconButton } from "./primitives";
 
 /**
  * The filter bar.
@@ -105,22 +106,11 @@ export function FilterBar({
       </Dropdown.Root>
 
       {isActive(filter) && (
-        <button
-          onClick={() => onChange({ text: "", mine: false, label: null })}
-          className="text-mute hover:text-fg shrink-0"
-          aria-label="Clear filter"
-          title="Clear filter"
-        >
+        <IconButton label="Clear filter" onClick={() => onChange({ text: "", mine: false, label: null })}>
           <X className="size-3.5" />
-        </button>
+        </IconButton>
       )}
-      <button
-        onClick={onClose}
-        className="text-mute hover:text-fg shrink-0 text-2xs"
-        aria-label="Close filter"
-      >
-        esc
-      </button>
+
     </div>
   );
 }

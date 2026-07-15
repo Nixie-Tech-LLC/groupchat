@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { fuzzyScore } from "../core/fuzzy";
 import { formatBinding } from "../core/keys";
 import { registry, type Ctx } from "../core/registry";
+import { Kbd } from "./primitives";
 
 /**
  * The command palette — a **projection** of the registry, not a menu.
@@ -76,12 +77,7 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
                   <span className="flex-1">{b.command.title}</span>
                   <span className="flex gap-1">
                     {b.bindings.map((k, i) => (
-                      <kbd
-                        key={i}
-                        className="border-line-strong bg-bg text-dim rounded-sm border px-1 font-mono text-2xs data-[selected=true]:border-transparent"
-                      >
-                        {formatBinding(k, { glyphs: true })}
-                      </kbd>
+                      <Kbd key={i}>{formatBinding(k, { glyphs: true })}</Kbd>
                     ))}
                   </span>
                 </Command.Item>
