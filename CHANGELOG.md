@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — protocol versioning & release hardening
+
+- **Protocol epoch bump (a coordinated break).** The sync ALPN (`lait/sync/0` →
+  `lait/sync/1`), the gossip topic derivation (now domain-separated by a
+  `GOSSIP_PROTOCOL` epoch), and the presence ALPN (`lait/presence/0` → `/1`) all
+  moved to epoch 1, which **introduces in-band version negotiation**. A node on
+  this version does **not** interoperate with a v0.4.8-or-earlier node — for this
+  one transition, upgrade every node in a workspace together. From here on, the
+  new windowed policy prevents flag-days.
+- **Mixed-version safety.** The sync handshake now carries a `protocol_version`;
+  a peer outside the supported window `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]`
+  is refused with a clear "upgrade lait" diagnostic instead of a silent decode
+  failure. Undecodable gossip payloads (the other version-skew path) are now
+  logged at debug instead of dropped silently.
+- **On-disk schema gate.** Opening a workspace store written by a *newer* lait now
+  fails fast with an upgrade message rather than risking a lossy read
+  (`SCHEMA_VERSION` is finally enforced on load).
+- **`lait update` heals a dev-channel node.** A `dev` build now reports a
+  clean-semver `X.Y.Z-dev.<sha>` to the updater (which sorts below stable), so
+  `lait update` moves it onto the stable release instead of reporting "already up
+  to date" and stranding it.
+- **Distribution fixes.** `cargo binstall lait` now resolves the binary correctly
+  on Linux/macOS (the archive nests under `lait-<target>/`; only Windows is flat).
+  The MSRV CI gate actually tests 1.91 again (it was silently running on stable).
+  Releases now ship a build-provenance attestation and a CycloneDX SBOM, and the
+  build was migrated to a custom-artifacts architecture so binaries can be signed
+  in place (macOS notarization + Windows Azure signing land next). See
+  `docs/RELEASE-SIGNING.md`.
+
 ## v0.4.8 — Windows self-update fix
 
 - **`lait update` works on Windows again.** cargo-dist ships the binary **flat**

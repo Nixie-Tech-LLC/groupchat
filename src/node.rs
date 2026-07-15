@@ -62,7 +62,10 @@ use crate::{
     tracker::{DirtySet, Tracker},
 };
 
-const PRESENCE_ALPN: &[u8] = b"lait/presence/0";
+// Presence-probe ALPN. Bumped in lockstep with the gossip epoch
+// (proto::GOSSIP_PROTOCOL) so a version skew that partitions gossip also
+// partitions the liveness probe, rather than leaving cross-epoch peers half-visible.
+const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);

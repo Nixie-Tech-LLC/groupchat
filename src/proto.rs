@@ -22,9 +22,23 @@ type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 
 /// Derive a stable gossip topic id from a human room name, so everyone who
 /// types the same room name lands in the same room.
+/// The gossip protocol epoch. Bump on ANY breaking change to [`Payload`] (the
+/// postcard-encoded gossip messages). postcard is not self-describing, so
+/// different-epoch nodes would otherwise silently fail to decode each other's
+/// frames (that drop is now logged in node.rs, but partitioning is cleaner).
+/// Because the epoch is folded into the topic id below, nodes of different
+/// epochs join *different* gossip topics and never exchange incompatible frames
+/// — the gossip analogue of bumping a wire ALPN. Epoch 1 is the first versioned
+/// topic; it does not interoperate with the pre-versioning topic.
+pub const GOSSIP_PROTOCOL: u32 = 1;
+
 pub fn topic_for_room(room: &str) -> TopicId {
-    let hash = blake3::hash(room.as_bytes());
-    TopicId::from_bytes(*hash.as_bytes())
+    // Domain-separate the topic by gossip epoch so a breaking Payload change
+    // partitions old and new nodes onto distinct topics.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&GOSSIP_PROTOCOL.to_le_bytes());
+    hasher.update(room.as_bytes());
+    TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
 
 /// Length of an invite nonce — a random single-use id (128 bits).
