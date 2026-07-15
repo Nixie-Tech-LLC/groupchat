@@ -24,6 +24,7 @@
  */
 
 import { parseBinding, type Binding } from "./keys";
+import type { Field } from "./overlay";
 
 /** The root surfaces. A view is not a route — there is no URL to be wrong about,
  *  and the browser's back button belongs to the browser. */
@@ -56,6 +57,9 @@ export interface AppApi {
   toast(message: string): void;
   refresh(): void;
   select(reff: string | null): void;
+  /** Show `value` for `(doc, field)` now, send the write, and let the doorbell
+   *  retire the guess. See core/overlay.ts. */
+  predict(doc: string, field: Field, value: string, send: () => Promise<unknown>): void;
   createIssue(): void;
   deleteIssue(reff: string): void;
   pickSpace(id: string): void;

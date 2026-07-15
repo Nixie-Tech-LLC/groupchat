@@ -17,10 +17,11 @@ import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
 import { Sidebar } from "./ui/Sidebar";
 import { applyFilter, EMPTY_FILTER, needsServer, type FilterState } from "./core/filter";
+import { applyOverlay, Overlay, PREDICTION_TTL_MS, type Field } from "./core/overlay";
 import { isReadOnly, type BoardView, type LabelDto, type Row, type SpaceRow } from "./types";
 import "./commands";
 
-type Overlay = "palette" | "shortcuts" | null;
+type Modal = "palette" | "shortcuts" | null;
 
 /**
  * The shell.
@@ -36,7 +37,7 @@ export function App() {
   const [current, setCurrent] = useState<string | null>(null);
   const [board, setBoard] = useState<BoardView | null>(null);
   const [selection, setSelection] = useState<string | null>(null);
-  const [overlay, setOverlay] = useState<Overlay>(null);
+  const [modal, setModal] = useState<Modal>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
@@ -49,6 +50,11 @@ export function App() {
   /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
    *  not the same as "nothing qualifies" — see core/filter.ts. */
   const [allowed, setAllowed] = useState<ReadonlySet<string> | null>(null);
+  /** Local predictions. A ref, not state: the doorbell handler mutates it and we
+   *  re-render explicitly — putting it in state would make every `set` a new Map
+   *  and every render a new overlay. */
+  const overlay = useRef(new Overlay());
+  const [predicted, setPredicted] = useState(0);
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
@@ -56,10 +62,15 @@ export function App() {
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
 
-  const shown: BoardView | null = useMemo(
-    () => (board ? applyFilter(board, filter, allowed) : null),
-    [board, filter, allowed],
-  );
+  // Overlay first, then filter: a predicted title should be findable by the text
+  // you just typed into it, and a predicted status should filter as its new one.
+  // `predicted` is the re-render trigger — the overlay itself is a mutable ref.
+  const { shown, optimistic } = useMemo(() => {
+    if (!board) return { shown: null, optimistic: new Set<string>() as ReadonlySet<string> };
+    const o = applyOverlay(board, overlay.current);
+    return { shown: applyFilter(o.board, filter, allowed), optimistic: o.optimistic };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [board, filter, allowed, predicted]);
 
   // Motion follows what is *visible*: j/k over rows a filter hid would look like
   // the selection teleporting.
@@ -154,13 +165,33 @@ export function App() {
     useCallback(
       (d) => {
         if (!d) {
+          // We can't say which docs moved, so no prediction can be trusted.
+          overlay.current.clear();
+          setPredicted((n) => n + 1);
           void loadSpaces();
           void loadBoard(current);
           setRevision((r) => r + 1);
           return;
         }
         if (d.space !== current) return;
-        void loadBoard(current);
+        // The doorbell is the spine of the optimism: it names the docs that
+        // moved, and the arrival of truth about a doc is what kills every guess
+        // about it — no ids to match, nothing to reconcile. Re-read FIRST, then
+        // drop the predictions: clearing before the fresh rows land would flash
+        // the old server value for a frame, which is the one thing the optimism
+        // exists to prevent.
+        void loadBoard(current).then(() => {
+          const docs = Object.values(d.dirty_by_project).flat();
+          let cleared = false;
+          for (const doc of docs) cleared = overlay.current.clearDoc(doc) || cleared;
+          // `reset` (or a daemon restart) means our whole view is suspect, so no
+          // guess about it survives either.
+          if (d.reset) {
+            overlay.current.clear();
+            cleared = true;
+          }
+          if (cleared) setPredicted((n) => n + 1);
+        });
         setRevision((r) => r + 1);
         if (d.dirty_catalog.length) void loadSpaces();
       },
@@ -172,6 +203,31 @@ export function App() {
   rowsRef.current = rows;
   const selRef = useRef(selection);
   selRef.current = selection;
+
+  /**
+   * Predict, then send.
+   *
+   * The order is the point: the value is on screen before the request leaves, and
+   * the doorbell — not a response — is what retires the guess. If the request is
+   * refused we roll back immediately rather than wait for a doorbell that will
+   * never come, because a refusal *is* the news.
+   */
+  const predict = useCallback(
+    async (doc: string, field: Field, value: string, send: () => Promise<unknown>) => {
+      overlay.current.set(doc, field, value);
+      setPredicted((n) => n + 1);
+      try {
+        await send();
+      } catch (e) {
+        overlay.current.clearDoc(doc);
+        setPredicted((n) => n + 1);
+        if (!(e instanceof ConfirmRequired)) {
+          setError(e instanceof LaitError ? e.message : String(e));
+        }
+      }
+    },
+    [],
+  );
 
   /** Writes never refetch — the daemon rings and the doorbell reloads. */
   const guard = useCallback(async (fn: () => Promise<unknown>) => {
@@ -185,9 +241,9 @@ export function App() {
 
   const api: AppApi = useMemo(
     () => ({
-      openPalette: () => setOverlay("palette"),
-      closePalette: () => setOverlay(null),
-      toggleShortcuts: () => setOverlay((o) => (o === "shortcuts" ? null : "shortcuts")),
+      openPalette: () => setModal("palette"),
+      closePalette: () => setModal(null),
+      toggleShortcuts: () => setModal((m) => (m === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
       goto: (v) => setView(v),
       openFilter: () => {
@@ -207,6 +263,7 @@ export function App() {
         setToast("Refreshed");
       },
       select: (reff) => setSelection(reff),
+      predict: (doc, field, value, send) => void predict(doc, field, value, send),
       pickSpace: (id) => setCurrent(id),
       moveSelection: (delta) => {
         const list = rowsRef.current;
@@ -239,12 +296,12 @@ export function App() {
           }
         }),
     }),
-    [current, guard, loadBoard, loadSpaces],
+    [current, guard, loadBoard, loadSpaces, predict],
   );
 
   const ctx: Ctx = useMemo(
-    () => ({ view, spaceId: current, readOnly, selection, overlay: overlay !== null, app: api }),
-    [view, current, readOnly, selection, overlay, api],
+    () => ({ view, spaceId: current, readOnly, selection, overlay: modal !== null, app: api }),
+    [view, current, readOnly, selection, modal, api],
   );
 
   const pending = useKeys(ctx);
@@ -254,6 +311,17 @@ export function App() {
   useEffect(() => {
     registry.validate();
   }, []);
+
+  // A prediction whose request neither errored nor rang is stuck: a dropped fetch,
+  // a suspended tab. Sweep so the UI falls back to what the server last said
+  // instead of showing a value that exists nowhere.
+  useEffect(() => {
+    if (!predicted) return;
+    const t = window.setInterval(() => {
+      if (overlay.current.sweep()) setPredicted((n) => n + 1);
+    }, PREDICTION_TTL_MS / 2);
+    return () => window.clearInterval(t);
+  }, [predicted]);
 
   const run = (id: string) => void registry.get(id)?.run(ctx);
 
@@ -393,6 +461,7 @@ export function App() {
             <Board
               board={shown}
               selection={selection}
+              optimistic={optimistic}
               onSelect={api.select}
               onCreate={() => run("issue.create")}
               readOnly={readOnly}
@@ -401,6 +470,7 @@ export function App() {
             <IssueList
               board={shown}
               selection={selection}
+              optimistic={optimistic}
               onSelect={api.select}
               onOpen={() => setDetail(true)}
               onCreate={() => run("issue.create")}
@@ -429,13 +499,14 @@ export function App() {
               revision={revision}
               onError={setError}
               onDelete={api.deleteIssue}
+              onPredict={api.predict}
             />
           </Panel>
         </>
       )}
 
-      {overlay === "palette" && <Palette ctx={ctx} onClose={() => setOverlay(null)} />}
-      {overlay === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setOverlay(null)} />}
+      {modal === "palette" && <Palette ctx={ctx} onClose={() => setModal(null)} />}
+      {modal === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setModal(null)} />}
 
       {/* A half-typed sequence must be visible, or `g` reads as a dropped key. */}
       {pending.length > 0 && (

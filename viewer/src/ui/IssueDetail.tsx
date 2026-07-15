@@ -10,6 +10,7 @@ import {
   type Priority,
   type WorkflowState,
 } from "../types";
+import type { Field } from "../core/overlay";
 import { catalogColor } from "./colors";
 import { short, when } from "./time";
 import { PriorityIcon, StatusIcon } from "./icons";
@@ -34,6 +35,7 @@ export function IssueDetail({
   readOnly,
   onError,
   onDelete,
+  onPredict,
   revision,
 }: {
   spaceId: string;
@@ -42,6 +44,8 @@ export function IssueDetail({
   readOnly: boolean;
   onError: (m: string) => void;
   onDelete: (reff: string) => void;
+  /** Predict `(doc, field)` locally, then send. The doorbell retires the guess. */
+  onPredict: (doc: string, field: Field, value: string, send: () => Promise<unknown>) => void;
   /** Bumped by the doorbell; re-reads without this pane knowing why. */
   revision: number;
 }) {
@@ -158,7 +162,11 @@ export function IssueDetail({
               icon: <StatusIcon category={s.category} color={catalogColor(s.color)} />,
               active: s.id === issue.status,
             }))}
-            onPick={(id) => void edit({ status: id })}
+            onPick={(id) =>
+              onPredict(issue.doc_id, "status", id, () =>
+                rpc(spaceId, { cmd: "issue_edit", reff, status: id }),
+              )
+            }
           />
 
           <Picker
@@ -178,7 +186,11 @@ export function IssueDetail({
               icon: <PriorityIcon priority={p} />,
               active: p === issue.priority,
             }))}
-            onPick={(id) => void edit({ priority: id })}
+            onPick={(id) =>
+              onPredict(issue.doc_id, "priority", id, () =>
+                rpc(spaceId, { cmd: "issue_edit", reff, priority: id }),
+              )
+            }
           />
         </div>
 

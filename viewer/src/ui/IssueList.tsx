@@ -20,6 +20,7 @@ import { PriorityIcon, StatusIcon } from "./icons";
 export function IssueList({
   board,
   selection,
+  optimistic,
   onSelect,
   onOpen,
   onCreate,
@@ -27,6 +28,8 @@ export function IssueList({
 }: {
   board: BoardView;
   selection: string | null;
+  /** Docs carrying an unconfirmed local prediction. */
+  optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
@@ -45,6 +48,7 @@ export function IssueList({
             key={col.state.id}
             col={col}
             selection={selection}
+            optimistic={optimistic}
             onSelect={onSelect}
             onOpen={onOpen}
             onCreate={onCreate}
@@ -66,6 +70,7 @@ const visible = (c: BoardColumn) => c.rows.filter((r) => !r.tombstone);
 function Group({
   col,
   selection,
+  optimistic,
   onSelect,
   onOpen,
   onCreate,
@@ -73,6 +78,7 @@ function Group({
 }: {
   col: BoardColumn;
   selection: string | null;
+  optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
@@ -106,6 +112,7 @@ function Group({
             row={row}
             state={col}
             selected={row.reff === selection}
+            pending={optimistic.has(row.doc_id)}
             onSelect={onSelect}
             onOpen={onOpen}
           />
@@ -119,12 +126,14 @@ function IssueRow({
   row,
   state,
   selected,
+  pending,
   onSelect,
   onOpen,
 }: {
   row: Row;
   state: BoardColumn;
   selected: boolean;
+  pending: boolean;
   onSelect: (reff: string) => void;
   onOpen: (reff: string) => void;
 }) {
@@ -158,6 +167,15 @@ function IssueRow({
       </span>
       <StatusIcon category={state.state.category} color={catalogColor(state.state.color)} />
       <span className="min-w-0 flex-1 truncate">{row.title}</span>
+      {/* Unconfirmed: shown as truth because that is what makes a write feel
+          instant, but never *claimed* as truth. */}
+      {pending && (
+        <span
+          className="bg-accent size-1.5 shrink-0 animate-pulse rounded-full"
+          title="Not confirmed by the daemon yet"
+          aria-label="Pending"
+        />
+      )}
       {row.assignee_summary && (
         <span className="text-mute shrink-0 text-xs">{row.assignee_summary}</span>
       )}

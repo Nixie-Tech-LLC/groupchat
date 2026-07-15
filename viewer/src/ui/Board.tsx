@@ -18,12 +18,15 @@ import { PriorityIcon, StatusIcon } from "./icons";
 export function Board({
   board,
   selection,
+  optimistic,
   onSelect,
   onCreate,
   readOnly,
 }: {
   board: BoardView;
   selection: string | null;
+  /** Docs carrying an unconfirmed local prediction. */
+  optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
@@ -35,6 +38,7 @@ export function Board({
           key={col.state.id}
           col={col}
           selection={selection}
+          optimistic={optimistic}
           onSelect={onSelect}
           onCreate={onCreate}
           readOnly={readOnly}
@@ -47,12 +51,14 @@ export function Board({
 function Column({
   col,
   selection,
+  optimistic,
   onSelect,
   onCreate,
   readOnly,
 }: {
   col: BoardColumn;
   selection: string | null;
+  optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
@@ -76,7 +82,13 @@ function Column({
       </header>
       <ul className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-1">
         {rows.map((row) => (
-          <Card key={row.reff} row={row} selected={row.reff === selection} onSelect={onSelect} />
+          <Card
+            key={row.reff}
+            row={row}
+            selected={row.reff === selection}
+            pending={optimistic.has(row.doc_id)}
+            onSelect={onSelect}
+          />
         ))}
         {rows.length === 0 && (
           <li className="border-line text-mute rounded border border-dashed p-4 text-center text-sm">
@@ -91,10 +103,12 @@ function Column({
 function Card({
   row,
   selected,
+  pending,
   onSelect,
 }: {
   row: Row;
   selected: boolean;
+  pending: boolean;
   onSelect: (reff: string) => void;
 }) {
   const el = useRef<HTMLLIElement>(null);
@@ -123,6 +137,13 @@ function Card({
         </span>
         {row.assignee_summary && (
           <span className="text-mute ml-auto text-2xs">{row.assignee_summary}</span>
+        )}
+        {pending && (
+          <span
+            className="bg-accent ml-auto size-1.5 animate-pulse rounded-full"
+            title="Not confirmed by the daemon yet"
+            aria-label="Pending"
+          />
         )}
       </div>
     </li>
