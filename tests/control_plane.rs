@@ -192,6 +192,7 @@ async fn stale_since_after_restart_yields_reset() {
             title: None,
             status: Some("in_progress".into()),
             priority: None,
+            description: None,
         },
     )
     .await
@@ -252,6 +253,7 @@ async fn validate_then_commit_rings_no_doorbell() {
             title: None,
             status: Some("definitely-not-a-status".into()),
             priority: None,
+            description: None,
         },
     )
     .await

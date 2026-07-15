@@ -517,19 +517,48 @@ pub const KEYS: &[KeySpec] = &[
         help: "Project key issue-creating commands fall back to when -p is omitted.",
         built_in: || None,
     },
+    KeySpec {
+        name: "tui.theme",
+        layers: KeyLayers::GlobalAndStore,
+        daemon_read: false,
+        help: "TUI theme: dark (default), light, or auto (COLORFGBG heuristic).",
+        built_in: || Some("dark".to_string()),
+    },
+    KeySpec {
+        name: "tui.tabs",
+        layers: KeyLayers::StoreOnly,
+        daemon_read: false,
+        help: "Saved board views (JSON array; pinned from the TUI with `P`).",
+        built_in: || None,
+    },
 ];
 
+/// Keymap overrides: `tui.key.<action-id> = "<key>"` (e.g. `tui.key.open-palette
+/// = "ctrl+p"`). An open prefix rather than table rows — the set of action ids
+/// belongs to the TUI, which validates suffixes and warns (never gates) on
+/// unknown ones. Store or global layer.
+static TUI_KEY_PREFIX_SPEC: KeySpec = KeySpec {
+    name: "tui.key.*",
+    layers: KeyLayers::GlobalAndStore,
+    daemon_read: false,
+    help: "TUI keybinding override for one action (see the TUI help for action ids).",
+    built_in: || None,
+};
+
 /// Look up a key in the table. `workspace.*` names get the reserved-namespace
-/// error (future synced workspace settings); anything else unknown lists the
-/// valid keys.
+/// error (future synced workspace settings); `tui.key.*` is an open prefix
+/// (validated by the TUI); anything else unknown lists the valid keys.
 pub fn key_spec(name: &str) -> Result<&'static KeySpec> {
     if name.starts_with("workspace.") {
         anyhow::bail!("'{name}' is reserved for synced workspace settings (not available yet)");
     }
+    if name.starts_with("tui.key.") && name.len() > "tui.key.".len() {
+        return Ok(&TUI_KEY_PREFIX_SPEC);
+    }
     KEYS.iter().find(|k| k.name == name).ok_or_else(|| {
         let known: Vec<&str> = KEYS.iter().map(|k| k.name).collect();
         anyhow!(
-            "unknown config key '{name}' — known keys: {}",
+            "unknown config key '{name}' — known keys: {} (+ tui.key.<action>)",
             known.join(", ")
         )
     })
