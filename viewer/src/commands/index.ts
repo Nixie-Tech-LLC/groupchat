@@ -73,6 +73,15 @@ export const coreCommands = contribute({
       run: (c: Ctx) => c.app.goto(view),
     })),
 
+    {
+      id: "filter.open",
+      title: "Filter issues",
+      group: "View",
+      keys: ["/"],
+      when: (c) => !c.overlay && hasSpace(c) && (c.view === "list" || c.view === "board"),
+      run: (c) => c.app.openFilter(),
+    },
+
     // ---- motion -----------------------------------------------------------
     {
       id: "nav.down",

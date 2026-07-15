@@ -52,6 +52,7 @@ export interface AppApi {
   toggleSidebar(): void;
   toggleDetail(): void;
   goto(view: View): void;
+  openFilter(): void;
   toast(message: string): void;
   refresh(): void;
   select(reff: string | null): void;

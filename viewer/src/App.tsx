@@ -8,13 +8,15 @@ import { contribute, registry, type AppApi, type Ctx, type View } from "./core/r
 import { useKeys } from "./core/useKeys";
 import { Activity } from "./ui/Activity";
 import { Board } from "./ui/Board";
+import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
 import { Palette } from "./ui/Palette";
 import { Shortcuts } from "./ui/Shortcuts";
 import { Sidebar } from "./ui/Sidebar";
-import { isReadOnly, type BoardView, type Row, type SpaceRow } from "./types";
+import { applyFilter, EMPTY_FILTER, needsServer, type FilterState } from "./core/filter";
+import { isReadOnly, type BoardView, type LabelDto, type Row, type SpaceRow } from "./types";
 import "./commands";
 
 type Overlay = "palette" | "shortcuts" | null;
@@ -39,6 +41,13 @@ export function App() {
   const [detail, setDetail] = useState(true);
   const [view, setView] = useState<View>("list");
   const [unread, setUnread] = useState(0);
+  const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [focusToken, setFocusToken] = useState(0);
+  const [labels, setLabels] = useState<LabelDto[]>([]);
+  /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
+   *  not the same as "nothing qualifies" — see core/filter.ts. */
+  const [allowed, setAllowed] = useState<ReadonlySet<string> | null>(null);
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
@@ -46,9 +55,16 @@ export function App() {
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
 
+  const shown: BoardView | null = useMemo(
+    () => (board ? applyFilter(board, filter, allowed) : null),
+    [board, filter, allowed],
+  );
+
+  // Motion follows what is *visible*: j/k over rows a filter hid would look like
+  // the selection teleporting.
   const rows: Row[] = useMemo(
-    () => (board ? board.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone)) : []),
-    [board],
+    () => (shown ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone)) : []),
+    [shown],
   );
 
   const loadSpaces = useCallback(async () => {
@@ -86,6 +102,41 @@ export function App() {
   useEffect(() => {
     void loadBoard(current);
   }, [current, loadBoard]);
+
+  // Labels for the filter menu — the daemon's registry, not names we invented.
+  useEffect(() => {
+    if (!current) return setLabels([]);
+    void (async () => {
+      try {
+        const r = await rpc(current, { cmd: "label_list" });
+        if (r.kind === "labels") setLabels(r.labels);
+      } catch {
+        // A missing label registry is not worth an error banner over — the menu
+        // just offers fewer options.
+      }
+    })();
+  }, [current, revision]);
+
+  // `mine`/`label` are server truth: ask `list`, keep the doc-ids, intersect.
+  useEffect(() => {
+    if (!current || !needsServer(filter)) return setAllowed(null);
+    let alive = true;
+    void (async () => {
+      try {
+        const r = await rpc(current, {
+          cmd: "list",
+          project: null,
+          filter: { mine: filter.mine, label: filter.label, all: true },
+        });
+        if (alive && r.kind === "list") setAllowed(new Set(r.rows.map((x) => x.doc_id)));
+      } catch (e) {
+        if (alive) setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [current, filter, revision]);
 
   // A selection that no longer exists (deleted, filtered away) must not linger.
   useEffect(() => {
@@ -138,6 +189,10 @@ export function App() {
       toggleShortcuts: () => setOverlay((o) => (o === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
       goto: (v) => setView(v),
+      openFilter: () => {
+        setFilterOpen(true);
+        setFocusToken((t) => t + 1);
+      },
       toggleSidebar: () => {
         const p = sidebar.current;
         if (!p) return;
@@ -300,6 +355,16 @@ export function App() {
           </p>
         )}
 
+        {filterOpen && (view === "list" || view === "board") && (
+          <FilterBar
+            filter={filter}
+            labels={labels}
+            focusToken={focusToken}
+            onChange={setFilter}
+            onClose={() => setFilterOpen(false)}
+          />
+        )}
+
         <div className="group/list flex min-h-0 flex-1 flex-col">
           {!current ? (
             <p className="text-mute p-8 text-center">Pick a space.</p>
@@ -316,17 +381,17 @@ export function App() {
             />
           ) : view === "activity" ? (
             <Activity spaceId={current} revision={revision} onError={setError} onOpen={api.select} />
-          ) : board && view === "board" ? (
+          ) : shown && view === "board" ? (
             <Board
-              board={board}
+              board={shown}
               selection={selection}
               onSelect={api.select}
               onCreate={() => run("issue.create")}
               readOnly={readOnly}
             />
-          ) : board && view === "list" ? (
+          ) : shown && view === "list" ? (
             <IssueList
-              board={board}
+              board={shown}
               selection={selection}
               onSelect={api.select}
               onOpen={() => setDetail(true)}
