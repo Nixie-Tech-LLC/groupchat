@@ -44,6 +44,14 @@ Additive within epoch 1 — no flag day. The new `hello` handshake and the
   existed for ambiguous refs; typos are the more common way to get there. Suggestions
   only when a guess is defensible.
 - **`--help` separates global flags from each command's own**, under `Global Options`.
+- **A captured command on Windows no longer hangs forever.** `CreateProcess` inherits
+  *every* inheritable handle, not just the three in `STARTUPINFO`, so the daemon a
+  command auto-spawns came up holding a write-end of that command's stdout — its own
+  `Stdio::null()` notwithstanding. The command exited, the pipe never closed, and
+  anything reading to EOF (`$(lait new …)`, a test harness, an MCP client) waited on an
+  EOF that could not arrive. lait now clears `HANDLE_FLAG_INHERIT` on its own stdio at
+  startup, which children given stdio explicitly still inherit (std duplicates the
+  handle for them). Unix was never affected — those fds are `CLOSE_ON_EXEC`.
 
 ## Unreleased — protocol version negotiation, schema gate & release hardening
 

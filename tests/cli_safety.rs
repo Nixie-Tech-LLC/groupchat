@@ -17,8 +17,15 @@
 //!    top-level reporter: one lowercase `error:` line, the versioned DTO under
 //!    `--json`, and the documented exit code. `main` returning `Result` used to
 //!    hand these to anyhow's `Termination`, which broke all three.
+//!
+//! 4. **Never hold your stdout hostage.** A command that auto-spawns a daemon must
+//!    still hit EOF when it exits: whoever captured it (`$(lait new …)`, a test
+//!    harness, an MCP client) reads until EOF, so a daemon left holding the write
+//!    end hangs the *caller*, not the daemon. Windows-only in practice — see
+//!    `disinherit_stdio` in `app.rs` — but the promise is platform-independent.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
@@ -113,6 +120,60 @@ fn delete_without_yes_refuses_and_keeps_the_issue() {
 
     shutdown(&home);
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// The daemon a command spawns must not outlive it *holding its stdout*.
+///
+/// `new` is the shape that bites: it auto-spawns a daemon, and the daemon is
+/// still running when `new` exits. On Windows `CreateProcess` inherits every
+/// inheritable handle, not just the ones in `STARTUPINFO`, so the daemon came up
+/// owning a write-end of the captured stdout of `new` — its own `Stdio::null()`
+/// notwithstanding. `new` exited, the pipe never closed, and the caller blocked
+/// on an EOF that could not arrive.
+///
+/// Waits on the *read*, not the exit: the process exiting was never the broken
+/// part. Reading on a thread keeps a regression a 15s failure that says why,
+/// rather than a wedged test the runner shoots at 90s with no diagnosis.
+#[test]
+fn a_spawned_daemon_does_not_hold_our_stdout_open() {
+    let home = tmp_home("hold");
+    init(&home);
+
+    let mut child = Command::new(bin())
+        .env("LAIT_CONFIG_ROOT", config_root(&home))
+        // 0 disables idle-shutdown, so the daemon is *guaranteed* to still be up
+        // when `new` exits — the race this test needs to be deterministic.
+        .env("LAIT_IDLE_SECS", "0")
+        .arg("--home")
+        .arg(&home)
+        .args(["new", "hold my stdout"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lait");
+
+    let status = child.wait().expect("wait for `new`");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        tx.send(stdout.read_to_string(&mut s).map(|_| s)).ok();
+    });
+    let read = rx.recv_timeout(Duration::from_secs(15));
+
+    // Before any assert: a live daemon is what wedges the reader, and on failure
+    // it would otherwise outlive the test and hold the *runner's* pipe too.
+    shutdown(&home);
+    std::fs::remove_dir_all(&home).ok();
+
+    assert!(status.success(), "new failed: {status}");
+    let read = read.expect(
+        "`new` exited but its stdout never reached EOF — the daemon it spawned \
+         inherited the write end and is holding it open. Whoever captures a lait \
+         command (a shell's `$(…)`, a test harness, an MCP client) hangs here.",
+    );
+    assert!(read.is_ok(), "reading stdout failed: {read:?}");
 }
 
 /// A selector that matches nothing is a not-found, and must answer like one on

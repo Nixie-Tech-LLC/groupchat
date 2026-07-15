@@ -122,6 +122,8 @@ fn resolve_workspace_selector(sel: &str) -> Result<std::path::PathBuf> {
 /// cause chain and always exits `1`. Every client-side failure funnels through
 /// [`crate::cli::report_error`] instead — see there for what that buys.
 pub async fn run() -> std::process::ExitCode {
+    // Before anything can spawn — every command, service or not.
+    disinherit_stdio();
     let specs = cmdspec::specs();
     let cli = cmdspec::build_cli(&specs);
     // `try_get_matches` (not `get_matches`) so a usage/parse error exits `1` — the
@@ -853,6 +855,50 @@ fn reset_sigpipe() {
 }
 #[cfg(not(unix))]
 fn reset_sigpipe() {}
+
+/// Stop our own stdio from leaking into processes we never handed it to.
+///
+/// On Windows `CreateProcess` is called with `bInheritHandles=TRUE`, and that is
+/// all-or-nothing: a child inherits *every* inheritable handle in this process,
+/// not just the three named in `STARTUPINFO`. When our stdout/stderr are pipes
+/// (any captured run — `Command::output()`, `$(lait ...)`, a test harness) those
+/// pipe handles are inheritable, so `ensure_daemon`'s spawn hands the daemon a
+/// write-end of *our* stdout even though its own stdio is `Stdio::null()`. The
+/// daemon outlives us, the write-end never closes, and our caller waits on an EOF
+/// that can never come — a captured `lait new` hangs forever. Unix is immune:
+/// those fds are `CLOSE_ON_EXEC`.
+///
+/// Clearing `HANDLE_FLAG_INHERIT` on our end fixes it at the source. It does not
+/// break children we *do* want to inherit stdio: for `Stdio::inherit()` std
+/// duplicates the handle with `bInheritHandle=TRUE` into the child's
+/// `STARTUPINFO`, so their output still lands on our stdout.
+///
+/// Unlike [`reset_sigpipe`], this runs for the services too — `lait mcp` speaks
+/// its protocol over stdio pipes and spawns a daemon, which is the same hang.
+#[cfg(windows)]
+fn disinherit_stdio() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for h in handles {
+        if h.is_null() {
+            continue;
+        }
+        // SAFETY: `h` is a live std handle we own, borrowed for this call only.
+        // Best-effort: a std stream can be closed or invalid (a detached service),
+        // and failing to clear a handle we never had is not an error.
+        unsafe {
+            SetHandleInformation(h as _, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+#[cfg(not(windows))]
+fn disinherit_stdio() {}
 
 #[cfg(test)]
 mod tests {
