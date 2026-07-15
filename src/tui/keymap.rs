@@ -16,10 +16,12 @@ use crate::config::Settings;
 pub enum FocusKind {
     Board,
     Peek,
-    List, // generic list-shaped screens (activity, and stubs)
+    List, // generic list-shaped screens (activity, log)
     Inbox,
     Members,
     Spaces,
+    Config,
+    Remotes,
     Help,
     // Input layers (Editor/Picker/Palette/Confirm) consume raw keys and never
     // hit the keymap, except through their own explicit Submit/Cancel checks.
@@ -164,6 +166,8 @@ pub struct Keymap {
     pub inbox: Vec<Binding>,
     pub members: Vec<Binding>,
     pub spaces: Vec<Binding>,
+    pub config: Vec<Binding>,
+    pub remotes: Vec<Binding>,
     pub help: Vec<Binding>,
 }
 
@@ -275,6 +279,8 @@ impl Keymap {
             bl(KeyPattern::ch('f'), SpaceForget, "forget"),
             b(KeyPattern::ch('P'), SpacePrune, "prune missing"),
         ];
+        let config = vec![bl(KeyPattern::code(K::Enter), OpenPeek, "edit key")];
+        let remotes = vec![bl(KeyPattern::ch('d'), Delete, "unpin")];
         let help = vec![bl(KeyPattern::code(K::Enter), Submit, "run action")];
         Keymap {
             global,
@@ -284,6 +290,8 @@ impl Keymap {
             inbox,
             members,
             spaces,
+            config,
+            remotes,
             help,
         }
     }
@@ -318,6 +326,8 @@ impl Keymap {
                 &mut self.inbox,
                 &mut self.members,
                 &mut self.spaces,
+                &mut self.config,
+                &mut self.remotes,
                 &mut self.help,
             ] {
                 for binding in table.iter_mut().filter(|b| b.action == action) {
@@ -340,6 +350,8 @@ impl Keymap {
             FocusKind::Inbox => &self.inbox,
             FocusKind::Members => &self.members,
             FocusKind::Spaces => &self.spaces,
+            FocusKind::Config => &self.config,
+            FocusKind::Remotes => &self.remotes,
             FocusKind::Help => &self.help,
         }
     }
@@ -371,6 +383,8 @@ impl Keymap {
             FocusKind::Inbox => "inbox",
             FocusKind::Members => "members",
             FocusKind::Spaces => "spaces",
+            FocusKind::Config => "config",
+            FocusKind::Remotes => "remotes",
             FocusKind::Help => "help",
         };
         vec![(ctx_name, self.table(ctx)), ("global", &self.global)]

@@ -39,8 +39,11 @@ pub enum EditorIntent {
     RenameMember {
         key: String,
     },
-    /// Name a pinned tab (Stage 4).
-    #[allow(dead_code)]
+    /// Set (empty buffer unsets) a store-layer config key.
+    ConfigSet {
+        key: String,
+    },
+    /// Name a pinned tab.
     NameTab,
 }
 
@@ -69,6 +72,7 @@ impl EditorState {
                 | EditorIntent::EditTitle { .. }
                 | EditorIntent::ApproveMember { .. }
                 | EditorIntent::RenameMember { .. }
+                | EditorIntent::ConfigSet { .. }
                 | EditorIntent::NameTab
         );
         let mut textarea = if initial.is_empty() {

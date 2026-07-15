@@ -516,8 +516,12 @@ the per-session workspace firehose; the inbox is the durable, filtered, watermar
 Inside each store home: `config.json` — the store settings layer. `lait config` fronts
 the two layers git-style (store wins). Closed key table: `user.nick` (global+store,
 daemon-read → best-effort `ConfigReload` on set), `project.default` (store-only, read
-lazily per request, §7.6). The `workspace.*` namespace is **reserved** for future
-settings that sync through the Catalog. The old per-store `profile.json` is retired.
+lazily per request, §7.6), `tui.theme` (global+store, `dark|light|auto`, client-read),
+`tui.tabs` (store-only, JSON `Vec<SavedTab>` — the TUI's saved view tabs, UI §5.2).
+One **open prefix**: `tui.key.<action-id>` (global+store) rebinds one TUI action; the
+config layer validates the prefix only, the TUI validates suffixes and warns (never
+gates) on unknown ones. The `workspace.*` namespace is **reserved** for future settings
+that sync through the Catalog. The old per-store `profile.json` is retired.
 
 **Ticket (wire, base32):** `WorkspaceTicket { workspace, name, host, host_nick,
 invite: Option<SignedInvite> }` — the topic is derived (`topic_for_workspace`), never

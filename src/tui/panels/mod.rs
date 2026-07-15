@@ -4,9 +4,12 @@
 
 pub mod activity;
 pub mod board;
+pub mod config_panel;
 pub mod doctor;
 pub mod help;
 pub mod inbox;
+pub mod log;
 pub mod members;
 pub mod peek;
+pub mod remotes;
 pub mod spaces;

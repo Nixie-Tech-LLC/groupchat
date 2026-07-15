@@ -1,8 +1,9 @@
-//! crossterm events → semantic [`Action`]s. Input-consuming layers (editor;
-//! later picker/palette) eat raw keys before the keymap; everything else
-//! resolves through the per-context binding tables. Mouse: Stage-1 basics
-//! (click to focus/select, wheel to scroll) over the render-time hit regions —
-//! the full model (double-click, tabs interactions) lands in Stage 4.
+//! crossterm events → semantic [`Action`]s. Input-consuming layers (editor,
+//! palette, picker, confirm, filter) eat raw keys before the keymap;
+//! everything else resolves through the per-context binding tables. Mouse
+//! lands on the render-time hit regions (overlays win): tabs, column headers,
+//! rows (double-click peeks), legend chips; the wheel scrolls the panel under
+//! the cursor.
 
 use anyhow::Result;
 use crossterm::event::{KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
@@ -47,6 +48,10 @@ pub async fn dispatch_key(app: &mut App, ev: KeyEvent) -> Result<()> {
             app.handle_filter_key(ev);
             return Ok(());
         }
+        Some(OverlayLayer::Invite { .. }) => {
+            app.stack.pop();
+            return Ok(());
+        }
         Some(OverlayLayer::Help) | None => {}
     }
     let ctx = app.focus();
@@ -79,6 +84,8 @@ pub fn underlying_ctx(app: &App) -> FocusKind {
         (Screen::Inbox, _) => FocusKind::Inbox,
         (Screen::Members, _) => FocusKind::Members,
         (Screen::Spaces, _) => FocusKind::Spaces,
+        (Screen::ConfigPanel, _) => FocusKind::Config,
+        (Screen::Remotes, _) => FocusKind::Remotes,
         _ => FocusKind::List,
     }
 }
@@ -116,8 +123,20 @@ pub async fn dispatch_mouse(app: &mut App, ev: MouseEvent) -> Result<()> {
                 Some(OverlayLayer::Editor(_)) | Some(OverlayLayer::Confirm(_)) => {
                     return Ok(());
                 }
+                Some(OverlayLayer::Invite { .. }) => {
+                    app.stack.pop();
+                    return Ok(());
+                }
                 _ => {}
             }
+            // Double-click detection (400ms, same target).
+            let now = std::time::Instant::now();
+            let double = matches!(
+                (app.last_click, target),
+                (Some((t, prev)), Some(cur))
+                    if prev == cur && now.duration_since(t).as_millis() <= 400
+            );
+            app.last_click = target.map(|t| (now, t));
             match target {
                 Some(HitTarget::ProjectTab(i)) => {
                     if i != app.project_idx && i < app.projects.len() {
@@ -130,12 +149,24 @@ pub async fn dispatch_mouse(app: &mut App, ev: MouseEvent) -> Result<()> {
                     app.col_idx = c;
                     app.clamp_selection();
                 }
+                Some(HitTarget::SavedTab(i)) => {
+                    // Click toggles: active tab clicked again = back to (all).
+                    let next = if app.active_tab == Some(i) {
+                        None
+                    } else {
+                        Some(i)
+                    };
+                    app.activate_tab(next).await?;
+                }
                 Some(HitTarget::BoardRow { col, row }) => {
                     app.col_idx = col;
                     app.row_idx = row;
                     app.clamp_selection();
                     if let Some(p) = &mut app.peek {
                         p.focused = false;
+                    }
+                    if double {
+                        Box::pin(app.apply(Action::OpenPeek)).await?;
                     }
                 }
                 Some(HitTarget::Peek) => {
@@ -150,6 +181,9 @@ pub async fn dispatch_mouse(app: &mut App, ev: MouseEvent) -> Result<()> {
                     } else {
                         let s = app.screen;
                         app.list_cursors.entry(s).or_default().sel = i;
+                        if double {
+                            Box::pin(app.apply(Action::OpenPeek)).await?;
+                        }
                     }
                 }
                 None => {}

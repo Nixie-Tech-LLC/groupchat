@@ -14,11 +14,13 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 
 use crate::cmdspec::Special;
-use crate::control::{request, BoardPos, CatalogScope, Doorbell, Request, Response};
+use crate::control::{
+    request, BoardPos, CatalogScope, Doorbell, Event as LogEvent, Filter, Request, Response,
+};
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
     ActivityEvent, BoardView, InboxEntry, IssueView, JoinRequestDto, MemberDto, Priority,
-    ProjectDto, Row,
+    ProjectDto, Row, SeedDto,
 };
 use crate::workspaces::{self, WorkspaceEntry};
 
@@ -69,6 +71,11 @@ pub enum OverlayLayer {
     Filter {
         prev: String,
     },
+    /// A minted invite: link + QR, dismissed by any key.
+    Invite {
+        link: String,
+        qr: Option<String>,
+    },
     Help,
 }
 
@@ -82,6 +89,7 @@ pub struct HitRegion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
     ProjectTab(usize),
+    SavedTab(usize),
     ColumnHeader(usize),
     BoardRow { col: usize, row: usize },
     Peek,
@@ -125,6 +133,29 @@ pub enum MemberItem {
     Member(MemberDto),
 }
 
+/// A saved view tab — persisted as JSON under the store-layer `tui.tabs` key.
+/// `filter` uses the daemon's List semantics (mine/status/label — never
+/// re-implemented client-side); `text` is the live client-side text filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedTab {
+    pub name: String,
+    #[serde(default)]
+    pub filter: Filter,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// One config-panel row (key + effective value + which layer supplied it).
+#[derive(Debug, Clone)]
+pub struct ConfigRow {
+    pub key: String,
+    pub value: String,
+    pub origin: &'static str,
+    pub help: &'static str,
+}
+
 /// Per-list cursor + scroll window for list-shaped screens.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ListCursor {
@@ -149,8 +180,18 @@ pub struct App {
     /// request lives in the daemon's event ring until it ages out.
     pub dismissed_requests: HashSet<String>,
     pub spaces: Vec<WorkspaceEntry>,
+    pub seeds: Vec<SeedDto>,
+    pub log_events: Vec<LogEvent>,
+    pub config_rows: Vec<ConfigRow>,
     pub diagnosis: Option<DiagnosisView>,
     pub peers_online: usize,
+    // ---- saved view tabs (store-layer `tui.tabs`) ----
+    pub tabs: Vec<SavedTab>,
+    pub active_tab: Option<usize>,
+    /// doc-ids matching the active tab's daemon-side filter (`Request::List`
+    /// intersection — Board takes no Filter; mine/label semantics stay server
+    /// truth). `None` = no active tab.
+    pub tab_docs: Option<HashSet<String>>,
     /// Set by a live space switch: the run loop re-subscribes to the (new)
     /// daemon after the current event is handled.
     pub needs_resubscribe: bool,
@@ -173,6 +214,8 @@ pub struct App {
     pub keymap: Keymap,
     pub regions: Vec<HitRegion>,
     pub status: StatusLine,
+    /// Last mouse-down (for double-click detection — 400ms window).
+    pub last_click: Option<(std::time::Instant, HitTarget)>,
     pub quit: bool,
 }
 
@@ -191,8 +234,14 @@ impl App {
             member_requests: Vec::new(),
             dismissed_requests: HashSet::new(),
             spaces: Vec::new(),
+            seeds: Vec::new(),
+            log_events: Vec::new(),
+            config_rows: Vec::new(),
             diagnosis: None,
             peers_online: 0,
+            tabs: Vec::new(),
+            active_tab: None,
+            tab_docs: None,
             needs_resubscribe: false,
             overlay: Overlay::default(),
             screen: Screen::Board,
@@ -208,6 +257,7 @@ impl App {
             keymap,
             regions: Vec::new(),
             status: StatusLine::default(),
+            last_click: None,
             quit: false,
         }
     }
@@ -229,6 +279,8 @@ impl App {
             (Screen::Inbox, _) => FocusKind::Inbox,
             (Screen::Members, _) => FocusKind::Members,
             (Screen::Spaces, _) => FocusKind::Spaces,
+            (Screen::ConfigPanel, _) => FocusKind::Config,
+            (Screen::Remotes, _) => FocusKind::Remotes,
             _ => FocusKind::List,
         }
     }
@@ -265,6 +317,12 @@ impl App {
     }
 
     pub fn row_matches_filter(&self, r: &Row) -> bool {
+        // Active saved tab: the daemon-side filter's doc-id set gates first.
+        if let Some(docs) = &self.tab_docs {
+            if !docs.contains(r.doc_id.as_str()) {
+                return false;
+            }
+        }
         if self.filter_text.is_empty() {
             return true;
         }
@@ -357,12 +415,44 @@ impl App {
         {
             Response::Board(b) => {
                 self.board = Some(*b);
+                self.refresh_tab_docs().await;
                 self.clamp_selection();
             }
             Response::Error { message, .. } => self.status.error(message),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Re-derive the active tab's doc-id set (board rows ∩ List results).
+    async fn refresh_tab_docs(&mut self) {
+        let Some(tab) = self.active_tab.and_then(|i| self.tabs.get(i)).cloned() else {
+            self.tab_docs = None;
+            return;
+        };
+        let project = self.current_project().map(|p| p.key.clone());
+        match self
+            .req(Request::List {
+                project,
+                filter: tab.filter.clone(),
+            })
+            .await
+        {
+            Ok(Response::List { rows }) => {
+                self.tab_docs = Some(
+                    rows.into_iter()
+                        .map(|r| r.doc_id.as_str().to_string())
+                        .collect(),
+                );
+            }
+            _ => {
+                // A failed fetch must not silently show everything under a
+                // named tab — drop back to no tab, loudly.
+                self.active_tab = None;
+                self.tab_docs = None;
+                self.status.error("tab filter fetch failed — tab cleared");
+            }
+        }
     }
 
     /// Re-fetch the peek's issue (its doc went dirty, or an edit landed).
@@ -470,10 +560,73 @@ impl App {
             Screen::Members => self.reload_members().await?,
             Screen::Spaces => self.reload_spaces(),
             Screen::Doctor => self.reload_diagnosis().await?,
-            // Stage-4 screens refresh once they hold data.
+            Screen::ConfigPanel => self.reload_config(),
+            Screen::Remotes => self.reload_seeds().await?,
+            Screen::Log => self.reload_log().await?,
+        }
+        Ok(())
+    }
+
+    pub async fn reload_seeds(&mut self) -> Result<()> {
+        match self.req(Request::SeedList).await? {
+            Response::Seeds { seeds } => self.seeds = seeds,
+            Response::Error { message, .. } => self.status.error(message),
             _ => {}
         }
         Ok(())
+    }
+
+    pub async fn reload_log(&mut self) -> Result<()> {
+        if let Response::Events { events, .. } = self.req(Request::Log { since: 0 }).await? {
+            self.log_events = events;
+        }
+        Ok(())
+    }
+
+    /// Effective settings, layered: every known key with value + origin, plus
+    /// any set open-prefix keys (`tui.key.*`) the static table can't list.
+    pub fn reload_config(&mut self) {
+        let settings = crate::config::Settings::load(Some(&self.home));
+        let mut rows: Vec<ConfigRow> = Vec::new();
+        for spec in crate::config::KEYS {
+            let (value, origin) = match (
+                settings.store.get(spec.name),
+                settings.global.get(spec.name),
+            ) {
+                (Some(v), _) => (v.to_string(), "store"),
+                (None, Some(v)) => (v.to_string(), "global"),
+                (None, None) => match (spec.built_in)() {
+                    Some(v) => (v, "default"),
+                    None => ("(unset)".to_string(), "default"),
+                },
+            };
+            rows.push(ConfigRow {
+                key: spec.name.to_string(),
+                value,
+                origin,
+                help: spec.help,
+            });
+        }
+        for (layer, origin) in [(&settings.store, "store"), (&settings.global, "global")] {
+            let mut extras: Vec<(String, String)> = layer
+                .0
+                .iter()
+                .filter(|(k, _)| k.starts_with("tui.key."))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            extras.sort();
+            for (k, v) in extras {
+                if !rows.iter().any(|r| r.key == k) {
+                    rows.push(ConfigRow {
+                        key: k,
+                        value: v,
+                        origin,
+                        help: "TUI keybinding override.",
+                    });
+                }
+            }
+        }
+        self.config_rows = rows;
     }
 
     /// Doorbell routing (U§4.2): every dirty scope refreshes exactly the
@@ -539,8 +692,11 @@ impl App {
         if db.presence_advanced {
             self.refresh_status_info().await;
             // Join requests are derived from presence announcements.
-            if self.screen == Screen::Members {
-                self.reload_members().await?;
+            match self.screen {
+                Screen::Members => self.reload_members().await?,
+                Screen::Remotes => self.reload_seeds().await?,
+                Screen::Log => self.reload_log().await?,
+                _ => {}
             }
         }
         Ok(())
@@ -605,6 +761,23 @@ impl App {
                         .filter(|r| !r.is_empty())
                     {
                         self.open_peek_for(&reff).await?;
+                    }
+                }
+                Screen::ConfigPanel => {
+                    let sel = self.cursor_of(Screen::ConfigPanel);
+                    if let Some(row) = self.config_rows.get(sel).cloned() {
+                        let initial = if row.value == "(unset)" {
+                            String::new()
+                        } else {
+                            row.value.clone()
+                        };
+                        self.push_editor(EditorState::new(
+                            EditorIntent::ConfigSet {
+                                key: row.key.clone(),
+                            },
+                            format!("{}  (empty unsets · store layer)", row.key),
+                            &initial,
+                        ));
                     }
                 }
                 _ => {}
@@ -726,6 +899,21 @@ impl App {
                 self.selection.clear();
             }
             ReorderUp | ReorderDown => self.reorder(action == ReorderDown).await?,
+            Delete if self.screen == Screen::Remotes => {
+                let sel = self.cursor_of(Screen::Remotes);
+                if let Some(s) = self.seeds.get(sel) {
+                    let label = if s.nick.is_empty() {
+                        s.id.chars().take(12).collect()
+                    } else {
+                        s.nick.clone()
+                    };
+                    self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                        title: "unpin seed".into(),
+                        body: format!("Unpin {label}? It stops being dialed on startup."),
+                        intent: ConfirmIntent::RemoveSeed { who: s.id.clone() },
+                    }));
+                }
+            }
             Delete => {
                 let targets = self.bulk_targets();
                 if !targets.is_empty() {
@@ -833,15 +1021,94 @@ impl App {
                     }));
                 }
             }
-            // Stage 4 actions — visible in help, honest about arrival.
-            PinFilterAsTab | TabNext | TabPrev | Cancel => {
-                self.status.info(format!(
-                    "'{}' lands later in this branch (stage 4)",
-                    action.id()
-                ));
+            PinFilterAsTab => {
+                if self.filter_text.is_empty() {
+                    self.status.info("nothing to pin — type a `/` filter first");
+                } else {
+                    self.push_editor(EditorState::new(
+                        EditorIntent::NameTab,
+                        "name this tab",
+                        &self.filter_text.clone(),
+                    ));
+                }
             }
+            TabNext | TabPrev => {
+                if self.tabs.is_empty() {
+                    self.status
+                        .info("no saved tabs — `/` filter then P pins one");
+                } else {
+                    // Cycle: none → 0 → 1 … → none (the plain board).
+                    let n = self.tabs.len();
+                    let next = match (self.active_tab, action == TabNext) {
+                        (None, true) => Some(0),
+                        (Some(i), true) if i + 1 < n => Some(i + 1),
+                        (Some(_), true) => None,
+                        (None, false) => Some(n - 1),
+                        (Some(0), false) => None,
+                        (Some(i), false) => Some(i - 1),
+                    };
+                    self.activate_tab(next).await?;
+                }
+            }
+            Cancel => {}
         }
         Ok(())
+    }
+
+    /// Switch the active saved tab (None = the plain board): apply its text
+    /// filter + project, then re-derive the doc-id gate.
+    pub async fn activate_tab(&mut self, idx: Option<usize>) -> Result<()> {
+        self.active_tab = idx;
+        match idx.and_then(|i| self.tabs.get(i)).cloned() {
+            Some(tab) => {
+                self.filter_text = tab.text.clone().unwrap_or_default();
+                if let Some(pk) = &tab.project {
+                    if let Some(i) = self
+                        .projects
+                        .iter()
+                        .position(|p| p.key.eq_ignore_ascii_case(pk))
+                    {
+                        self.project_idx = i;
+                    }
+                }
+                self.status.info(format!("tab: {}", tab.name));
+            }
+            None => {
+                self.filter_text.clear();
+                self.tab_docs = None;
+                self.status.info("tab: (all)");
+            }
+        }
+        self.reload_board().await?;
+        Ok(())
+    }
+
+    /// Parse the store-layer `tui.tabs` JSON into the tab list (bad JSON warns,
+    /// never gates).
+    pub fn load_tabs(&mut self, settings: &crate::config::Settings) {
+        self.tabs = match settings.get("tui.tabs") {
+            Some(json) => match serde_json::from_str::<Vec<SavedTab>>(json) {
+                Ok(tabs) => tabs,
+                Err(e) => {
+                    self.status.error(format!("tui.tabs: bad JSON ({e})"));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        self.active_tab = None;
+        self.tab_docs = None;
+    }
+
+    /// Persist the tab list to the store-layer config (atomic ConfigMap write).
+    fn save_tabs(&mut self) {
+        let json = serde_json::to_string(&self.tabs).unwrap_or_else(|_| "[]".into());
+        let path = crate::config::store_config_path(&self.home);
+        let mut cfg = crate::config::ConfigMap::load(&path);
+        cfg.set("tui.tabs", &json);
+        if let Err(e) = cfg.save(&path) {
+            self.status.error(format!("saving tabs failed: {e:#}"));
+        }
     }
 
     fn motion(&mut self, action: Action) {
@@ -1080,8 +1347,12 @@ impl App {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
         match crate::cmdspec::parse_to_dispatch(&argv_ref) {
             Ok(crate::cmdspec::ParsedCommand::Request(r)) => self.dispatch_request(r).await?,
-            Ok(crate::cmdspec::ParsedCommand::Special { which, name, .. }) => {
-                self.run_special(which, name, &argv_ref).await?;
+            Ok(crate::cmdspec::ParsedCommand::Special {
+                which,
+                name,
+                matches,
+            }) => {
+                self.run_special(which, name, &matches, &argv_ref).await?;
             }
             Err(e) => {
                 let first = e
@@ -1101,9 +1372,16 @@ impl App {
     }
 
     /// The palette's `Special` table (see cmdspec): work verbs run natively
-    /// (no git-branch step in the TUI), screens that exist route, everything
-    /// process-level is honestly CLI-only.
-    async fn run_special(&mut self, which: Special, name: &str, argv: &[&str]) -> Result<()> {
+    /// (no git-branch step in the TUI), spaces/config/invite/watch route to
+    /// their native surfaces, everything process-level is honestly CLI-only.
+    async fn run_special(
+        &mut self,
+        which: Special,
+        name: &str,
+        matches: &clap::ArgMatches,
+        argv: &[&str],
+    ) -> Result<()> {
+        let opt = |id: &str| matches.try_get_one::<String>(id).ok().flatten().cloned();
         match which {
             Special::Start | Special::Done | Special::Stop => {
                 // The optional positional ref is the first non-flag token
@@ -1128,21 +1406,67 @@ impl App {
             }
             Special::Id => self.dispatch_request(Request::Id).await?,
             Special::Tui => self.status.info("you're already here"),
-            Special::Invite => self
-                .status
-                .error("the invite panel lands in stage 4 — run `lait invite` in a shell"),
-            Special::Watch => self
-                .status
-                .error("the log screen lands in stage 4 — run `lait watch` in a shell"),
-            Special::Workspaces | Special::WorkspacesForget | Special::WorkspacesPrune => self
-                .status
-                .error("the spaces screen lands in stage 3 — run `lait spaces` in a shell"),
-            Special::ConfigGet
-            | Special::ConfigSet
-            | Special::ConfigUnset
-            | Special::ConfigList => self
-                .status
-                .error("the config panel lands in stage 4 — run `lait config` in a shell"),
+            Special::Invite => {
+                let require_approval = matches.get_flag("require_approval");
+                let reusable = matches.get_flag("reusable");
+                let ttl = opt("ttl_hours").and_then(|v| v.parse::<u64>().ok());
+                self.mint_invite_with(require_approval, reusable, ttl).await;
+            }
+            Special::Watch => {
+                self.screen = Screen::Log;
+                self.peek = None;
+                self.reload_log().await?;
+            }
+            Special::Workspaces => {
+                self.screen = Screen::Spaces;
+                self.peek = None;
+                self.reload_spaces();
+            }
+            Special::WorkspacesForget => {
+                let sel = opt("sel").unwrap_or_default();
+                self.screen = Screen::Spaces;
+                self.reload_spaces();
+                self.stack.push(OverlayLayer::Confirm(ConfirmState {
+                    title: "forget space".into(),
+                    body: format!(
+                        "Forget '{sel}'? The store stays on disk — only the registry entry goes."
+                    ),
+                    intent: ConfirmIntent::ForgetSpace { sel },
+                }));
+            }
+            Special::WorkspacesPrune => {
+                self.screen = Screen::Spaces;
+                self.reload_spaces();
+                self.apply(Action::SpacePrune).await?;
+            }
+            Special::ConfigList => {
+                self.screen = Screen::ConfigPanel;
+                self.peek = None;
+                self.reload_config();
+            }
+            Special::ConfigGet => {
+                let key = opt("key").unwrap_or_default();
+                let settings = crate::config::Settings::load(Some(&self.home));
+                match settings.get(&key) {
+                    Some(v) => self.status.info(format!("{key} = {v}")),
+                    None => match crate::config::key_spec(&key) {
+                        Ok(spec) => match (spec.built_in)() {
+                            Some(v) => self.status.info(format!("{key} = {v} (default)")),
+                            None => self.status.info(format!("'{key}' is unset")),
+                        },
+                        Err(e) => self.status.error(e.to_string()),
+                    },
+                }
+            }
+            Special::ConfigSet => {
+                let key = opt("key").unwrap_or_default();
+                let value = opt("value").unwrap_or_default();
+                self.config_set_store(key, Some(value)).await;
+            }
+            Special::ConfigUnset => {
+                let key = opt("key").unwrap_or_default();
+                self.config_set_store(key, None).await;
+            }
             _ => self
                 .status
                 .error(format!("`{name}` is CLI-only — run it in a shell")),
@@ -1555,6 +1879,15 @@ impl App {
                 }
                 Err(e) => self.status.error(format!("forget failed: {e:#}")),
             },
+            ConfirmIntent::RemoveSeed { who } => {
+                match self.req(Request::SeedRemove { who }).await? {
+                    Response::Error { message, .. } => self.status.error(message),
+                    _ => {
+                        self.status.info("seed unpinned");
+                        self.reload_seeds().await?;
+                    }
+                }
+            }
             ConfirmIntent::PruneSpaces => match workspaces::prune() {
                 Ok(removed) => {
                     self.status.info(format!(
@@ -1605,17 +1938,26 @@ impl App {
         self.members.iter().any(|m| m.me && m.role == "admin")
     }
 
-    /// Mint a fresh default invite (Pattern A: single-use, auto-admit, 7-day)
-    /// and copy the link — the TUI analogue of `lait invite` (QR in Stage 4).
+    /// Mint an invite (default = Pattern A: single-use, auto-admit, 7-day),
+    /// copy the link, and pop the QR overlay — the TUI `lait invite`.
     async fn mint_invite(&mut self) {
-        if !self.is_admin() {
+        self.mint_invite_with(false, false, None).await;
+    }
+
+    async fn mint_invite_with(
+        &mut self,
+        require_approval: bool,
+        reusable: bool,
+        ttl_hours: Option<u64>,
+    ) {
+        if !self.is_admin() && !self.members.is_empty() {
             self.status.error("inviting needs an admin key");
             return;
         }
         let req = Request::Invite {
-            require_approval: false,
-            reusable: false,
-            ttl_hours: None,
+            require_approval,
+            reusable,
+            ttl_hours,
         };
         match self.req(req).await {
             Ok(Response::Text { text }) => {
@@ -1624,13 +1966,14 @@ impl App {
                     .parse::<crate::proto::WorkspaceTicket>()
                     .map(|t| t.link())
                     .unwrap_or_else(|_| token.clone());
-                if crate::cli::copy_to_clipboard(&link) {
-                    self.status
-                        .info("invite link copied — single-use, auto-admit, expires in 7d");
+                let copied = crate::cli::copy_to_clipboard(&link);
+                let qr = crate::cli::render_qr(&link).ok();
+                self.stack.push(OverlayLayer::Invite { link, qr });
+                self.status.info(if copied {
+                    "invite link copied — any key closes"
                 } else {
-                    self.status
-                        .error("invite created, but clipboard copy failed — use `lait invite`");
-                }
+                    "invite minted (clipboard unavailable) — any key closes"
+                });
             }
             Ok(Response::Error { message, .. }) => {
                 self.status.error(format!("invite failed: {message}"))
@@ -1638,6 +1981,55 @@ impl App {
             Ok(_) => self.status.error("invite failed: unexpected response"),
             Err(e) => self.status.error(format!("invite failed: {e:#}")),
         }
+    }
+
+    /// Write (or, with `None`, unset) a key in the store-layer config file,
+    /// then make it real: ConfigReload for daemon-read keys, live theme /
+    /// keymap / tabs re-application for `tui.*` keys.
+    pub async fn config_set_store(&mut self, key: String, value: Option<String>) {
+        let spec = match crate::config::key_spec(&key) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status.error(e.to_string());
+                return;
+            }
+        };
+        let path = crate::config::store_config_path(&self.home);
+        let mut cfg = crate::config::ConfigMap::load(&path);
+        let message = match &value {
+            Some(v) => {
+                cfg.set(&key, v);
+                format!("{key} = {v}")
+            }
+            None => {
+                if !cfg.unset(&key) {
+                    self.status
+                        .error(format!("'{key}' was not set in the store layer"));
+                    return;
+                }
+                format!("unset {key}")
+            }
+        };
+        if let Err(e) = cfg.save(&path) {
+            self.status.error(format!("config write failed: {e:#}"));
+            return;
+        }
+        if spec.daemon_read {
+            let _ = self.req(Request::ConfigReload).await;
+        }
+        if key.starts_with("tui.") {
+            // Live re-application — a TUI setting must never wait for restart.
+            let settings = crate::config::Settings::load(Some(&self.home));
+            self.theme = Theme::load(&settings);
+            let mut km = Keymap::defaults();
+            for w in km.apply_overrides(&settings) {
+                self.status.error(w);
+            }
+            self.keymap = km;
+            self.load_tabs(&settings);
+        }
+        self.reload_config();
+        self.status.info(message);
     }
 
     pub fn selected_space(&self) -> Option<&WorkspaceEntry> {
@@ -1707,6 +2099,7 @@ impl App {
         for w in warnings {
             self.status.error(w);
         }
+        self.load_tabs(&settings);
         self.projects.clear();
         self.project_idx = 0;
         self.applied_default_project = false;
@@ -1811,8 +2204,31 @@ impl App {
     /// over from the old modal, plus quick-create through the CLI grammar).
     pub async fn submit_editor(&mut self, intent: EditorIntent, content: String) -> Result<()> {
         let content_trimmed = content.trim();
-        // Member intents complete here: they refresh the roster, not the board.
+        // Non-issue intents complete here (their refresh isn't the board).
         match &intent {
+            EditorIntent::NameTab => {
+                if content_trimmed.is_empty() {
+                    return Ok(());
+                }
+                let tab = SavedTab {
+                    name: content_trimmed.to_string(),
+                    filter: Filter::default(),
+                    text: Some(self.filter_text.clone()).filter(|t| !t.is_empty()),
+                    project: self.current_project().map(|p| p.key.clone()),
+                };
+                self.tabs.push(tab);
+                self.save_tabs();
+                let idx = self.tabs.len() - 1;
+                self.activate_tab(Some(idx)).await?;
+                self.status
+                    .info(format!("pinned '{content_trimmed}' — [ ] cycles tabs"));
+                return Ok(());
+            }
+            EditorIntent::ConfigSet { key } => {
+                let value = Some(content_trimmed.to_string()).filter(|v| !v.is_empty());
+                self.config_set_store(key.clone(), value).await;
+                return Ok(());
+            }
             EditorIntent::ApproveMember { key } => {
                 let as_name = Some(content_trimmed.to_string()).filter(|s| !s.is_empty());
                 let req = Request::MemberApprove {
@@ -1926,9 +2342,11 @@ impl App {
                     body: content.trim_end().to_string(),
                 }
             }
-            EditorIntent::NameTab => return Ok(()), // Stage 4
-            // Handled above (roster refresh path).
-            EditorIntent::ApproveMember { .. } | EditorIntent::RenameMember { .. } => return Ok(()),
+            // Handled in the pre-pass above (non-issue paths).
+            EditorIntent::NameTab
+            | EditorIntent::ConfigSet { .. }
+            | EditorIntent::ApproveMember { .. }
+            | EditorIntent::RenameMember { .. } => return Ok(()),
         };
         match self.req(req).await? {
             Response::Ref { reff } => {

@@ -24,6 +24,10 @@ pub enum ConfirmIntent {
     },
     /// Drop every registry entry whose store is gone (`workspaces::prune`).
     PruneSpaces,
+    /// Unpin an always-on seed peer.
+    RemoveSeed {
+        who: String,
+    },
 }
 
 pub struct ConfirmState {

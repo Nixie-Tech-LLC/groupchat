@@ -106,6 +106,7 @@ pub async fn run(home: &Path) -> Result<()> {
     for w in warnings {
         app.status.error(w);
     }
+    app.load_tabs(&settings);
     app.reload_projects().await?;
     app.reload_board().await?;
     app.refresh_inbox_count().await;
@@ -216,10 +217,56 @@ fn draw(f: &mut Frame, app: &mut App) {
             OverlayLayer::Palette(p) => p.draw(f, app, body),
             OverlayLayer::Picker(p) => p.draw(f, app, body),
             OverlayLayer::Confirm(c) => c.draw(f, app, body),
+            OverlayLayer::Invite { link, qr } => draw_invite(f, app, body, link, qr.as_deref()),
             OverlayLayer::Filter { .. } => {} // rendered by the status bar
         }
     }
     app.stack = stack;
+}
+
+/// The minted-invite overlay: QR (when it fits) + the link, any key closes.
+fn draw_invite(f: &mut Frame, app: &App, area: Rect, link: &str, qr: Option<&str>) {
+    let qr_lines: Vec<&str> = qr.map(|q| q.lines().collect()).unwrap_or_default();
+    let qr_h = qr_lines.len() as u16;
+    let qr_fits = qr_h > 0 && qr_h + 5 <= area.height && area.width >= 60;
+    let body_h = if qr_fits { qr_h + 5 } else { 6 };
+    let w = area.width.saturating_sub(6).clamp(40, 100);
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + 1,
+        width: w,
+        height: body_h.min(area.height),
+    };
+    f.render_widget(ratatui::widgets::Clear, rect);
+    let mut lines: Vec<Line> = Vec::new();
+    if qr_fits {
+        for l in &qr_lines {
+            lines.push(Line::raw((*l).to_string()));
+        }
+    } else if qr.is_some() {
+        lines.push(Line::styled(
+            "(terminal too small for the QR — the link is on your clipboard)",
+            app.theme.dim_style(),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(link.to_string(), app.theme.accent_style()));
+    lines.push(Line::styled(
+        "single command for them: lait join <link>",
+        app.theme.dim_style(),
+    ));
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(app.theme.border(true))
+        .title(" invite — link copied ")
+        .title_bottom(" any key closes ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .alignment(ratatui::layout::Alignment::Center),
+        rect,
+    );
 }
 
 fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
@@ -259,6 +306,38 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
             target: HitTarget::ProjectTab(i),
         });
         rx += w;
+    }
+    // Saved view tabs after the project tabs (chips; click toggles).
+    if !app.tabs.is_empty() {
+        spans.push(Span::styled(" │", app.theme.dim_style()));
+        rx += 2;
+        let names: Vec<(usize, String, bool)> = app
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, format!(" {} ", t.name), app.active_tab == Some(i)))
+            .collect();
+        for (i, label, active) in names {
+            let w = label.chars().count() as u16;
+            app.regions.push(HitRegion {
+                rect: Rect {
+                    x: rx,
+                    y: area.y,
+                    width: w,
+                    height: 1,
+                },
+                target: HitTarget::SavedTab(i),
+            });
+            let style = if active {
+                ratatui::style::Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                app.theme.dim_style()
+            };
+            spans.push(Span::styled(label, style));
+            rx += w;
+        }
     }
     let _ = x;
     // Right side: screen name, sync, inbox badge.
@@ -333,17 +412,9 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         Screen::Members => panels::members::draw(f, app, area),
         Screen::Spaces => panels::spaces::draw(f, app, area),
         Screen::Doctor => panels::doctor::draw(f, app, area),
-        s => {
-            // Stage-4 screens: honest stubs, never dead-ends.
-            let name = format!("{s:?}").to_lowercase();
-            f.render_widget(
-                Paragraph::new(format!(
-                    "({name} arrives later on this branch — esc returns to the board)"
-                ))
-                .style(app.theme.dim_style()),
-                area,
-            );
-        }
+        Screen::ConfigPanel => panels::config_panel::draw(f, app, area),
+        Screen::Remotes => panels::remotes::draw(f, app, area),
+        Screen::Log => panels::log::draw(f, app, area),
     }
 }
 
@@ -771,6 +842,132 @@ mod tests {
         assert!(out.contains("ENG"), "project brief chips");
         assert!(out.contains("✗"), "missing-store marker");
         assert!(out.contains("switch"), "switch binding in the legend");
+    }
+
+    #[test]
+    fn saved_tab_json_roundtrips_and_gates_the_board() {
+        let tab = app::SavedTab {
+            name: "mine".into(),
+            filter: crate::control::Filter {
+                mine: true,
+                ..Default::default()
+            },
+            text: Some("race".into()),
+            project: Some("DEMO".into()),
+        };
+        let json = serde_json::to_string(&vec![tab.clone()]).unwrap();
+        let back: Vec<app::SavedTab> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, vec![tab]);
+
+        // The doc-id gate hides rows outside the tab's List result.
+        let mut app = fixture();
+        let keep = app.board.as_ref().unwrap().columns[1].rows[0]
+            .doc_id
+            .as_str()
+            .to_string();
+        app.tab_docs = Some([keep].into_iter().collect());
+        let out = rendered(&mut app);
+        assert!(out.contains("flaky reconnect"), "gated-in row renders");
+        assert!(!out.contains("fix login race"), "gated-out row hidden");
+        assert!(out.contains("Backlog (0)"), "counts reflect the gate");
+    }
+
+    #[test]
+    fn header_renders_saved_tab_chips() {
+        let mut app = fixture();
+        app.tabs = vec![
+            app::SavedTab {
+                name: "mine".into(),
+                ..Default::default()
+            },
+            app::SavedTab {
+                name: "urgent".into(),
+                ..Default::default()
+            },
+        ];
+        app.active_tab = Some(1);
+        let out = rendered(&mut app);
+        assert!(out.contains(" mine "));
+        assert!(out.contains(" urgent "));
+    }
+
+    #[test]
+    fn config_panel_lists_keys_with_origin() {
+        let mut app = fixture();
+        app.screen = Screen::ConfigPanel;
+        app.config_rows = vec![
+            app::ConfigRow {
+                key: "tui.theme".into(),
+                value: "dark".into(),
+                origin: "default",
+                help: "TUI color theme.",
+            },
+            app::ConfigRow {
+                key: "user.nick".into(),
+                value: "mira".into(),
+                origin: "store",
+                help: "Display nick.",
+            },
+        ];
+        let out = rendered(&mut app);
+        assert!(out.contains("tui.theme"));
+        assert!(out.contains("(default"));
+        assert!(out.contains("(store"));
+        assert!(out.contains("enter edits the store layer"));
+    }
+
+    #[test]
+    fn remotes_and_log_screens_render() {
+        let mut app = fixture();
+        app.screen = Screen::Remotes;
+        app.seeds = vec![crate::dto::SeedDto {
+            id: "ab".repeat(32),
+            nick: "nas".into(),
+            workspace: "ws_x".into(),
+            state: "online".into(),
+            online: true,
+        }];
+        let out = rendered(&mut app);
+        assert!(out.contains("nas"));
+        assert!(out.contains("pinned seed peers"));
+        assert!(out.contains("unpin"), "remove binding in the legend");
+
+        app.screen = Screen::Log;
+        app.log_events = vec![crate::control::Event {
+            seq: 1,
+            kind: crate::control::EventKind::Join,
+            id: "cd".repeat(32),
+            nick: "alice".into(),
+            text: "announced a join".into(),
+            ts: 0,
+        }];
+        let out = rendered(&mut app);
+        assert!(out.contains("alice"));
+        assert!(out.contains("announced a join"));
+    }
+
+    #[test]
+    fn invite_overlay_shows_link_and_closes_on_any_key() {
+        let mut app = fixture();
+        app.stack.push(OverlayLayer::Invite {
+            link: "lait://join/abc123".into(),
+            qr: None,
+        });
+        let out = rendered(&mut app);
+        assert!(out.contains("lait://join/abc123"));
+        assert!(out.contains("any key closes"));
+        futures_lite_block_on(async {
+            event::dispatch_key(
+                &mut app,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('x'),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        assert!(app.stack.is_empty(), "any key pops the invite overlay");
     }
 
     #[test]

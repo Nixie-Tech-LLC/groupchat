@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — the rich TUI (full CLI parity)
+
+`lait tui` grows from proof-of-concept to a full client. Board-centric with a
+co-visible right-side issue peek; every CLI verb is reachable inside it.
+
+- **Board + peek.** Workflow columns with two-line cards, colors from the
+  workflow/project/label registries, an optimistic overlay (`▲`), and a peek
+  panel with description, comments, and the derived history timeline (⚠ marks
+  LWW collisions). `S`/`D`/`O` run start/done/stop; `H`/`L` move status;
+  `J`/`K` reorder (`IssueMove`, optimistic).
+- **One grammar, two entry points.** The `:` palette parses through the same
+  clap tree as the shell, with fuzzy verb completion; `start`/`config`/
+  `spaces`/`invite`/`watch` map to native TUI surfaces, process-level commands
+  say "CLI-only" honestly. Ambiguous refs open a disambiguation picker that
+  retries with the chosen candidate.
+- **In-TUI editors** (tui-textarea): quick-create parses inline `-p/-a/-P/-l`
+  tokens with `new`'s grammar; multi-line description/comment (`Ctrl+S`
+  saves); a parse error reopens the editor with the line intact.
+- **Pickers + multi-select.** Assign/label pickers pre-check current state and
+  submit the diff; `x` marks issues and every verb goes bulk (one request per
+  issue, `7 ok · 1 failed` tally).
+- **Screens.** Inbox (unread watermark, `C` clears), Activity, Members (the
+  inline picker's domain: key-first approve, rename, remove, invite w/ QR
+  overlay), Spaces (live, commit-last space switch), Config (edit any key;
+  `tui.*` changes apply live), Remotes, Log.
+- **Filter + saved tabs.** `/` live filter; `P` pins it as a named tab
+  (store-layer `tui.tabs`), `[`/`]` cycle; daemon-side tab filters apply by
+  doc-id intersection with `List` — mine/label semantics stay server truth.
+- **Mouse, themes, rebinding.** Clickable tabs/rows/legend, double-click
+  peeks, wheel scrolls the panel under the cursor. `tui.theme = dark|light|
+  auto`; `tui.key.<action-id>` rebinds any action (bad overrides warn, never
+  gate). Panic-safe terminal restore (RAII + hook).
+
 ## Unreleased — the daily-loop DX pass (spaces, start/done/stop, inbox)
 
 Shaped by a blind design exercise (Linear-style and Jira-style teams designing
