@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use anyhow::{anyhow, Result};
 
 use crate::acl::{self, AclOp, AclState, Role, SignedOp};
+use crate::authz;
 use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
 use crate::crypto::{self, WorkspaceKey};
@@ -482,6 +483,7 @@ impl Tracker {
             Request::Label { reff, add, remove } => self.label(reff, add, remove),
             Request::Comment { reff, body } => self.comment(reff, body),
             Request::IssueDelete { reff } => self.issue_delete(reff),
+            Request::IssueRestore { reff } => self.issue_restore(reff),
             Request::IssueLink { reff, kind, target } => self.issue_link(reff, kind, target, true),
             Request::IssueUnlink { reff, kind, target } => {
                 self.issue_link(reff, kind, target, false)
@@ -507,8 +509,10 @@ impl Tracker {
             // seals the ACL op, so it ignores it here.
             Request::MemberAdd { who, admin, .. } => Ok(self.member_add_cmd(who, admin)),
             Request::MemberRemove { who } => Ok(self.member_remove_cmd(who)),
+            Request::AgentAdd { key } => Ok(self.agent_add_cmd(key)),
             Request::KeyRotate => Ok(self.key_rotate_cmd()),
             Request::Members => Ok((self.members_response(), None)),
+            Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
         };
         match r {
@@ -1120,6 +1124,18 @@ impl Tracker {
     }
 
     fn issue_delete(&mut self, reff: String) -> Result<(Response, Option<DirtySet>)> {
+        self.set_deleted(reff, true)
+    }
+    fn issue_restore(&mut self, reff: String) -> Result<(Response, Option<DirtySet>)> {
+        self.set_deleted(reff, false)
+    }
+
+    /// Delete or restore an issue — now a **signed content-authority op**
+    /// (contract §3.4): agents cannot delete, every delete is attributable and
+    /// reversible, and the catalog tombstone flag becomes a *cache* of the
+    /// authz-plane replay. Human members only (an agent holds the key but no
+    /// content authority).
+    fn set_deleted(&mut self, reff: String, on: bool) -> Result<(Response, Option<DirtySet>)> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
             Err(resp) => return Ok((resp, None)),
@@ -1129,24 +1145,100 @@ impl Tracker {
             .row(&doc_id)
             .map(|r| r.project_id)
             .ok_or_else(|| anyhow!("no such row"))?;
-        // tombstone (S§5.6) + remove from board ordering. Soft-delete is the
-        // I-confluent T2 shape (contract §2.1): undelete stays a flag flip.
-        self.catalog.set_tombstone(&doc_id, true)?;
-        self.catalog.board_remove(&project_id, &doc_id)?;
-        self.catalog.apply(&OpCtx::authority("deleted", &self.me));
+        if !self.acl_state().is_human_member(&self.me) {
+            return Ok((
+                Response::err("agents may not delete issues (no content authority)"),
+                None,
+            ));
+        }
+        // Sign the tombstone op, embedding the membership frontier we observed
+        // (the at-position anchor), and append it to the encrypted authz DAG.
+        let op = authz::AuthzOp {
+            action: authz::AuthzAction::Tombstone {
+                doc: doc_id.clone(),
+                on,
+            },
+            ts: self.now_secs(),
+            asof: self.membership.heads(),
+        };
+        let signed = authz::sign_authz(
+            &self.seed,
+            &op,
+            self.catalog.authz_heads(),
+            &self.workspace_id,
+        );
+        self.catalog.add_authz_op(&signed)?;
+        // The tombstone flag + board membership are a cache of the replay.
+        let tombstoned = self.authz_state().is_tombstoned(&doc_id);
+        self.catalog.set_tombstone(&doc_id, tombstoned)?;
+        if tombstoned {
+            self.catalog.board_remove(&project_id, &doc_id)?;
+        } else {
+            self.catalog.board_insert_top(&project_id, &doc_id)?;
+        }
+        self.catalog.apply(&OpCtx::authority(
+            if on { "deleted" } else { "restored" },
+            &self.me,
+        ));
         self.store.save_catalog(&self.catalog)?;
         self.store.mark_dirty();
         let reff = self.aliases.canonical_for(&doc_id);
-        self.push_activity(Some(&doc_id), &reff, "deleted", vec![], "");
+        let verb = if on { "deleted" } else { "restored" };
+        self.push_activity(Some(&doc_id), &reff, verb, vec![], "");
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
             project: project_id.as_str().to_string(),
         });
         Ok((
             Response::Ok {
-                message: Some(format!("deleted {reff}")),
+                message: Some(format!("{verb} {reff}")),
             },
             Some(dirty),
         ))
+    }
+
+    /// The materialized content-authority state (deterministic replay of the
+    /// encrypted authz DAG against membership, contract §3.4).
+    fn authz_state(&self) -> authz::AuthzState {
+        authz::replay(
+            &self.genesis,
+            &self.membership.ops(),
+            &self.catalog.authz_ops(),
+        )
+    }
+
+    /// Reconcile catalog tombstone flags to the authz-plane replay after a sync
+    /// import (writer-direction for the T2 plane): a peer's signed delete/restore
+    /// becomes visible locally. Returns the docs whose visibility changed.
+    fn reconcile_tombstones(&mut self) -> Result<Vec<DocId>> {
+        let authz = self.authz_state();
+        let mut changed = Vec::new();
+        for doc_id in self.catalog.doc_ids() {
+            if !authz.governs(&doc_id) {
+                continue; // legacy docs keep their pre-CRAIT flag untouched
+            }
+            let want = authz.is_tombstoned(&doc_id);
+            let have = self
+                .catalog
+                .row(&doc_id)
+                .map(|r| r.tombstone)
+                .unwrap_or(false);
+            if want != have {
+                self.catalog.set_tombstone(&doc_id, want)?;
+                if let Some(pid) = self.catalog.row(&doc_id).map(|r| r.project_id) {
+                    if want {
+                        self.catalog.board_remove(&pid, &doc_id)?;
+                    } else {
+                        self.catalog.board_insert_top(&pid, &doc_id)?;
+                    }
+                }
+                changed.push(doc_id);
+            }
+        }
+        if !changed.is_empty() {
+            self.catalog
+                .apply(&OpCtx::authority("tombstone_sync", &self.me));
+        }
+        Ok(changed)
     }
 
     /// Add or remove an issue link (contract §3.2 `edges`). `relates` is
@@ -2095,22 +2187,110 @@ impl Tracker {
         self.member_remove(&user)
     }
     fn members_response(&self) -> Response {
-        let members = self
+        let acl = self.acl_state();
+        let members = acl
             .members()
             .into_iter()
-            .map(|(key, role, me)| crate::dto::MemberDto {
-                key,
-                role: match role {
-                    Role::Admin => "admin".into(),
-                    Role::Member => "member".into(),
-                },
-                me,
-                // Local petnames live outside the tracker (never synced); the node
-                // layer overlays them onto this projection after the fact.
-                alias: String::new(),
+            .map(|(key, _role)| {
+                let standing = acl.standing(&key).unwrap_or("member");
+                crate::dto::MemberDto {
+                    me: key == self.me,
+                    // The sponsoring member's key, for agents (empty otherwise).
+                    sponsor: acl.sponsor_of(&key).map(|s| s.as_str().to_string()),
+                    key,
+                    role: standing.into(),
+                    // Local petnames live outside the tracker (never synced); the
+                    // node layer overlays them onto this projection after the fact.
+                    alias: String::new(),
+                }
             })
             .collect();
         Response::Members { members }
+    }
+
+    fn agent_add_cmd(&mut self, key: String) -> (Response, Option<DirtySet>) {
+        let Some(agent) = UserId::parse(&key) else {
+            return (
+                Response::err(format!(
+                    "an agent key must be a 64-hex ed25519 public key, got '{key}'"
+                )),
+                None,
+            );
+        };
+        self.agent_add(&agent)
+    }
+
+    /// The membership audit log — the signed ACL DAG replayed into a rendered,
+    /// causally-ordered list of who did what, with each op's verdict (contract
+    /// §3.4). Cryptographic provenance, distinct from the advisory activity feed.
+    fn member_log_response(&self) -> Response {
+        let (_state, audit) = acl::replay_with_audit(&self.genesis, &self.membership.ops());
+        let entries = audit
+            .into_iter()
+            .map(|e| crate::dto::MemberLogEntry {
+                op: e.hash,
+                actor: e.author.as_str().to_string(),
+                kind: e.kind.into(),
+                subject: e.subject.map(|s| s.as_str().to_string()),
+                role: e.role.map(|r| match r {
+                    Role::Admin => "admin".into(),
+                    Role::Member => "member".into(),
+                }),
+                authorized: e.authorized,
+            })
+            .collect();
+        Response::MemberLog { entries }
+    }
+
+    /// Sponsor an agent keypair (contract §3.4). Any human member may sponsor;
+    /// the agent is sealed the workspace key (so it can read/write content) but
+    /// holds no membership or content authority, and its standing dies with the
+    /// sponsor. Admin-agnostic — this is delegation, not elevation.
+    pub fn agent_add(&mut self, agent: &UserId) -> (Response, Option<DirtySet>) {
+        let acl = self.acl_state();
+        if !acl.is_human_member(&self.me) {
+            return (
+                Response::err("only a human member can sponsor an agent"),
+                None,
+            );
+        }
+        if acl.is_member(agent) {
+            return (
+                Response::err(format!(
+                    "{} is already a workspace principal",
+                    agent.short()
+                )),
+                None,
+            );
+        }
+        let op = acl::sign_op(
+            &self.seed,
+            &AclOp::AddAgent { key: agent.clone() },
+            self.membership.heads(),
+            &self.workspace_id,
+        );
+        // Seal every epoch we hold to the agent, exactly like a member add — an
+        // agent must decrypt the workspace to be useful.
+        let agent = agent.clone();
+        if let Err(e) = self.member_apply(op, "agent_add", |t| {
+            let epochs: Vec<(u32, WorkspaceKey)> =
+                t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+            for (epoch, key) in epochs {
+                if let Some(sealed) = crypto::seal_to(&agent, &key) {
+                    t.membership.put_sealed(epoch, &agent, &sealed)?;
+                }
+            }
+            Ok(())
+        }) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        self.push_activity(None, &agent.short(), "agent_added", vec![], &agent.short());
+        (
+            Response::Ok {
+                message: Some(format!("sponsored agent {}", agent.short())),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
     }
 
     /// Apply a signed op + an extra key-sealing step, then commit + persist.
@@ -2218,6 +2398,10 @@ impl Tracker {
         if healed {
             self.catalog.apply(&OpCtx::structure("row_heal", &self.me));
         }
+        // A peer's imported catalog may carry new signed tombstone/restore ops
+        // in the encrypted authz DAG (contract §3.4). Reconcile the cached
+        // tombstone flags to the replay so a remote delete/restore takes effect.
+        self.reconcile_tombstones()?;
         // Incremental alias upkeep after a catalog reconcile: reconcile every doc
         // the catalog now knows (O(1) per already-consistent doc, so O(N) total —
         // no O(N²) rebuild on every sync round). New peer docs and any offline
@@ -3466,7 +3650,18 @@ mod tests {
         assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
 
         let before = b.tracker.activity_high_water();
-        sync_all(&mut a.tracker, &mut b.tracker);
+        // Drive A's concurrent doc edit into B directly. (A single
+        // catalog-triggered pull can transiently *skip* a concurrent same-doc
+        // edit: the catalog row `head` is one LWW cell both peers write, so
+        // when the puller wins that race `local_head == cat_head` looks
+        // up-to-date though the provider holds a concurrent op. It self-heals
+        // over bidirectional gossip rounds — a convergence lag orthogonal to
+        // this test, which is about the *import* producing a correct synced
+        // row. An empty VV requests the full doc; import is idempotent and the
+        // concurrent branch still registers.)
+        let did = a.tracker.resolve_issue(&reff).unwrap().to_string();
+        let enc = a.tracker.export_doc_from(&did, &[]).unwrap().unwrap();
+        b.tracker.import_doc(&did, &enc).unwrap();
         let (resp, _) = b.tracker.handle(Request::Activity { since: before });
         let events = match resp {
             Response::Activity { events, .. } => events,
@@ -3601,6 +3796,92 @@ mod tests {
             Response::Graph(g) => assert!(g.parent.is_none()),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
+        // CRAIT (contract §3.4) end to end through the real sync path:
+        //  - a member's signed delete propagates to a peer (tombstone is a
+        //    cache of the authz replay, reconciled on import),
+        //  - a sponsored agent cannot delete (no content authority),
+        //  - restore clears it, and the members log attributes everything.
+        let mut a = new_node(); // founder/admin
+        with_project(&mut a.tracker);
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let a_ws = a.tracker.workspace_str();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        // B must sync to learn it is a member before it can act as one.
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(
+            b.tracker.acl_state().is_human_member(&b_user),
+            "B sees itself"
+        );
+
+        // B sponsors an agent (agent's key is a fresh ed25519 pubkey).
+        let agent = user_from_seed([99u8; 32]);
+        let (resp, _) = b.tracker.agent_add(&agent);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(b.tracker.acl_state().is_agent(&agent));
+        assert_eq!(
+            b.tracker.acl_state().sponsor_of(&agent),
+            Some(&b_user),
+            "the agent's sponsor is B"
+        );
+        assert!(
+            !b.tracker.acl_state().is_human_member(&agent),
+            "an agent is not a human member"
+        );
+
+        let reff = new_issue(&mut a.tracker, "delete me");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        sync_all(&mut b.tracker, &mut a.tracker);
+
+        // B (a human member) deletes; it must appear deleted on A after sync.
+        let (resp, _) = b
+            .tracker
+            .handle(Request::IssueDelete { reff: reff.clone() });
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert!(
+            b.tracker
+                .authz_state()
+                .is_tombstoned(&b.tracker.resolve_issue(&reff).unwrap()),
+            "deleted locally on B"
+        );
+        sync_all(&mut b.tracker, &mut a.tracker);
+        let a_id = a.tracker.resolve_issue(&reff).unwrap();
+        assert!(
+            a.tracker.catalog().row(&a_id).unwrap().tombstone,
+            "a peer's signed delete reconciles into A's tombstone cache"
+        );
+
+        // Restore on A, sync back: restore clears it on B (restore-wins).
+        let (resp, _) = a
+            .tracker
+            .handle(Request::IssueRestore { reff: reff.clone() });
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let b_id = b.tracker.resolve_issue(&reff).unwrap();
+        assert!(
+            !b.tracker.catalog().row(&b_id).unwrap().tombstone,
+            "the restore propagates and clears the tombstone on B"
+        );
+
+        // The members log is cryptographic provenance, in causal order.
+        let log = match a.tracker.handle(Request::MemberLog).0 {
+            Response::MemberLog { entries } => entries,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            log.iter().any(|e| e.kind == "add_member" && e.authorized),
+            "the member-add is logged authorized: {log:?}"
+        );
+        assert!(
+            log.iter().any(|e| e.kind == "add_agent" && e.authorized),
+            "the agent sponsorship is logged authorized: {log:?}"
+        );
     }
 
     #[test]

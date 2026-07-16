@@ -23,6 +23,7 @@
 
 pub mod acl;
 pub mod app;
+pub mod authz;
 pub mod cli;
 pub mod cmdspec;
 pub mod config;
@@ -44,6 +45,7 @@ pub mod presence;
 pub mod proto;
 pub mod registry;
 pub mod serve;
+pub mod sigdag;
 pub mod store;
 pub mod sync;
 pub mod tracker;

@@ -1,23 +1,44 @@
 //! Membership / ACL — a signed ed25519 op-graph validated by deterministic
-//! replay (S§6, A§11). The ops ride in the plaintext membership layer
+//! replay (S§6, A§11), riding the shared hash-DAG envelope ([`crate::sigdag`],
+//! domain `lait/aclop/1`). The ops ride in the plaintext membership layer
 //! ([`crate::membership`]) and propagate as a grow-only set; **trust is computed
-//! by app-layer replay**, never by Loro. Roles are `admin`/`member`; revocation
-//! is **remove-wins**.
+//! by app-layer replay**, never by Loro. Revocation is **remove-wins**.
 //!
-//! Authority: an op is honored only if its author is an admin as of the op's
-//! causal history. Sequential admin actions (the common path) validate exactly;
-//! the remove-wins membership resolution uses the causal ancestor closure so a
-//! concurrent add cannot override a remove.
+//! Principals (LAIT-DATA-CONTRACT §3.4):
+//! - `admin` — may author every membership op.
+//! - `member` — a human collaborator; may sponsor agents and remove their own.
+//! - **agent** — an AI keypair sponsored by a member (`AddAgent`, sponsor = the
+//!   op's author). An agent is a member for *encryption* purposes (it is sealed
+//!   the workspace key) but may author **no** membership op, and its membership
+//!   dies with its sponsor — removing the human transitively ends every agent
+//!   they sponsored. No re-delegation: agents cannot sponsor agents.
+//!
+//! Authority: an op is honored only if its author holds the required standing
+//! as of the op's causal history. Sequential actions (the common path) validate
+//! exactly; concurrency resolves by deterministic topo tie-break, with the
+//! remove-wins override over the causal ancestor closure so a concurrent add
+//! cannot override a remove.
+//!
+//! Forward compatibility: a signature-valid op whose bytes this build cannot
+//! decode is kept as an **opaque DAG node** — present for ancestry, no effect
+//! on state — so future op kinds cannot diverge two replicas' ancestor
+//! closures (which would diverge membership, and therefore key-sealing).
 //!
 //! > **Research-grade** (A§2): a proven design implemented by hand, unaudited.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{UserId, WorkspaceId};
+use crate::sigdag::{self, SignedNode};
 use crate::store::Genesis;
+
+/// The signing domain for membership ops (see [`crate::sigdag`]).
+pub const ACL_DOMAIN: &[u8] = b"lait/aclop/1";
+
+/// A signed membership op — the shared envelope under this plane's domain.
+pub type SignedOp = SignedNode;
 
 /// A member role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -28,11 +49,25 @@ pub enum Role {
 }
 
 /// A membership operation (S§6). Canonically encoded (postcard) and signed.
+/// Variants are **append-only** (postcard discriminants are positional).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AclOp {
-    AddMember { key: UserId, role: Role },
-    RemoveMember { key: UserId },
-    SetRole { key: UserId, role: Role },
+    AddMember {
+        key: UserId,
+        role: Role,
+    },
+    RemoveMember {
+        key: UserId,
+    },
+    SetRole {
+        key: UserId,
+        role: Role,
+    },
+    /// Sponsor an agent keypair (contract §3.4). The sponsor is the op's
+    /// **author**; the agent's membership is derived, and dies, with them.
+    AddAgent {
+        key: UserId,
+    },
 }
 
 impl AclOp {
@@ -40,7 +75,8 @@ impl AclOp {
         match self {
             AclOp::AddMember { key, .. }
             | AclOp::RemoveMember { key }
-            | AclOp::SetRole { key, .. } => key,
+            | AclOp::SetRole { key, .. }
+            | AclOp::AddAgent { key } => key,
         }
     }
     fn encode(&self) -> Vec<u8> {
@@ -48,116 +84,78 @@ impl AclOp {
     }
 }
 
-/// A signed op with its causal parents (S§6). `op` is the canonical `AclOp`
-/// bytes; `sig` is ed25519 by `author` over a payload that binds the op bytes,
-/// the author, the (sorted) `parents`, **and** the workspace id — so a valid
-/// signature cannot be re-parented (which would defeat remove-wins revocation)
-/// or replayed into another workspace. `parents` are op hashes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SignedOp {
-    pub op: Vec<u8>,
-    pub author: UserId,
-    pub sig: Vec<u8>,
-    pub parents: Vec<String>,
-}
-
-/// The canonical bytes an op's signature covers: domain ‖ op ‖ author ‖
-/// sorted(parents) ‖ workspaceId. Binding `parents` closes the revocation
-/// bypass (a re-parented copy of a valid op no longer verifies); binding the
-/// workspace id prevents cross-workspace op replay. `workspace_id` is supplied
-/// by context (the signer's / genesis's workspace) and is not transmitted in
-/// `SignedOp`, so this does not change the op's wire shape.
-fn signing_payload(op: &[u8], author: &UserId, parents: &[String], workspace_id: &str) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(b"lait/aclop/1");
-    h.update(op);
-    h.update(author.as_str().as_bytes());
-    let mut ps = parents.to_vec();
-    ps.sort();
-    for p in &ps {
-        h.update(p.as_bytes());
-    }
-    h.update(workspace_id.as_bytes());
-    *h.finalize().as_bytes()
-}
-
-impl SignedOp {
-    /// The content-address of this op (its hash-DAG node id).
-    pub fn hash(&self) -> String {
-        let mut h = blake3::Hasher::new();
-        h.update(&self.op);
-        h.update(self.author.as_str().as_bytes());
-        let mut ps = self.parents.clone();
-        ps.sort();
-        for p in ps {
-            h.update(p.as_bytes());
-        }
-        h.finalize().to_hex().to_string()
-    }
-    fn decode_op(&self) -> Option<AclOp> {
-        postcard::from_bytes(&self.op).ok()
-    }
-    /// Verify the signature against the canonical payload (op ‖ author ‖
-    /// sorted(parents) ‖ `workspace_id`). Fails if the op was re-parented,
-    /// re-authored, or lifted from another workspace.
-    fn verify_sig(&self, workspace_id: &str) -> bool {
-        let Some(pk_bytes) = hex32(self.author.as_str()) else {
-            return false;
-        };
-        let Ok(vk) = VerifyingKey::from_bytes(&pk_bytes) else {
-            return false;
-        };
-        let Ok(sig) = Signature::from_slice(&self.sig) else {
-            return false;
-        };
-        let payload = signing_payload(&self.op, &self.author, &self.parents, workspace_id);
-        vk.verify(&payload, &sig).is_ok()
-    }
-}
-
 /// Sign an [`AclOp`] with the author's ed25519 seed, given the current heads as
-/// parents and the workspace id (S§6). The signature binds all of them, so a
-/// valid op cannot be re-parented or replayed across workspaces. The author is
-/// derived from the seed.
+/// parents and the workspace id (S§6). The signature binds op ‖ author ‖
+/// sorted(parents) ‖ workspace id under the plane domain, so a valid op cannot
+/// be re-parented, replayed across workspaces, or lifted into another plane.
 pub fn sign_op(
     seed: &[u8; 32],
     op: &AclOp,
     parents: Vec<String>,
     workspace_id: &WorkspaceId,
 ) -> SignedOp {
-    let sk = SigningKey::from_bytes(seed);
-    let author =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
-    let op_bytes = op.encode();
-    let payload = signing_payload(&op_bytes, &author, &parents, workspace_id.as_str());
-    let sig: Signature = sk.sign(&payload);
-    SignedOp {
-        op: op_bytes,
-        author,
-        sig: sig.to_bytes().to_vec(),
+    sigdag::sign_node(
+        ACL_DOMAIN,
+        seed,
+        op.encode(),
         parents,
-    }
+        workspace_id.as_str(),
+    )
 }
 
 /// The materialized ACL state after replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AclState {
+    /// Every principal sealed into the workspace, humans and agents alike.
     members: BTreeMap<UserId, Role>,
+    /// agent key → sponsoring member. Every key here is also in `members`
+    /// (with `Role::Member`); an agent's presence is derived from its sponsor's.
+    agents: BTreeMap<UserId, UserId>,
 }
 
 impl AclState {
+    /// Whether `u` is sealed into the workspace (humans and agents alike).
     pub fn is_member(&self, u: &UserId) -> bool {
         self.members.contains_key(u)
     }
     pub fn is_admin(&self, u: &UserId) -> bool {
         matches!(self.members.get(u), Some(Role::Admin))
     }
+    /// Whether `u` is an agent principal (contract §3.4).
+    pub fn is_agent(&self, u: &UserId) -> bool {
+        self.agents.contains_key(u)
+    }
+    /// The sponsoring member of an agent.
+    pub fn sponsor_of(&self, u: &UserId) -> Option<&UserId> {
+        self.agents.get(u)
+    }
+    /// A human (non-agent) member — the standing content-authority ops require.
+    pub fn is_human_member(&self, u: &UserId) -> bool {
+        self.is_member(u) && !self.is_agent(u)
+    }
     pub fn role(&self, u: &UserId) -> Option<Role> {
         self.members.get(u).copied()
     }
-    /// All current members, sorted by key.
+    /// `admin` | `member` | `agent` — the projection surface.
+    pub fn standing(&self, u: &UserId) -> Option<&'static str> {
+        if self.is_agent(u) {
+            return Some("agent");
+        }
+        match self.members.get(u)? {
+            Role::Admin => Some("admin"),
+            Role::Member => Some("member"),
+        }
+    }
+    /// All current members, sorted by key (includes agents — the sealing set).
     pub fn members(&self) -> Vec<(UserId, Role)> {
         self.members.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+    /// All current agents with their sponsors, sorted by key.
+    pub fn agents(&self) -> Vec<(UserId, UserId)> {
+        self.agents
+            .iter()
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect()
     }
     pub fn len(&self) -> usize {
         self.members.len()
@@ -167,106 +165,176 @@ impl AclState {
     }
 }
 
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
+/// One rendered row of the membership audit log (`lait members log`): the op
+/// in deterministic causal order, with its replay verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEntry {
+    pub hash: String,
+    pub author: UserId,
+    /// `add_member` | `remove_member` | `set_role` | `add_agent` | `unknown`.
+    pub kind: &'static str,
+    /// The subject key (absent for undecodable ops).
+    pub subject: Option<UserId>,
+    pub role: Option<Role>,
+    /// Whether replay honored the op (false = unauthorized or undecodable).
+    pub authorized: bool,
 }
 
 /// Deterministically replay a signed op-graph from the genesis (S§6). Founding
 /// admins seed the admin set; each op is honored only if signature-valid and
-/// authored by an admin as of its causal history; membership resolves
-/// **remove-wins** over the causal ancestor closure.
+/// authored by a principal with the required standing as of its causal history;
+/// membership resolves **remove-wins** over the causal ancestor closure, then
+/// agents cascade with their sponsors.
 pub fn replay(genesis: &Genesis, ops: &[SignedOp]) -> AclState {
-    // Index valid-signed ops by hash.
-    let mut by_hash: HashMap<String, (&SignedOp, AclOp)> = HashMap::new();
+    replay_with_audit(genesis, ops).0
+}
+
+/// [`replay`] plus the per-op audit trail, in the same deterministic order.
+pub fn replay_with_audit(genesis: &Genesis, ops: &[SignedOp]) -> (AclState, Vec<AuditEntry>) {
+    // Index signature-valid ops by hash. Undecodable ops stay as opaque DAG
+    // nodes (ancestry, no state) — the forward-compat rule in the module docs.
     let ws = genesis.workspace_id.as_str();
+    let mut nodes: HashMap<String, &SignedOp> = HashMap::new();
+    let mut decoded: HashMap<String, Option<AclOp>> = HashMap::new();
     for so in ops {
-        if !so.verify_sig(ws) {
+        if !so.verify_sig(ACL_DOMAIN, ws) {
             continue;
         }
-        if let Some(op) = so.decode_op() {
-            by_hash.insert(so.hash(), (so, op));
-        }
+        let h = so.hash();
+        decoded.insert(h.clone(), postcard::from_bytes(&so.op).ok());
+        nodes.insert(h, so);
     }
 
-    // Transitive causal ancestors of each op (over present parents only).
-    let ancestors = compute_ancestors(&by_hash);
+    let ancestors = sigdag::compute_ancestors(&nodes);
+    let order = sigdag::topo_order(&nodes);
 
-    // Topological order (ancestors before descendants; concurrent ops ordered by
-    // hash). Deterministic and independent of `by_hash`'s (randomized) iteration
-    // order, so every honest node computes the same membership from the same op
-    // set — required for E2EE (all nodes must seal the next epoch key to the same
-    // recipient set).
-    let order = topo_order(&by_hash);
-
-    // Founding admins are the trust root.
+    // ---- pass 1 (topo): authorize ops, tracking standing as it evolves ----
     let mut admins: BTreeSet<UserId> = genesis.founding_admins.iter().cloned().collect();
+    let mut humans: BTreeSet<UserId> = admins.clone();
+    let mut agents_now: BTreeMap<UserId, UserId> = BTreeMap::new();
 
-    // First pass (topo): decide which ops are authorized, growing the admin set
-    // so later ops authored by freshly-added admins validate. This is exact for
-    // sequential admin grants; concurrent grants are resolved by topo tie-break.
     let mut authorized: Vec<String> = Vec::new();
+    let mut audit: Vec<AuditEntry> = Vec::new();
     for h in &order {
-        let (so, op) = &by_hash[h];
-        let author_ok = admins.contains(&so.author);
-        if !author_ok {
+        let so = nodes[h];
+        let op = &decoded[h];
+        let mut entry = AuditEntry {
+            hash: h.clone(),
+            author: so.author.clone(),
+            kind: "unknown",
+            subject: None,
+            role: None,
+            authorized: false,
+        };
+        let Some(op) = op else {
+            audit.push(entry); // opaque node: ancestry only
+            continue;
+        };
+        entry.subject = Some(op.key().clone());
+        entry.kind = match op {
+            AclOp::AddMember { .. } => "add_member",
+            AclOp::RemoveMember { .. } => "remove_member",
+            AclOp::SetRole { .. } => "set_role",
+            AclOp::AddAgent { .. } => "add_agent",
+        };
+        if let AclOp::AddMember { role, .. } | AclOp::SetRole { role, .. } = op {
+            entry.role = Some(*role);
+        }
+
+        // Agents may author NO membership op (contract §3.4).
+        let ok = !agents_now.contains_key(&so.author)
+            && match op {
+                AclOp::AddMember { .. } | AclOp::SetRole { .. } => admins.contains(&so.author),
+                // Admins remove anyone; a sponsor may retire their own agent.
+                AclOp::RemoveMember { key } => {
+                    admins.contains(&so.author) || agents_now.get(key) == Some(&so.author)
+                }
+                // Any human member may sponsor an agent for themselves; the
+                // agent key must be fresh (not already a principal).
+                AclOp::AddAgent { key } => {
+                    humans.contains(&so.author)
+                        && key != &so.author
+                        && !humans.contains(key)
+                        && !agents_now.contains_key(key)
+                }
+            };
+        entry.authorized = ok;
+        audit.push(entry);
+        if !ok {
             continue;
         }
         authorized.push(h.clone());
-        // grow the admin set from authorized ops so downstream authors validate.
         match op {
             AclOp::AddMember { key, role } | AclOp::SetRole { key, role } => {
+                humans.insert(key.clone());
+                agents_now.remove(key);
                 if *role == Role::Admin {
                     admins.insert(key.clone());
                 } else {
                     admins.remove(key);
                 }
             }
+            AclOp::AddAgent { key } => {
+                agents_now.insert(key.clone(), so.author.clone());
+            }
             AclOp::RemoveMember { key } => {
+                humans.remove(key);
                 admins.remove(key);
+                agents_now.remove(key);
+                // in-pass sponsor cascade so an orphaned agent cannot author
+                // (nothing to author anyway) nor be counted as standing.
+                agents_now.retain(|_, sponsor| sponsor != key);
             }
         }
     }
-    // Membership: seed with the founding admins, apply authorized ops in topo
-    // order, then apply the remove-wins override for concurrency.
+
+    // ---- pass 2: materialize membership from authorized ops in topo order ----
     let mut members: BTreeMap<UserId, Role> = genesis
         .founding_admins
         .iter()
         .map(|a| (a.clone(), Role::Admin))
         .collect();
+    let mut agents: BTreeMap<UserId, UserId> = BTreeMap::new();
 
     for h in &authorized {
-        match &by_hash[h].1 {
+        match decoded[h].as_ref().expect("authorized ops decoded") {
             AclOp::AddMember { key, role } | AclOp::SetRole { key, role } => {
                 members.insert(key.clone(), *role);
+                agents.remove(key);
+            }
+            AclOp::AddAgent { key } => {
+                members.insert(key.clone(), Role::Member);
+                agents.insert(key.clone(), nodes[h].author.clone());
             }
             AclOp::RemoveMember { key } => {
                 members.remove(key);
+                agents.remove(key);
             }
         }
     }
 
-    // remove-wins override: a key with an authorized remove that is NOT
-    // causally-succeeded by an authorized add is removed even if a concurrent
-    // add appeared later in topo order.
+    // ---- remove-wins override (S§6): an authorized remove not causally
+    // succeeded by an authorized (re-)add removes the key even if a concurrent
+    // add appeared later in topo order. AddAgent counts as an add of its key.
     let keys: BTreeSet<UserId> = authorized
         .iter()
-        .map(|h| by_hash[h].1.key().clone())
+        .filter_map(|h| decoded[h].as_ref().map(|op| op.key().clone()))
         .collect();
     for key in keys {
         let adds: Vec<&String> = authorized
             .iter()
-            .filter(|h| matches!(&by_hash[*h].1, AclOp::AddMember { key: k, .. } | AclOp::SetRole { key: k, .. } if k == &key))
+            .filter(|h| {
+                matches!(decoded[*h].as_ref(),
+                    Some(AclOp::AddMember { key: k, .. })
+                    | Some(AclOp::SetRole { key: k, .. })
+                    | Some(AclOp::AddAgent { key: k }) if k == &key)
+            })
             .collect();
         let removes: Vec<&String> = authorized
             .iter()
-            .filter(|h| matches!(&by_hash[*h].1, AclOp::RemoveMember { key: k } if k == &key))
+            .filter(|h| {
+                matches!(decoded[*h].as_ref(), Some(AclOp::RemoveMember { key: k }) if k == &key)
+            })
             .collect();
         if removes.is_empty() {
             continue;
@@ -281,86 +349,29 @@ pub fn replay(genesis: &Genesis, ops: &[SignedOp]) -> AclState {
         });
         if removed {
             members.remove(&key);
+            agents.remove(&key);
         }
     }
 
-    AclState { members }
-}
-
-fn compute_ancestors(
-    by_hash: &HashMap<String, (&SignedOp, AclOp)>,
-) -> HashMap<String, HashSet<String>> {
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-    for h in by_hash.keys() {
-        let mut anc = HashSet::new();
-        let mut stack: Vec<String> = by_hash[h].0.parents.clone();
-        while let Some(p) = stack.pop() {
-            if by_hash.contains_key(&p) && anc.insert(p.clone()) {
-                stack.extend(by_hash[&p].0.parents.clone());
-            }
-        }
-        out.insert(h.clone(), anc);
-    }
-    out
-}
-
-/// Deterministic topological sort (Kahn's algorithm) over the present-parent
-/// DAG. Ready nodes are emitted in hash order, so the result is a total order
-/// that depends only on the op set — never on `by_hash`'s randomized iteration
-/// order. A previous `sort_by` comparator here was non-transitive on mixed
-/// ancestry/hash pairs, which — combined with the HashMap-seeded input order —
-/// let two honest nodes derive different orders (and thus different membership).
-fn topo_order(by_hash: &HashMap<String, (&SignedOp, AclOp)>) -> Vec<String> {
-    // Indegree over PRESENT parents only; children adjacency for decrement.
-    let mut indeg: HashMap<String, usize> = by_hash.keys().map(|h| (h.clone(), 0)).collect();
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for (h, (so, _)) in by_hash {
-        for p in &so.parents {
-            if by_hash.contains_key(p) {
-                *indeg.get_mut(h).unwrap() += 1;
-                children.entry(p.clone()).or_default().push(h.clone());
-            }
-        }
-    }
-    // Ready set kept sorted by hash (BTreeSet) for a deterministic tie-break.
-    let mut ready: BTreeSet<String> = indeg
+    // ---- sponsor cascade: an agent stands only while its sponsor does.
+    // Sponsors are never agents (AddAgent authorization), so one pass suffices.
+    let orphaned: Vec<UserId> = agents
         .iter()
-        .filter(|(_, d)| **d == 0)
-        .map(|(h, _)| h.clone())
+        .filter(|(_, sponsor)| !members.contains_key(*sponsor))
+        .map(|(k, _)| k.clone())
         .collect();
-    let mut order: Vec<String> = Vec::with_capacity(by_hash.len());
-    while let Some(h) = ready.iter().next().cloned() {
-        ready.remove(&h);
-        order.push(h.clone());
-        if let Some(cs) = children.get(&h) {
-            let mut cs = cs.clone();
-            cs.sort();
-            for c in cs {
-                let d = indeg.get_mut(&c).unwrap();
-                *d -= 1;
-                if *d == 0 {
-                    ready.insert(c);
-                }
-            }
-        }
+    for k in orphaned {
+        agents.remove(&k);
+        members.remove(&k);
     }
-    // Any remaining nodes sit on a parent-cycle (malformed input); append them in
-    // hash order so the result stays deterministic and total.
-    if order.len() < by_hash.len() {
-        let mut rest: Vec<String> = by_hash
-            .keys()
-            .filter(|h| !order.contains(*h))
-            .cloned()
-            .collect();
-        rest.sort();
-        order.extend(rest);
-    }
-    order
+
+    (AclState { members, agents }, audit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
@@ -508,7 +519,7 @@ mod tests {
         // Regression for the validation-found CRITICAL: an evicted member (no
         // admin key) tries to defeat remove-wins by lifting the admin's still-
         // valid signed AddMember op and re-parenting the copy to descend from the
-        // removal. Because the signature now binds `parents` (+ workspace id), the
+        // removal. Because the signature binds `parents` (+ workspace id), the
         // re-parented copy fails verification and is dropped by replay.
         let g = genesis(&[1]); // user1 = founding admin
         let add_orig = sign_op(
@@ -539,7 +550,7 @@ mod tests {
             parents: vec![rm.hash()],
         };
         assert!(
-            !add_replay.verify_sig(g.workspace_id.as_str()),
+            !add_replay.verify_sig(ACL_DOMAIN, g.workspace_id.as_str()),
             "re-parented copy must FAIL signature verification (sig binds parents)"
         );
         let st = replay(&g, &[add_orig, rm, add_replay]);
@@ -600,5 +611,254 @@ mod tests {
         let b = replay(&g, &[op2, op1]);
         assert_eq!(a, b, "replay is deterministic regardless of delivery order");
         assert!(a.is_member(&user(3)));
+    }
+
+    // ---- agents (contract §3.4) ----
+
+    #[test]
+    fn member_sponsors_agent_and_agent_is_sealed_but_powerless() {
+        let g = genesis(&[1]);
+        let add_b = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        // B (a plain member) sponsors agent X.
+        let add_agent = sign_op(
+            &seed(2),
+            &AclOp::AddAgent { key: user(10) },
+            vec![add_b.hash()],
+            &g.workspace_id,
+        );
+        // X (an agent) tries to add member Y — never authorized.
+        let agent_forges = sign_op(
+            &seed(10),
+            &AclOp::AddMember {
+                key: user(11),
+                role: Role::Member,
+            },
+            vec![add_agent.hash()],
+            &g.workspace_id,
+        );
+        // X tries to sponsor its own agent — no re-delegation.
+        let agent_delegates = sign_op(
+            &seed(10),
+            &AclOp::AddAgent { key: user(12) },
+            vec![add_agent.hash()],
+            &g.workspace_id,
+        );
+        let st = replay(&g, &[add_b, add_agent, agent_forges, agent_delegates]);
+        assert!(st.is_member(&user(10)), "the agent is sealed (a member)");
+        assert!(st.is_agent(&user(10)));
+        assert_eq!(st.sponsor_of(&user(10)), Some(&user(2)));
+        assert!(!st.is_human_member(&user(10)));
+        assert!(!st.is_member(&user(11)), "agent membership ops are void");
+        assert!(!st.is_member(&user(12)), "agents cannot sponsor agents");
+        assert_eq!(st.standing(&user(10)), Some("agent"));
+        assert_eq!(st.standing(&user(2)), Some("member"));
+    }
+
+    #[test]
+    fn non_member_cannot_sponsor_and_agent_key_must_be_fresh() {
+        let g = genesis(&[1]);
+        // A stranger sponsors an agent — void.
+        let stranger = sign_op(
+            &seed(5),
+            &AclOp::AddAgent { key: user(10) },
+            vec![],
+            &g.workspace_id,
+        );
+        // The founder "sponsors" an existing human as an agent — void.
+        let add_b = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let demote = sign_op(
+            &seed(1),
+            &AclOp::AddAgent { key: user(2) },
+            vec![add_b.hash()],
+            &g.workspace_id,
+        );
+        // Self-sponsoring is void.
+        let selfie = sign_op(
+            &seed(1),
+            &AclOp::AddAgent { key: user(1) },
+            vec![],
+            &g.workspace_id,
+        );
+        let st = replay(&g, &[stranger, add_b.clone(), demote, selfie]);
+        assert!(!st.is_member(&user(10)));
+        assert!(!st.is_agent(&user(2)), "a human cannot be demoted to agent");
+        assert!(!st.is_agent(&user(1)));
+    }
+
+    #[test]
+    fn removing_the_sponsor_cascades_to_their_agents() {
+        let g = genesis(&[1]);
+        let add_b = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let add_agent = sign_op(
+            &seed(2),
+            &AclOp::AddAgent { key: user(10) },
+            vec![add_b.hash()],
+            &g.workspace_id,
+        );
+        let rm_b = sign_op(
+            &seed(1),
+            &AclOp::RemoveMember { key: user(2) },
+            vec![add_agent.hash()],
+            &g.workspace_id,
+        );
+        let st = replay(&g, &[add_b, add_agent, rm_b]);
+        assert!(!st.is_member(&user(2)), "sponsor removed");
+        assert!(
+            !st.is_member(&user(10)),
+            "the agent's membership dies with its sponsor"
+        );
+        assert!(st.agents().is_empty());
+    }
+
+    #[test]
+    fn sponsor_can_retire_their_own_agent_but_not_other_members() {
+        let g = genesis(&[1]);
+        let add_b = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let add_c = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(3),
+                role: Role::Member,
+            },
+            vec![add_b.hash()],
+            &g.workspace_id,
+        );
+        let add_agent = sign_op(
+            &seed(2),
+            &AclOp::AddAgent { key: user(10) },
+            vec![add_c.hash()],
+            &g.workspace_id,
+        );
+        // B retires their own agent — authorized without admin.
+        let retire = sign_op(
+            &seed(2),
+            &AclOp::RemoveMember { key: user(10) },
+            vec![add_agent.hash()],
+            &g.workspace_id,
+        );
+        // B (not an admin) tries to remove member C — void.
+        let overreach = sign_op(
+            &seed(2),
+            &AclOp::RemoveMember { key: user(3) },
+            vec![retire.hash()],
+            &g.workspace_id,
+        );
+        let st = replay(&g, &[add_b, add_c, add_agent, retire, overreach]);
+        assert!(!st.is_member(&user(10)), "sponsor retired their agent");
+        assert!(
+            st.is_member(&user(3)),
+            "a member cannot remove other members"
+        );
+    }
+
+    #[test]
+    fn undecodable_ops_hold_ancestry_without_state() {
+        // Forward compat (module docs): a signature-valid op with unknown bytes
+        // is an opaque DAG node. Here: add(B) → OPAQUE → remove(B) → re-add(B)
+        // parented on the opaque node's CHILD chain; the re-add must still be
+        // recognized as causally succeeding the remove (ancestry intact), so B
+        // is a member — a build that dropped the opaque node would break the
+        // chain and remove-wins would falsely evict B.
+        let g = genesis(&[1]);
+        let add = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let rm = sign_op(
+            &seed(1),
+            &AclOp::RemoveMember { key: user(2) },
+            vec![add.hash()],
+            &g.workspace_id,
+        );
+        // An op kind this build does not know: raw bytes that fail decode but
+        // carry a valid signature, causally after the remove.
+        let opaque = sigdag::sign_node(
+            ACL_DOMAIN,
+            &seed(1),
+            vec![0xff, 0xff, 0xff, 0xff],
+            vec![rm.hash()],
+            g.workspace_id.as_str(),
+        );
+        let readd = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![opaque.hash()],
+            &g.workspace_id,
+        );
+        let st = replay(&g, &[add, rm, opaque, readd]);
+        assert!(
+            st.is_member(&user(2)),
+            "ancestry must flow through opaque nodes: the re-add causally succeeds the remove"
+        );
+    }
+
+    #[test]
+    fn audit_log_renders_verdicts_in_causal_order() {
+        let g = genesis(&[1]);
+        let add = sign_op(
+            &seed(1),
+            &AclOp::AddMember {
+                key: user(2),
+                role: Role::Member,
+            },
+            vec![],
+            &g.workspace_id,
+        );
+        let forged = sign_op(
+            &seed(3),
+            &AclOp::RemoveMember { key: user(2) },
+            vec![add.hash()],
+            &g.workspace_id,
+        );
+        let (st, audit) = replay_with_audit(&g, &[add, forged]);
+        assert!(st.is_member(&user(2)));
+        assert_eq!(audit.len(), 2);
+        assert_eq!(audit[0].kind, "add_member");
+        assert!(audit[0].authorized);
+        assert_eq!(audit[1].kind, "remove_member");
+        assert!(
+            !audit[1].authorized,
+            "the forged remove is logged, not honored"
+        );
     }
 }

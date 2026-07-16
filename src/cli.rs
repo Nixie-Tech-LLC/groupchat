@@ -1335,7 +1335,38 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 } else {
                     format!("  {}", m.alias)
                 };
-                println!("{:<7} {}{}{}", m.role, m.key.short(), name, you);
+                // Agents render their sponsor so the delegation chain is visible.
+                let sponsor = m
+                    .sponsor
+                    .as_deref()
+                    .map(|s| format!("  via {}", s.chars().take(8).collect::<String>()))
+                    .unwrap_or_default();
+                println!("{:<7} {}{}{}{}", m.role, m.key.short(), name, sponsor, you);
+            }
+            0
+        }
+        Response::MemberLog { entries } => {
+            if entries.is_empty() {
+                println!("(no membership ops yet)");
+            }
+            for e in entries {
+                let mark = if e.authorized {
+                    paint(out.color, ansi::GREEN, "\u{2713}")
+                } else {
+                    paint(out.color, ansi::YELLOW, "\u{2717}")
+                };
+                let actor: String = e.actor.chars().take(8).collect();
+                let subject = e
+                    .subject
+                    .as_deref()
+                    .map(|s| s.chars().take(8).collect::<String>())
+                    .unwrap_or_default();
+                let role = e
+                    .role
+                    .as_deref()
+                    .map(|r| format!(" {r}"))
+                    .unwrap_or_default();
+                println!("{mark} {actor}  {:<13} {subject}{role}", e.kind);
             }
             0
         }

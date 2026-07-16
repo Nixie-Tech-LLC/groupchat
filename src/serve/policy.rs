@@ -30,6 +30,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Activity { .. }
         | Request::IssueGraph { .. }
         | Request::Members
+        | Request::MemberLog
         | Request::MemberRequests
         | Request::Status
         | Request::Diagnose { .. }
@@ -50,9 +51,11 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Label { .. }
         | Request::Comment { .. }
         | Request::IssueDelete { .. }
+        | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
         | Request::IssueUnlink { .. }
         | Request::IssueParent { .. }
+        | Request::AgentAdd { .. }
         | Request::IssueStart { .. }
         | Request::IssueDone { .. }
         | Request::IssueStop { .. }
