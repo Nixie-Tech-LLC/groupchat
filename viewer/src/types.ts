@@ -258,9 +258,13 @@ export type CatalogScope = { scope: string; project?: string | null };
 /**
  * A dirty-set frame, tagged with the space it rang for.
  *
- * Never state: the client re-reads the authoritative projection for each dirty
- * scope and never patches from the frame (UI.md §4.2). `reset` (or an `epoch`
- * change — a daemon restart) means rebaseline from scratch.
+ * Never state: the client re-reads the authoritative projection and never patches
+ * from the frame (UI.md §4.2). `reset` — or an `epoch` change, which is a daemon
+ * restart — means rebaseline from scratch; `App` treats them identically.
+ *
+ * `activity_advanced` and `presence_advanced` are carried faithfully but not yet
+ * read: this client re-reads on any ring rather than per dirty scope. See
+ * `doorbell.ts`.
  */
 export interface SpaceDoorbell {
   space: string;

@@ -169,12 +169,27 @@ async fn gate(State(app): State<Arc<App>>, req: axum::extract::Request, next: Ne
         .and_then(|v| v.to_str().ok())
         .and_then(|c| auth::cookie_value(c, &app.cookie));
     let query = req.uri().query().and_then(|q| query_param(q, "token"));
-    let presented = bearer.or(query.as_deref()).or(cookie);
 
-    if let Err(r) = app.guard.check_token(presented) {
+    if let Err(r) = app
+        .guard
+        .check_token(resolve_token(bearer, query.as_deref(), cookie))
+    {
         return refuse(r);
     }
     next.run(req).await
+}
+
+/// Which presented credential wins.
+///
+/// Extracted so the test and the gate exercise the *same* order. Inlined, the
+/// precedence could only be tested by a copy of it — which stays green when the
+/// real one is reordered, i.e. exactly when the regression it guards happens.
+fn resolve_token<'a>(
+    bearer: Option<&'a str>,
+    query: Option<&'a str>,
+    cookie: Option<&'a str>,
+) -> Option<&'a str> {
+    bearer.or(query).or(cookie)
 }
 
 fn refuse(r: Refusal) -> Response {
@@ -388,6 +403,180 @@ fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    /// The real router, over a supervisor scoped to a directory with no spaces.
+    ///
+    /// Every case below is refused (or served) by `gate` and the embedded-asset
+    /// fallback, neither of which touches a daemon or the registry — so these run
+    /// with no port, no store, and no process-wide env.
+    fn app(token: &str) -> Router {
+        let nowhere = std::path::PathBuf::from("/nonexistent-for-tests");
+        router(Arc::new(App {
+            guard: Guard::new(token.into(), 7717),
+            sup: Supervisor::new(nowhere.clone(), nowhere, true),
+            cookie: cookie_name(7717),
+        }))
+    }
+
+    /// `GET /app.js` — the embedded bundle. Chosen because it proves the gate let
+    /// the request *through* without needing a daemon behind it.
+    fn req(headers: &[(&str, &str)], uri: &str) -> HttpRequest<Body> {
+        let mut b = HttpRequest::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    async fn status(token: &str, headers: &[(&str, &str)], uri: &str) -> StatusCode {
+        app(token)
+            .oneshot(req(headers, uri))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_and_admits_over_real_http() {
+        const T: &str = "s3cret";
+
+        // No credential at all.
+        assert_eq!(
+            status(T, &[("host", "127.0.0.1:7717")], "/app.js").await,
+            StatusCode::UNAUTHORIZED,
+        );
+
+        // The rebinding signature: a **valid token** and the attacker's Host. This
+        // is the case the whole ordering exists for — after a successful rebind the
+        // browser believes they are us and hands over the cookie, so the token stops
+        // being a secret they lack. Host is what they cannot launder.
+        assert_eq!(
+            status(
+                T,
+                &[("host", "evil.com"), ("authorization", "Bearer s3cret")],
+                "/app.js",
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+
+        // Cross-origin caller that addresses us correctly.
+        assert_eq!(
+            status(
+                T,
+                &[
+                    ("host", "127.0.0.1:7717"),
+                    ("origin", "http://evil.com"),
+                    ("authorization", "Bearer s3cret"),
+                ],
+                "/app.js",
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+
+        // …and the happy path actually serves.
+        assert_eq!(
+            status(
+                T,
+                &[
+                    ("host", "127.0.0.1:7717"),
+                    ("authorization", "Bearer s3cret")
+                ],
+                "/app.js",
+            )
+            .await,
+            StatusCode::OK,
+        );
+    }
+
+    /// The gate's *ordering*, which the case above cannot see.
+    ///
+    /// With a rebound Host **and** a valid token, both orderings answer 403 — so
+    /// status alone proves nothing about which check ran. The distinguishing case is
+    /// a rebound Host with **no** token: origin-first refuses the *host* (403) and
+    /// never consults a credential; token-first refuses the *token* (401), which
+    /// means it weighed the secret before establishing the request was even
+    /// addressed to us. That is the invariant, and this is the only way to see it
+    /// from outside.
+    #[tokio::test]
+    async fn the_origin_is_judged_before_the_credential() {
+        assert_eq!(
+            status("t", &[("host", "evil.com")], "/app.js").await,
+            StatusCode::FORBIDDEN,
+            "a rebound Host must be refused as a Host, not fall through to the token check",
+        );
+        // Same request, right host: now the credential is the thing that's wrong.
+        assert_eq!(
+            status("t", &[("host", "127.0.0.1:7717")], "/app.js").await,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    /// The stale-cookie lockout, end to end.
+    ///
+    /// Cookies ignore the port, so a previous run leaves `lait_token_7717` in the
+    /// jar for `127.0.0.1`. Cookie-first would 401 a freshly-printed link — and
+    /// stay 401ing, since the page cannot clear an `HttpOnly` cookie it cannot read.
+    #[tokio::test]
+    async fn a_fresh_url_token_beats_a_stale_cookie_over_http() {
+        const T: &str = "fresh";
+        let res = app(T)
+            .oneshot(req(
+                &[
+                    ("host", "127.0.0.1:7717"),
+                    ("cookie", "lait_token_7717=stale"),
+                ],
+                "/?token=fresh",
+            ))
+            .await
+            .unwrap();
+
+        // Admitted, and handed the current credential to replace the stale one.
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let set = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(set.contains("lait_token_7717=fresh"), "got: {set}");
+        assert!(
+            set.contains("HttpOnly"),
+            "the page must not be able to read it"
+        );
+        assert!(set.contains("SameSite=Strict"), "must not ride cross-site");
+
+        // The stale cookie alone is still refused.
+        assert_eq!(
+            status(
+                T,
+                &[
+                    ("host", "127.0.0.1:7717"),
+                    ("cookie", "lait_token_7717=stale"),
+                ],
+                "/app.js",
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+
+    /// An unknown path is the SPA's to route, not a 404.
+    #[tokio::test]
+    async fn unknown_paths_fall_back_to_the_app() {
+        assert_eq!(
+            status(
+                "t",
+                &[("host", "127.0.0.1:7717"), ("authorization", "Bearer t")],
+                "/issues/SCRA-1",
+            )
+            .await,
+            StatusCode::OK,
+        );
+    }
 
     #[test]
     fn query_param_finds_only_an_exact_key() {
@@ -415,15 +604,18 @@ mod tests {
         let stale = auth::cookie_value("lait_token_7717=stale", "lait_token_7717");
         let query = query_param("token=fresh", "token");
 
-        // The resolution order `gate` uses.
-        let presented = None.or(query.as_deref()).or(stale);
+        // `resolve_token` is what `gate` calls, so reordering the gate fails here.
+        let presented = resolve_token(None, query.as_deref(), stale);
         assert_eq!(presented, Some("fresh"));
         assert!(guard.check_token(presented).is_ok());
+    }
 
-        // Cookie-first would have picked the stale one and locked the user out.
-        let wrong = None.or(stale).or(query.as_deref());
-        assert_eq!(wrong, Some("stale"));
-        assert!(guard.check_token(wrong).is_err());
+    #[test]
+    fn bearer_outranks_everything_and_cookie_is_the_fallback() {
+        assert_eq!(resolve_token(Some("b"), Some("q"), Some("c")), Some("b"));
+        assert_eq!(resolve_token(None, Some("q"), Some("c")), Some("q"));
+        assert_eq!(resolve_token(None, None, Some("c")), Some("c"));
+        assert_eq!(resolve_token(None, None, None), None);
     }
 
     #[test]

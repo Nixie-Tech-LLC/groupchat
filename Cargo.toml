@@ -165,6 +165,10 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # property-based convergence testing (random op sequences across N peers).
 proptest = "1"
+# `ServiceExt::oneshot` — drive `serve`'s real router in-process, so the gate's
+# ordering and precedence are tested through the thing that implements them
+# rather than a copy of it. No port, no daemon.
+tower = { version = "0.5", features = ["util"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

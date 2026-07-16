@@ -75,6 +75,11 @@ export function App() {
    *  and every render a new overlay. */
   const overlay = useRef(new Overlay());
   const [predicted, setPredicted] = useState(0);
+  /** Monotonic load token — see `loadBoard`. A generalisation of an `alive` flag:
+   *  it also orders two loads of the *same* space, which `alive` cannot. */
+  const boardSeq = useRef(0);
+  /** Last doorbell epoch seen per space — the daemon-boot nonce (UI.md §4.1). */
+  const epochs = useRef(new Map<string, number>());
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
@@ -130,19 +135,35 @@ export function App() {
    * Backs off rather than hammering, and gives up after a few tries so a genuinely
    * dead space says so instead of spinning forever.
    */
-  const loadBoard = useCallback(async (id: string | null, attempt = 0): Promise<void> => {
+  const loadBoard = useCallback(async (id: string | null): Promise<void> => {
+    // Only the newest load may commit. Two doorbells in quick succession issue
+    // two loads, and the one that resolves *last* is not the one issued last —
+    // so an older board could silently overwrite a newer one, and nothing would
+    // correct it until the next ring. The retry below makes it worse by holding a
+    // load open for ~2.8s, long enough to land on a space you have since left and
+    // paint its error over the one you are looking at.
+    const seq = ++boardSeq.current;
+    const stale = () => seq !== boardSeq.current;
+
     if (!id) return setBoard(null);
-    try {
-      const r = await rpc(id, { cmd: "board", project: null });
-      setBoard(r.kind === "board" ? r : null);
-      setError(null);
-    } catch (e) {
-      if (attempt < 3) {
-        await new Promise((r) => window.setTimeout(r, 400 * 2 ** attempt));
-        return loadBoard(id, attempt + 1);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const r = await rpc(id, { cmd: "board", project: null });
+        if (stale()) return;
+        setBoard(r.kind === "board" ? r : null);
+        setError(null);
+        return;
+      } catch (e) {
+        if (stale()) return;
+        if (attempt < 3) {
+          await new Promise((r) => window.setTimeout(r, 400 * 2 ** attempt));
+          if (stale()) return;
+          continue;
+        }
+        setBoard(null);
+        setError(e instanceof Error ? e.message : String(e));
+        return;
       }
-      setBoard(null);
-      setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -156,15 +177,21 @@ export function App() {
   // Labels for the filter menu — the daemon's registry, not names we invented.
   useEffect(() => {
     if (!current) return setLabels([]);
+    // Same race as `loadBoard`: switch space mid-flight and the old space's
+    // labels would land in the new space's filter menu.
+    let alive = true;
     void (async () => {
       try {
         const r = await rpc(current, { cmd: "label_list" });
-        if (r.kind === "labels") setLabels(r.labels);
+        if (alive && r.kind === "labels") setLabels(r.labels);
       } catch {
         // A missing label registry is not worth an error banner over — the menu
         // just offers fewer options.
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, [current, revision]);
 
   // `mine`/`label` are server truth: ask `list`, keep the doc-ids, intersect.
@@ -211,6 +238,17 @@ export function App() {
           setRevision((r) => r + 1);
           return;
         }
+        // `epoch` is a per-daemon-boot nonce: a change means that daemon
+        // restarted, so our position in its stream is meaningless and nothing we
+        // hold about the space is trustworthy — which is exactly what `reset`
+        // says (UI.md §4.1). The server sends `reset` on the death it can see;
+        // the epoch catches a restart it can't, where a daemon dies and returns
+        // between two frames. Recorded for every space, not just the selected
+        // one, so switching to a space doesn't compare against a stale nonce.
+        const prev = epochs.current.get(d.space);
+        epochs.current.set(d.space, d.epoch);
+        const rebaseline = d.reset || (prev !== undefined && prev !== d.epoch);
+
         if (d.space !== current) return;
         // The doorbell is the spine of the optimism: it names the docs that
         // moved, and the arrival of truth about a doc is what kills every guess
@@ -222,21 +260,24 @@ export function App() {
           const docs = Object.values(d.dirty_by_project).flat();
           let cleared = false;
           for (const doc of docs) cleared = overlay.current.clearDoc(doc) || cleared;
-          // `reset` (or a daemon restart) means our whole view is suspect, so no
-          // guess about it survives either.
-          if (d.reset) {
+          if (rebaseline) {
             overlay.current.clear();
             cleared = true;
           }
           if (cleared) setPredicted((n) => n + 1);
         });
         setRevision((r) => r + 1);
-        if (d.dirty_catalog.length) void loadSpaces();
+        // On a rebaseline the space list is exactly as suspect as the board: a
+        // daemon that restarted may have changed its own name, projects, or
+        // whether it is up at all.
+        if (rebaseline || d.dirty_catalog.length) void loadSpaces();
       },
       [current, loadBoard, loadSpaces],
     ),
   );
 
+  const currentRef = useRef(current);
+  currentRef.current = current;
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
   const selRef = useRef(selection);
@@ -347,15 +388,27 @@ export function App() {
   }, []);
 
   // A prediction whose request neither errored nor rang is stuck: a dropped fetch,
-  // a suspended tab. Sweep so the UI falls back to what the server last said
-  // instead of showing a value that exists nowhere.
+  // a suspended tab.
+  //
+  // Sweeping is only half the job. Dropping the guess leaves the **pre-write**
+  // value on screen with the uncertainty mark removed — the server's stale answer,
+  // now presented as confirmed. That is worse than the guess was: at least the
+  // guess admitted it was one. So a sweep re-reads.
+  //
+  // Deps are `[loadBoard]`, which is stable. Keying this on `predicted` tore the
+  // interval down and rebuilt it on every prediction, so steady editing or a busy
+  // doorbell stream could reset the timer indefinitely and it would never fire —
+  // the one thing it exists to do.
   useEffect(() => {
-    if (!predicted) return;
     const t = window.setInterval(() => {
-      if (overlay.current.sweep()) setPredicted((n) => n + 1);
+      if (!overlay.current.sweep()) return;
+      setPredicted((n) => n + 1);
+      void loadBoard(currentRef.current);
+      // The detail pane reads off `revision`, not the board.
+      setRevision((r) => r + 1);
     }, PREDICTION_TTL_MS / 2);
     return () => window.clearInterval(t);
-  }, [predicted]);
+  }, [loadBoard]);
 
   const run = (id: string) => void registry.get(id)?.run(ctx);
 
