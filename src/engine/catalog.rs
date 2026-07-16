@@ -58,6 +58,10 @@ const C_ACL: &str = "acl";
 const C_ALIASES: &str = "aliases";
 const C_SUBS: &str = "subs";
 const C_EDGES: &str = "edges";
+/// The content-authority DAG (`crate::authz`): signed tombstone ops et al.
+/// Encrypted with the rest of the catalog — the blind relay learns nothing,
+/// and old builds never parse it (LAIT-DATA-CONTRACT §3.4 placement rule).
+const C_AUTHZ: &str = "authz";
 /// The tree-node meta key carrying the issue DocId a `subs` node stands for.
 const META_DOC: &str = "docId";
 
@@ -121,6 +125,7 @@ impl CatalogDoc {
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_SUBS, LoroTree::new())?;
         root.insert_container(C_EDGES, LoroMap::new())?;
+        root.insert_container(C_AUTHZ, LoroList::new())?;
         let wf = root.insert_container(C_WORKFLOW, LoroMovableList::new())?;
         for (i, state) in default_workflow().into_iter().enumerate() {
             let m = wf.insert_container(i, LoroMap::new())?;
@@ -246,6 +251,62 @@ impl CatalogDoc {
             _ if create => self.root().insert_container(C_EDGES, LoroMap::new()).ok(),
             _ => None,
         }
+    }
+    /// The content-authority op list (same lazy-create rule).
+    fn authz_list(&self, create: bool) -> Option<LoroList> {
+        match self.root().get(C_AUTHZ) {
+            Some(ValueOrContainer::Container(Container::List(l))) => Some(l),
+            _ if create => self.root().insert_container(C_AUTHZ, LoroList::new()).ok(),
+            _ => None,
+        }
+    }
+
+    // ---- content-authority ops (the encrypted signed DAG, contract §3.4) ----
+
+    /// Append a signed content-authority op (idempotent by op hash — the same
+    /// grow-only-set rule as the membership plane).
+    pub fn add_authz_op(&self, op: &crate::sigdag::SignedNode) -> Result<()> {
+        let hash = op.hash();
+        if self.authz_ops().iter().any(|o| o.hash() == hash) {
+            return Ok(());
+        }
+        let bytes = postcard::to_stdvec(op).map_err(|e| anyhow!("encode authz op: {e}"))?;
+        let list = self
+            .authz_list(true)
+            .ok_or_else(|| anyhow!("authz container unavailable"))?;
+        list.insert(list.len(), bytes.as_slice())?;
+        Ok(())
+    }
+
+    /// All content-authority ops currently held.
+    pub fn authz_ops(&self) -> Vec<crate::sigdag::SignedNode> {
+        let Some(list) = self.authz_list(false) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..list.len() {
+            if let Some(ValueOrContainer::Value(loro::LoroValue::Binary(b))) = list.get(i) {
+                if let Ok(op) = postcard::from_bytes::<crate::sigdag::SignedNode>(&b) {
+                    out.push(op);
+                }
+            }
+        }
+        out
+    }
+
+    /// The authz DAG's current heads — the parents for the next op.
+    pub fn authz_heads(&self) -> Vec<String> {
+        let ops = self.authz_ops();
+        let mut is_parent = std::collections::HashSet::new();
+        for o in &ops {
+            for p in &o.parents {
+                is_parent.insert(p.clone());
+            }
+        }
+        ops.iter()
+            .map(|o| o.hash())
+            .filter(|h| !is_parent.contains(h))
+            .collect()
     }
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {

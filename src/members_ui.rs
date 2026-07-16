@@ -733,12 +733,14 @@ mod tests {
                 key: crate::ids::UserId::from_key_string("9f2a".repeat(16)),
                 role: "admin".to_string(),
                 me: true,
+                sponsor: None,
                 alias: String::new(),
             },
             MemberDto {
                 key: crate::ids::UserId::from_key_string("3b7c".repeat(16)),
                 role: "member".to_string(),
                 me: false,
+                sponsor: None,
                 alias: "carol".to_string(),
             },
         ];

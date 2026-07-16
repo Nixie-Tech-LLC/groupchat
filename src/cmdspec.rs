@@ -846,7 +846,8 @@ pub fn specs() -> Vec<Spec> {
         ),
         Spec::req(
             "delete",
-            "Delete (tombstone) an issue (ref optional — inferred from git).",
+            "Delete (tombstone) an issue \u{2014} a signed, reversible authority op \
+             (ref optional \u{2014} inferred from git).",
             vec![A::pos_opt("reff", "Issue ref.")],
             |m| {
                 Ok(Request::IssueDelete {
@@ -854,6 +855,17 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         ),
+        Spec::req(
+            "restore",
+            "Restore a deleted issue (ref optional \u{2014} inferred from git).",
+            vec![A::pos_opt("reff", "Issue ref.")],
+            |m| {
+                Ok(Request::IssueRestore {
+                    reff: resolve_reff(m)?,
+                })
+            },
+        )
+        .alias(&["undelete"]),
         Spec::req(
             "history",
             "The issue's derived activity/time-travel feed (ref optional — inferred from git).",
@@ -1043,6 +1055,25 @@ pub fn specs() -> Vec<Spec> {
                     },
                 )
                 .alias(&["alias"]),
+                Spec::req(
+                    "agent",
+                    "Sponsor an agent keypair (any member). It can read/write but not \
+                     manage membership or delete; its standing dies with you.",
+                    vec![A::pos("key", "The agent's 64-hex ed25519 public key.")],
+                    |m| {
+                        Ok(Request::AgentAdd {
+                            key: req_str(m, "key"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "log",
+                    "The membership audit log: the signed ACL DAG in causal order, \
+                     with each op's authorization verdict.",
+                    vec![],
+                    |_| Ok(Request::MemberLog),
+                )
+                .alias(&["history"]),
                 Spec::req(
                     "rotate-key",
                     "Rotate the space key (admin-only).",
@@ -1360,8 +1391,8 @@ pub fn specs() -> Vec<Spec> {
     for s in &mut v {
         s.order = match s.name {
             "new" | "start" | "done" | "stop" | "inbox" | "show" | "board" | "ls" | "edit"
-            | "move" | "assign" | "label" | "comment" | "delete" | "link" | "unlink" | "parent"
-            | "graph" | "history" | "activity" | "serve" => ORDER_DAILY,
+            | "move" | "assign" | "label" | "comment" | "delete" | "restore" | "link"
+            | "unlink" | "parent" | "graph" | "history" | "activity" | "serve" => ORDER_DAILY,
             "init" | "join" | "invite" | "spaces" | "members" | "doctor" | "status" | "who" => {
                 ORDER_SHARE
             }

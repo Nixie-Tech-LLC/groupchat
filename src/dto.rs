@@ -335,14 +335,40 @@ pub struct InboxEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDto {
     pub key: UserId,
-    /// "admin" | "member".
+    /// "admin" | "member" | "agent" (contract §3.4).
     pub role: String,
     /// Whether this is us.
     pub me: bool,
+    /// For an agent, the sponsoring member's key; `None` for humans. The agent's
+    /// standing dies with this sponsor.
+    #[serde(default)]
+    pub sponsor: Option<String>,
     /// Local petname you've assigned to this key (empty if none). A private,
     /// never-synced label — the trusted half of the local-petname identity model.
     #[serde(default)]
     pub alias: String,
+}
+
+/// One rendered row of the membership audit log (`lait members log`, contract
+/// §3.4): the signed ACL DAG replayed in causal order with each op's verdict.
+/// This is **cryptographic provenance** (who was authorized to do what),
+/// distinct from the advisory activity feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberLogEntry {
+    /// The op's content-address (its DAG node id).
+    pub op: String,
+    /// The signing author's key (verified — the signature covers the op).
+    pub actor: String,
+    /// "add_member" | "remove_member" | "set_role" | "add_agent" | "unknown".
+    pub kind: String,
+    /// The subject key the op acts on (absent for an undecodable op).
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// "admin" | "member" for role-bearing ops.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Whether replay honored the op (false = unauthorized or undecodable).
+    pub authorized: bool,
 }
 
 /// A pending join request: someone who announced a join (via `connect`/`join`)

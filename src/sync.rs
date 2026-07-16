@@ -36,10 +36,19 @@ pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
 /// and raise [`MIN_SUPPORTED_PROTOCOL`] only when dropping support for an old
 /// version. Peers outside `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]` are
 /// refused with a clear diagnostic instead of failing to decode silently.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// **v2 (CRAIT, contract §3.4):** the catalog gained the encrypted `authz`
+/// signed-op DAG and membership gained the `AddAgent` op kind. A v1 node drops
+/// op kinds it can't decode, which diverges its membership ancestor closure —
+/// and thus its key-sealing recipient set — from a v2 node's, splitting E2EE.
+/// So v2 refuses v1 outright (`MIN_SUPPORTED_PROTOCOL = 2`): the flag day the
+/// versioning contract exists for, taken while the mesh is small. Going
+/// forward, replay keeps signature-valid-but-undecodable ops as opaque DAG
+/// nodes (`acl`/`authz`), so this is the LAST divergence-class flag day.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// The oldest sync protocol version we still accept from a peer. Raising this is
 /// how a retired version is dropped — it defines the mixed-version support window.
-pub const MIN_SUPPORTED_PROTOCOL: u32 = 1;
+pub const MIN_SUPPORTED_PROTOCOL: u32 = 2;
 
 /// Whether we can sync with a peer advertising protocol version `peer`. Accepts
 /// peers inside the supported window; outside it, returns a human-facing reason
@@ -282,7 +291,20 @@ mod tests {
         assert!(check_sync_protocol(PROTOCOL_VERSION + 1).is_err());
 
         // A peer older than the support window is refused (it must upgrade).
-        // MIN is >= 1 today, so MIN - 1 is a real out-of-window value.
         assert!(check_sync_protocol(MIN_SUPPORTED_PROTOCOL - 1).is_err());
+    }
+
+    #[test]
+    fn v1_peers_are_refused_the_crait_flag_day() {
+        // CRAIT (contract §3.4) added the encrypted `authz` DAG and the
+        // `AddAgent` op kind; a v1 node drops op kinds it can't decode, which
+        // diverges its membership ancestor closure and splits E2EE. v2 refuses
+        // v1 outright — the deliberate flag day (module docs).
+        // v1 is out of the window (MIN_SUPPORTED_PROTOCOL == 2) — the flag day.
+        let err = check_sync_protocol(1).unwrap_err().to_string();
+        assert!(
+            err.contains("upgrade"),
+            "the refusal must name the way out: {err}"
+        );
     }
 }

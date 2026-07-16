@@ -22,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
     ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, JoinRequestDto,
-    LabelDto, MemberDto, ProjectDto, Row, SeedDto,
+    LabelDto, MemberDto, MemberLogEntry, ProjectDto, Row, SeedDto,
 };
 
 /// The control-plane protocol version this build **speaks** — the CLI/TUI/MCP
@@ -173,6 +173,11 @@ pub enum Request {
     IssueDelete {
         reff: String,
     },
+    /// Restore a deleted issue — a signed content-authority op that clears the
+    /// tombstone (contract §3.4). Restore-wins over a concurrent delete.
+    IssueRestore {
+        reff: String,
+    },
     /// Link two issues (`blocks` | `relates` | `duplicates`) — an add-wins edge
     /// in the catalog structure doc (contract §3.2).
     IssueLink {
@@ -266,8 +271,18 @@ pub enum Request {
     MemberRemove {
         who: String,
     },
+    /// Sponsor an agent keypair (contract §3.4). Any human member may sponsor;
+    /// the agent is sealed the workspace key but holds no membership or content
+    /// authority, and its standing dies with the sponsor.
+    AgentAdd {
+        /// The agent's ed25519 public key (64-hex).
+        key: String,
+    },
     KeyRotate,
     Members,
+    /// The membership audit log: the signed ACL DAG replayed in causal order
+    /// with each op's authorization verdict (cryptographic provenance).
+    MemberLog,
     /// List pending join requests (announced joiners not yet members, UI.md §8).
     MemberRequests,
     /// Approve a pending join request **by id-prefix / key** — sugar over
@@ -413,6 +428,10 @@ pub enum Response {
     },
     Members {
         members: Vec<MemberDto>,
+    },
+    /// The membership audit log (reply to [`Request::MemberLog`]).
+    MemberLog {
+        entries: Vec<MemberLogEntry>,
     },
     /// Pending join requests (announced joiners not yet members, UI.md §8).
     JoinRequests {

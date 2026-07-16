@@ -1282,6 +1282,7 @@ impl Node {
             | Request::IssueUnlink { .. }
             | Request::IssueParent { .. }
             | Request::IssueGraph { .. }
+            | Request::IssueRestore { .. }
             | Request::IssueView { .. }
             | Request::List { .. }
             | Request::Board { .. }
@@ -1292,6 +1293,8 @@ impl Node {
             | Request::LabelList
             | Request::Activity { .. }
             | Request::MemberRemove { .. }
+            | Request::AgentAdd { .. }
+            | Request::MemberLog
             | Request::KeyRotate => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {

@@ -40,6 +40,7 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "label",
     "comment",
     "issue_delete",
+    "issue_restore",
     "issue_link",
     "issue_unlink",
     "issue_parent",
@@ -55,8 +56,10 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "activity",
     "member_add",
     "member_remove",
+    "agent_add",
     "key_rotate",
     "members",
+    "member_log",
 ];
 
 /// The set of MCP tool names this server exposes (kept beside the `#[tool]`
@@ -74,6 +77,7 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "label",
     "comment",
     "issue_delete",
+    "issue_restore",
     "issue_link",
     "issue_unlink",
     "issue_parent",
@@ -89,8 +93,10 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "activity",
     "member_add",
     "member_remove",
+    "agent_add",
     "key_rotate",
     "members",
+    "member_log",
     "member_requests",
     "member_approve",
     "member_alias",
@@ -263,6 +269,12 @@ pub struct MemberAddArgs {
     /// Optional local petname to attach to the resolved key (never synced).
     #[serde(default)]
     pub alias: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentAddArgs {
+    /// The agent's ed25519 public key (64-hex) — the keypair the agent signs with.
+    pub key: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -481,12 +493,23 @@ impl LaitMcp {
         .await
     }
 
-    #[tool(description = "Delete (tombstone) an issue. It stays in history for backfill.")]
+    #[tool(
+        description = "Delete (tombstone) an issue — a signed, reversible authority op. Agents \
+                       cannot delete."
+    )]
     async fn issue_delete(
         &self,
         Parameters(a): Parameters<RefArg>,
     ) -> Result<CallToolResult, McpError> {
         self.run(Request::IssueDelete { reff: a.reff }).await
+    }
+
+    #[tool(description = "Restore a deleted issue (restore-wins over a concurrent delete).")]
+    async fn issue_restore(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueRestore { reff: a.reff }).await
     }
 
     #[tool(
@@ -651,6 +674,18 @@ impl LaitMcp {
         self.run(Request::MemberRemove { who: a.who }).await
     }
 
+    #[tool(
+        description = "Sponsor an agent keypair (any human member). The agent can read/write \
+                       content but cannot manage membership or delete issues, and its standing \
+                       dies with the sponsor."
+    )]
+    async fn agent_add(
+        &self,
+        Parameters(a): Parameters<AgentAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::AgentAdd { key: a.key }).await
+    }
+
     #[tool(description = "Rotate the workspace key (admin-only).")]
     async fn key_rotate(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::KeyRotate).await
@@ -659,6 +694,14 @@ impl LaitMcp {
     #[tool(description = "List workspace members and their roles (from the signed ACL).")]
     async fn members(&self) -> Result<CallToolResult, McpError> {
         self.run(Request::Members).await
+    }
+
+    #[tool(
+        description = "The membership audit log: the signed ACL DAG replayed in causal order, \
+                       with each op's authorization verdict (cryptographic provenance)."
+    )]
+    async fn member_log(&self) -> Result<CallToolResult, McpError> {
+        self.run(Request::MemberLog).await
     }
 
     #[tool(description = "List pending join requests (announced joiners not yet added).")]
