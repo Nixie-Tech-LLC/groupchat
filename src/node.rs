@@ -1278,6 +1278,10 @@ impl Node {
             | Request::Label { .. }
             | Request::Comment { .. }
             | Request::IssueDelete { .. }
+            | Request::IssueLink { .. }
+            | Request::IssueUnlink { .. }
+            | Request::IssueParent { .. }
+            | Request::IssueGraph { .. }
             | Request::IssueView { .. }
             | Request::List { .. }
             | Request::Board { .. }

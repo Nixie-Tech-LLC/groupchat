@@ -28,6 +28,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::ProjectList
         | Request::LabelList
         | Request::Activity { .. }
+        | Request::IssueGraph { .. }
         | Request::Members
         | Request::MemberRequests
         | Request::Status
@@ -49,6 +50,9 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Label { .. }
         | Request::Comment { .. }
         | Request::IssueDelete { .. }
+        | Request::IssueLink { .. }
+        | Request::IssueUnlink { .. }
+        | Request::IssueParent { .. }
         | Request::IssueStart { .. }
         | Request::IssueDone { .. }
         | Request::IssueStop { .. }

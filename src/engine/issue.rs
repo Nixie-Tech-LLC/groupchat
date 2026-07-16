@@ -6,18 +6,25 @@
 //! Fields (S§5):
 //! - `id`, `workspaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
 //! - `title`, `status`, `priority` — LWW value leaves.
-//! - `description` — `LoroText` (RGA char-merge, co-editable).
+//! - `description` — `LoroText` (RGA char-merge, co-editable; writes are a
+//!   **splice**, never a full-buffer replace — see [`IssueDoc::set_description`]).
 //! - `assignees`, `labels` — `LoroMap<Id, true>` present-key sets (S§5.2).
 //! - `comments` — `LoroList<Comment>`, insertion-order union (S§5.3).
 //!
 //! `projectId` is the **single source of project membership** (S§5.5).
+//!
+//! Mutation contract (LAIT-DATA-CONTRACT §5-§6): callers stage typed writes and
+//! land them with exactly one [`IssueDoc::apply`] per Request — the only commit
+//! path, and it stamps the op metadata every change must carry.
 
 use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
 use crate::dto::{CommentDto, Priority, DEFAULT_STATUS};
 use crate::ids::{DocId, LabelId, ProjectId, UserId, WorkspaceId};
-use crate::loro_ext as lx;
+
+use super::loro_ext as lx;
+use super::op::{self, OpCtx};
 
 const ROOT: &str = "issue";
 const K_ID: &str = "id";
@@ -43,6 +50,10 @@ pub struct NewIssue {
     pub created_by: UserId,
     pub created_at: u64,
     pub body: Option<String>,
+    /// The store's stable peer id (contract §5): one version-vector entry per
+    /// store lifetime instead of one per session. `None` (tests, replicas)
+    /// keeps the kernel's fresh random peer.
+    pub peer: Option<u64>,
 }
 
 /// A wrapper around one issue's `LoroDoc`.
@@ -51,9 +62,11 @@ pub struct IssueDoc {
 }
 
 impl IssueDoc {
-    /// Create a brand-new issue document, committing the initial state.
+    /// Create a brand-new issue document, committing the initial state as one
+    /// `created` op.
     pub fn create(spec: NewIssue) -> Result<Self> {
         let doc = LoroDoc::new();
+        op::configure(&doc, spec.peer);
         let root = doc.get_map(ROOT);
         root.insert(K_ID, spec.doc_id.as_str())?;
         root.insert(K_WORKSPACE, spec.workspace_id.as_str())?;
@@ -73,21 +86,28 @@ impl IssueDoc {
         root.insert_container(C_ASSIGNEES, loro::LoroMap::new())?;
         root.insert_container(C_LABELS, loro::LoroMap::new())?;
         root.insert_container(C_COMMENTS, loro::LoroList::new())?;
-        doc.commit();
+        op::commit_with(&doc, &OpCtx::content("created", &spec.created_by));
         Ok(Self { doc })
     }
 
-    /// Wrap an already-loaded `LoroDoc` (from the store or from sync).
-    pub fn from_doc(doc: LoroDoc) -> Self {
-        Self { doc }
+    /// Load from stored/synced snapshot bytes (the only public constructor from
+    /// bytes — it applies the contract's kernel configuration before any write
+    /// can happen on the loaded doc).
+    pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
+        let doc = LoroDoc::new();
+        op::configure(&doc, peer);
+        doc.import(bytes)
+            .map_err(|e| anyhow!("import issue snapshot: {e}"))?;
+        Ok(Self { doc })
     }
 
-    /// Borrow the underlying document (for the store / sync layer).
-    pub fn doc(&self) -> &LoroDoc {
+    /// The raw kernel handle — never leaves the engine (contract §6).
+    pub(in crate::engine) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
 
-    /// Export a full snapshot (durable store / cold-start sync).
+    /// Export a full snapshot (durable store / cold-start sync). Retains the
+    /// full oplog: the snapshot IS the history (contract §5).
     pub fn snapshot(&self) -> Result<Vec<u8>> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -103,21 +123,33 @@ impl IssueDoc {
     }
 
     /// The issue doc's oplog frontiers — the causal head used as the sync digest
-    /// (SCHEMA §3.2, §8).
-    pub fn head(&self) -> Frontiers {
+    /// (SCHEMA §3.2, §8). Engine-internal; the world sees [`Self::head_hash`].
+    pub(in crate::engine) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
 
-    /// This doc's oplog version vector (for per-doc VV-diff sync, A§8).
-    pub fn oplog_vv(&self) -> loro::VersionVector {
-        self.doc.oplog_vv()
+    /// The opaque `DocMeta.head` digest of this doc (S§3.2).
+    pub fn head_hash(&self) -> Vec<u8> {
+        super::catalog::head_hash(&self.head())
     }
 
-    /// Export only the ops a peer at `from` lacks (`export(updates(from))`, A§8).
-    pub fn export_from(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+    /// This doc's oplog version vector, wire-encoded (per-doc VV-diff sync, A§8).
+    pub fn oplog_vv_bytes(&self) -> Vec<u8> {
+        self.doc.oplog_vv().encode()
+    }
+
+    /// Export only the ops a peer lacks, from its wire-encoded VV (A§8).
+    pub fn export_from_bytes(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
         self.doc
-            .export(ExportMode::updates(from))
+            .export(ExportMode::updates(&vv))
             .map_err(|e| anyhow!("export issue updates: {e}"))
+    }
+
+    /// The deep state as JSON — for convergence assertions and debugging.
+    pub fn state_json(&self) -> serde_json::Value {
+        use loro::ToJson;
+        self.doc.get_deep_value().to_json_value()
     }
 
     fn root(&self) -> loro::LoroMap {
@@ -220,7 +252,7 @@ impl IssueDoc {
         out
     }
 
-    // ---- writes (each caller commits at the Request boundary, S§7.1) ----
+    // ---- writes (staged; landed by exactly one `apply` per Request, S§7.1) ----
 
     pub fn set_title(&self, title: &str) -> Result<()> {
         self.root().insert(K_TITLE, title)?;
@@ -239,18 +271,17 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Replace the whole description (P0 full-buffer replace, UI.md §5.3).
+    /// Set the description as a **splice**: the kernel computes the minimal
+    /// edit, so a concurrent edit by another peer RGA-merges cleanly instead of
+    /// concatenating both full bodies (the P0 full-buffer replace did exactly
+    /// that — contract §3.1), and the oplog records the actual edit instead of
+    /// a delete-all/insert-all pair per save.
     pub fn set_description(&self, body: &str) -> Result<()> {
         let t = self
             .description_text()
             .ok_or_else(|| anyhow!("description container missing"))?;
-        let len = t.len_unicode();
-        if len > 0 {
-            t.delete(0, len)?;
-        }
-        if !body.is_empty() {
-            t.insert(0, body)?;
-        }
+        t.update(body, loro::UpdateOptions::default())
+            .map_err(|e| anyhow!("splice description: {e}"))?;
         Ok(())
     }
 
@@ -295,9 +326,10 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Commit the pending ops as one Loro commit (one Request = one commit, S§7.1).
-    pub fn commit(&self) {
-        self.doc.commit();
+    /// Land the staged ops as one metadata-carrying change — the only commit
+    /// path (one Request = one apply = one change; S§7.1, contract §6).
+    pub fn apply(&self, ctx: &OpCtx) {
+        op::commit_with(&self.doc, ctx);
     }
 }
 
@@ -318,6 +350,9 @@ mod tests {
     fn user() -> UserId {
         UserId::from_key_string("a".repeat(64))
     }
+    fn ctx(kind: &str) -> OpCtx {
+        OpCtx::content(kind, &user())
+    }
 
     fn sample() -> IssueDoc {
         IssueDoc::create(NewIssue {
@@ -329,6 +364,7 @@ mod tests {
             created_by: user(),
             created_at: 1000,
             body: Some("the token refresh races".into()),
+            peer: None,
         })
         .unwrap()
     }
@@ -351,7 +387,7 @@ mod tests {
         i.set_title("fix login race").unwrap();
         i.set_status("in_progress").unwrap();
         i.set_priority(Priority::Urgent).unwrap();
-        i.commit();
+        i.apply(&ctx("edited"));
         assert_eq!(i.title(), "fix login race");
         assert_eq!(i.status(), "in_progress");
         assert_eq!(i.priority(), Priority::Urgent);
@@ -364,10 +400,10 @@ mod tests {
         let u2 = UserId::from_key_string("b".repeat(64));
         i.add_assignee(&u1).unwrap();
         i.add_assignee(&u2).unwrap();
-        i.commit();
+        i.apply(&ctx("assigned"));
         assert_eq!(i.assignees().len(), 2);
         i.remove_assignee(&u1).unwrap();
-        i.commit();
+        i.apply(&ctx("unassigned"));
         assert_eq!(i.assignees(), vec![u2]);
     }
 
@@ -376,10 +412,10 @@ mod tests {
         let i = sample();
         let l = LabelId::mint(&SystemUlidSource);
         i.add_label(&l).unwrap();
-        i.commit();
+        i.apply(&ctx("labeled"));
         assert_eq!(i.labels(), vec![l.clone()]);
         i.remove_label(&l).unwrap();
-        i.commit();
+        i.apply(&ctx("labeled"));
         assert!(i.labels().is_empty());
     }
 
@@ -388,7 +424,7 @@ mod tests {
         let i = sample();
         i.add_comment(&user(), 10, "first").unwrap();
         i.add_comment(&user(), 20, "second").unwrap();
-        i.commit();
+        i.apply(&ctx("commented"));
         let cs = i.comments();
         assert_eq!(cs.len(), 2);
         assert_eq!(cs[0].body, "first");
@@ -396,25 +432,64 @@ mod tests {
     }
 
     #[test]
-    fn description_full_replace() {
+    fn description_splices_and_merges_concurrent_edits() {
+        // The contract §3.1 fix: a splice write means two peers editing
+        // different parts of the body RGA-merge cleanly, instead of the
+        // full-buffer replace concatenating both bodies.
         let i = sample();
-        i.set_description("brand new body").unwrap();
-        i.commit();
-        assert_eq!(i.description(), "brand new body");
+        i.set_description("the token refresh races").unwrap();
+        i.apply(&ctx("edited"));
+        let replica = IssueDoc::from_snapshot(&i.snapshot().unwrap(), None).unwrap();
+
+        i.set_description("the token refresh races on cold start")
+            .unwrap();
+        i.apply(&ctx("edited"));
+        replica.set_description("The token refresh races").unwrap();
+        replica.apply(&ctx("edited"));
+
+        i.import(&replica.export_from_bytes(&[]).unwrap()).unwrap();
+        replica.import(&i.export_from_bytes(&[]).unwrap()).unwrap();
+        assert_eq!(i.description(), replica.description(), "converged");
+        assert_eq!(
+            i.description(),
+            "The token refresh races on cold start",
+            "both edits survive — no body duplication"
+        );
     }
 
     #[test]
     fn snapshot_roundtrip_preserves_state() {
         let i = sample();
         i.set_status("done").unwrap();
-        i.commit();
+        i.apply(&ctx("edited"));
         let snap = i.snapshot().unwrap();
-        let loaded = IssueDoc::from_doc({
-            let d = LoroDoc::new();
-            d.import(&snap).unwrap();
-            d
-        });
+        let loaded = IssueDoc::from_snapshot(&snap, None).unwrap();
         assert_eq!(loaded.title(), "fix login");
         assert_eq!(loaded.status(), "done");
+    }
+
+    #[test]
+    fn history_survives_snapshot_roundtrip_with_metadata() {
+        // Contract §5: per-request changes with kind/actor/ts, durable on disk.
+        let i = sample();
+        i.set_status("in_progress").unwrap();
+        i.apply(&ctx("started"));
+        i.set_status("done").unwrap();
+        i.apply(&ctx("finished"));
+        let loaded = IssueDoc::from_snapshot(&i.snapshot().unwrap(), None).unwrap();
+        let hist = crate::engine::history::issue_history(&loaded);
+        assert_eq!(hist.len(), 3, "created + started + finished");
+        assert_eq!(hist[0].kind.as_deref(), Some("created"));
+        assert_eq!(hist[1].kind.as_deref(), Some("started"));
+        assert_eq!(hist[2].kind.as_deref(), Some("finished"));
+        assert_eq!(hist[2].actor, Some(user()));
+        assert!(hist[2].ts > 0, "real wall-clock on every change");
+        let status_change = hist[2]
+            .changes
+            .iter()
+            .find(|c| c.field == "status")
+            .expect("status transition recorded");
+        assert_eq!(status_change.from.as_deref(), Some("in_progress"));
+        assert_eq!(status_change.to.as_deref(), Some("done"));
     }
 }

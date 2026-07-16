@@ -21,8 +21,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::diagnose::DiagnosisView;
 use crate::dto::{
-    ActivityEvent, BoardView, Candidate, InboxEntry, IssueView, JoinRequestDto, LabelDto,
-    MemberDto, ProjectDto, Row, SeedDto,
+    ActivityEvent, BoardView, Candidate, GraphView, InboxEntry, IssueView, JoinRequestDto,
+    LabelDto, MemberDto, ProjectDto, Row, SeedDto,
 };
 
 /// The control-plane protocol version this build **speaks** — the CLI/TUI/MCP
@@ -171,6 +171,30 @@ pub enum Request {
         body: String,
     },
     IssueDelete {
+        reff: String,
+    },
+    /// Link two issues (`blocks` | `relates` | `duplicates`) — an add-wins edge
+    /// in the catalog structure doc (contract §3.2).
+    IssueLink {
+        reff: String,
+        kind: String,
+        target: String,
+    },
+    IssueUnlink {
+        reff: String,
+        kind: String,
+        target: String,
+    },
+    /// Set (or clear, with `parent: None`) an issue's parent in the sub-issue
+    /// hierarchy — a tree-move CRDT, so concurrent conflicting parents can
+    /// never converge to a cycle (contract §3.2).
+    IssueParent {
+        reff: String,
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    /// The issue's graph neighborhood: parent, children, links, open blockers.
+    IssueGraph {
         reff: String,
     },
     /// Work-state verbs (UI.md §2): each is ONE commit = one activity row,
@@ -369,6 +393,8 @@ pub enum Response {
         rows: Vec<Row>,
     },
     Board(Box<BoardView>),
+    /// The issue-graph neighborhood (reply to [`Request::IssueGraph`]).
+    Graph(Box<GraphView>),
     Activity {
         events: Vec<ActivityEvent>,
         last: u64,

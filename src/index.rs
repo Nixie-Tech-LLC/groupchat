@@ -533,12 +533,19 @@ mod tests {
     use crate::ids::{SystemUlidSource, WorkspaceId};
     use crate::issue::{IssueDoc, NewIssue};
 
+    fn test_user() -> UserId {
+        UserId::from_key_string("a".repeat(64))
+    }
+    fn commit(c: &CatalogDoc) {
+        c.apply(&crate::engine::op::OpCtx::structure("test", &test_user()));
+    }
+
     fn setup() -> (CatalogDoc, ProjectId, WorkspaceId) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let c = CatalogDoc::create(&ws, "test").unwrap();
+        let c = CatalogDoc::create(&ws, "test", None, &test_user()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
-        c.doc().commit();
+        commit(&c);
         (c, p, ws)
     }
 
@@ -555,9 +562,10 @@ mod tests {
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,
-            created_by: UserId::from_key_string("a".repeat(64)),
+            created_by: test_user(),
             created_at: 1,
             body: None,
+            peer: None,
         })
         .unwrap();
         c.upsert_row(&issue).unwrap();
@@ -565,7 +573,7 @@ mod tests {
         if seq_via_assign {
             c.assign_alias_seq(&id, p).unwrap();
         }
-        c.doc().commit();
+        commit(c);
         id
     }
 
@@ -669,7 +677,7 @@ mod tests {
         // force both to seq 5 (collision)
         c.set_seq(&a, 5).unwrap();
         c.set_seq(&b, 5).unwrap();
-        c.doc().commit();
+        commit(&c);
         let aliases = AliasTable::build(&c);
         // deterministic: sorted-first keeps ENG-5, the other gets ENG-5b
         let (first, second) = if a < b { (&a, &b) } else { (&b, &a) };
@@ -710,7 +718,7 @@ mod tests {
         let (c, p, ws) = setup();
         let q = ProjectId::mint(&SystemUlidSource);
         c.add_project(&q, "Design", "DSN", "pink").unwrap();
-        c.doc().commit();
+        commit(&c);
         let mut ids = Vec::new();
         for t in ["a", "b", "cc", "d", "e", "f"] {
             ids.push(add_issue(&c, &ws, &p, t, true));
@@ -751,7 +759,7 @@ mod tests {
 
         // Collide b onto seq 1, then reconcile just b.
         c.set_seq(&b, 1).unwrap();
-        c.doc().commit();
+        commit(&c);
         t.reconcile_doc(&c, &b);
 
         // Sorted-first of {a,b} at (ENG,1) keeps the bare alias; the other +suffix.

@@ -7,13 +7,21 @@
 //! replays the ACL, unseals its copy of the current-epoch key, and can then
 //! decrypt the workspace. A non-member sees the signed ops + envelopes it cannot
 //! open — and therefore only ciphertext for the actual issue data.
+//!
+//! This doc is the reference Regime-C surface (LAIT-DATA-CONTRACT §1): its
+//! Loro layer only *moves* the signed ops; trust comes from `acl::replay`.
+//! Commits go through [`MembershipDoc::apply`] like every other doc — note the
+//! commit metadata here is **plaintext on the wire** (fine: it names ACL ops
+//! whose authors are already public).
 
 use anyhow::{anyhow, Result};
 use loro::{Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, ValueOrContainer};
 
 use crate::acl::SignedOp;
 use crate::ids::{UserId, WorkspaceId};
-use crate::loro_ext as lx;
+
+use super::loro_ext as lx;
+use super::op::{self, OpCtx};
 
 const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
@@ -28,31 +36,41 @@ pub struct MembershipDoc {
 }
 
 impl MembershipDoc {
-    pub fn create(workspace_id: &WorkspaceId) -> Result<Self> {
+    pub fn create(workspace_id: &WorkspaceId, peer: Option<u64>, founder: &UserId) -> Result<Self> {
         let doc = LoroDoc::new();
+        op::configure(&doc, peer);
         let root = doc.get_map(ROOT);
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
         root.insert(K_EPOCH, 0i64)?;
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
         root.insert_container(C_REDEEMED, LoroMap::new())?;
-        doc.commit();
+        op::commit_with(&doc, &OpCtx::authority("init", founder));
         Ok(Self { doc })
     }
 
-    pub fn from_doc(doc: LoroDoc) -> Self {
-        Self { doc }
+    /// Load from stored snapshot bytes, applying the contract's kernel config.
+    pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
+        let doc = LoroDoc::new();
+        op::configure(&doc, peer);
+        doc.import(bytes)
+            .map_err(|e| anyhow!("import membership snapshot: {e}"))?;
+        Ok(Self { doc })
     }
+
     /// A bare, uninitialized membership doc — for a JOINER, which imports the
     /// founder's full membership so container ids match (see `CatalogDoc::empty`).
-    pub fn empty() -> Self {
-        Self {
-            doc: LoroDoc::new(),
-        }
+    pub fn empty(peer: Option<u64>) -> Self {
+        let doc = LoroDoc::new();
+        op::configure(&doc, peer);
+        Self { doc }
     }
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
+
+    /// Land staged ops as one metadata-carrying change (contract §6).
+    pub fn apply(&self, ctx: &OpCtx) {
+        op::commit_with(&self.doc, ctx);
     }
+
     pub fn snapshot(&self) -> Result<Vec<u8>> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -64,15 +82,20 @@ impl MembershipDoc {
             .map(|_| ())
             .map_err(|e| anyhow!("import membership update: {e}"))
     }
-    pub fn head(&self) -> Frontiers {
+    pub(in crate::engine) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
-    pub fn oplog_vv(&self) -> loro::VersionVector {
-        self.doc.oplog_vv()
+    /// The raw encoded frontiers (input to the combined sync head, A§8).
+    pub fn head_bytes(&self) -> Vec<u8> {
+        self.head().encode()
     }
-    pub fn export_from(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+    pub fn oplog_vv_bytes(&self) -> Vec<u8> {
+        self.doc.oplog_vv().encode()
+    }
+    pub fn export_from_bytes(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
         self.doc
-            .export(ExportMode::updates(from))
+            .export(ExportMode::updates(&vv))
             .map_err(|e| anyhow!("export membership updates: {e}"))
     }
 
@@ -239,11 +262,17 @@ mod tests {
         let pk = SigningKey::from_bytes(&[n; 32]).verifying_key();
         UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
+    fn ctx(kind: &str) -> OpCtx {
+        OpCtx::authority(kind, &user(1))
+    }
+    fn fresh(w: &WorkspaceId) -> MembershipDoc {
+        MembershipDoc::create(w, None, &user(1)).unwrap()
+    }
 
     #[test]
     fn ops_grow_only_and_heads_track_frontier() {
         let w = ws();
-        let m = MembershipDoc::create(&w).unwrap();
+        let m = fresh(&w);
         let op1 = sign_op(
             &[1; 32],
             &AclOp::AddMember {
@@ -255,7 +284,7 @@ mod tests {
         );
         m.add_op(&op1).unwrap();
         m.add_op(&op1).unwrap(); // idempotent
-        m.doc().commit();
+        m.apply(&ctx("member_add"));
         assert_eq!(m.ops().len(), 1);
         assert_eq!(m.heads(), vec![op1.hash()]);
         let op2 = sign_op(
@@ -265,16 +294,16 @@ mod tests {
             &w,
         );
         m.add_op(&op2).unwrap();
-        m.doc().commit();
+        m.apply(&ctx("member_remove"));
         assert_eq!(m.heads(), vec![op2.hash()], "head advances to the new op");
     }
 
     #[test]
     fn sealed_keys_per_epoch_roundtrip() {
-        let m = MembershipDoc::create(&ws()).unwrap();
+        let m = fresh(&ws());
         m.put_sealed(0, &user(1), b"sealed-for-1").unwrap();
         m.put_sealed(0, &user(2), b"sealed-for-2").unwrap();
-        m.doc().commit();
+        m.apply(&ctx("seal"));
         assert_eq!(
             m.get_sealed(0, &user(1)).as_deref(),
             Some(&b"sealed-for-1"[..])
@@ -293,11 +322,11 @@ mod tests {
 
     #[test]
     fn redeemed_nonces_record_and_survive_a_snapshot() {
-        let m = MembershipDoc::create(&ws()).unwrap();
+        let m = fresh(&ws());
         let nonce = [7u8; 16];
         assert!(!m.is_redeemed(&nonce), "unseen nonce is not redeemed");
         m.mark_redeemed(&nonce, &user(3)).unwrap();
-        m.doc().commit();
+        m.apply(&ctx("invite_redeem"));
         assert!(m.is_redeemed(&nonce), "burned nonce reads back as redeemed");
         assert!(
             !m.is_redeemed(&[8u8; 16]),
@@ -306,18 +335,14 @@ mod tests {
         // The guard is synced state, so it must survive a snapshot round-trip
         // (this is what gives a second admin the same replay protection).
         let snap = m.snapshot().unwrap();
-        let loaded = MembershipDoc::from_doc({
-            let d = LoroDoc::new();
-            d.import(&snap).unwrap();
-            d
-        });
+        let loaded = MembershipDoc::from_snapshot(&snap, None).unwrap();
         assert!(loaded.is_redeemed(&nonce), "redemption survives snapshot");
     }
 
     #[test]
     fn snapshot_roundtrip_preserves_membership() {
         let w = ws();
-        let m = MembershipDoc::create(&w).unwrap();
+        let m = fresh(&w);
         let op = sign_op(
             &[1; 32],
             &AclOp::AddMember {
@@ -330,13 +355,9 @@ mod tests {
         m.add_op(&op).unwrap();
         m.put_sealed(0, &user(2), b"k").unwrap();
         m.set_epoch(1).unwrap();
-        m.doc().commit();
+        m.apply(&ctx("member_add"));
         let snap = m.snapshot().unwrap();
-        let loaded = MembershipDoc::from_doc({
-            let d = LoroDoc::new();
-            d.import(&snap).unwrap();
-            d
-        });
+        let loaded = MembershipDoc::from_snapshot(&snap, None).unwrap();
         assert_eq!(loaded.ops().len(), 1);
         assert_eq!(loaded.current_epoch(), 1);
         assert_eq!(loaded.get_sealed(0, &user(2)).as_deref(), Some(&b"k"[..]));

@@ -864,6 +864,72 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         ),
+        Spec::req(
+            "link",
+            "Link two issues: `link ENG-1 blocks ENG-2` (kinds: blocks/relates/duplicates; two refs = relates).",
+            vec![
+                A::pos("reff", "Issue ref."),
+                A::pos("kind_or_target", "Link kind, or the target ref (kind defaults to relates)."),
+                A::pos_opt("target", "Target issue ref (when a kind was given)."),
+            ],
+            |m| {
+                let reff = req_str(m, "reff");
+                let a = req_str(m, "kind_or_target");
+                let (kind, target) = match opt_str(m, "target") {
+                    Some(t) => (a, t),
+                    None => ("relates".to_string(), a),
+                };
+                Ok(Request::IssueLink { reff, kind, target })
+            },
+        ),
+        Spec::req(
+            "unlink",
+            "Remove an issue link: `unlink ENG-1 blocks ENG-2`.",
+            vec![
+                A::pos("reff", "Issue ref."),
+                A::pos("kind_or_target", "Link kind, or the target ref (kind defaults to relates)."),
+                A::pos_opt("target", "Target issue ref (when a kind was given)."),
+            ],
+            |m| {
+                let reff = req_str(m, "reff");
+                let a = req_str(m, "kind_or_target");
+                let (kind, target) = match opt_str(m, "target") {
+                    Some(t) => (a, t),
+                    None => ("relates".to_string(), a),
+                };
+                Ok(Request::IssueUnlink { reff, kind, target })
+            },
+        ),
+        Spec::req(
+            "parent",
+            "Set an issue's parent (sub-issue hierarchy): `parent ENG-3 ENG-1`; `--none` clears it.",
+            vec![
+                A::pos("reff", "Issue ref."),
+                A::pos_opt("parent", "Parent issue ref (omit with --none to clear)."),
+                A::flag("none", "Clear the parent (make it a top-level issue)."),
+            ],
+            |m| {
+                let reff = req_str(m, "reff");
+                let parent = opt_str(m, "parent");
+                if parent.is_none() && !flag(m, "none") {
+                    anyhow::bail!(
+                        "give a parent ref, or --none to clear: `lait parent {reff} <epic>`"
+                    );
+                }
+                Ok(Request::IssueParent { reff, parent })
+            },
+        ),
+        Spec::req(
+            "graph",
+            "The issue's relations: parent, sub-issues, links, and open blockers (ref optional — inferred from git).",
+            vec![A::pos_opt("reff", "Issue ref.")],
+            |m| {
+                Ok(Request::IssueGraph {
+                    reff: resolve_reff(m)?,
+                })
+            },
+        )
+        .alias(&["links", "deps"]),
         // ---- registries (grouped: bare = list) ----
         Spec {
             subs: vec![
@@ -1294,8 +1360,8 @@ pub fn specs() -> Vec<Spec> {
     for s in &mut v {
         s.order = match s.name {
             "new" | "start" | "done" | "stop" | "inbox" | "show" | "board" | "ls" | "edit"
-            | "move" | "assign" | "label" | "comment" | "delete" | "history" | "activity"
-            | "serve" => ORDER_DAILY,
+            | "move" | "assign" | "label" | "comment" | "delete" | "link" | "unlink" | "parent"
+            | "graph" | "history" | "activity" | "serve" => ORDER_DAILY,
             "init" | "join" | "invite" | "spaces" | "members" | "doctor" | "status" | "who" => {
                 ORDER_SHARE
             }

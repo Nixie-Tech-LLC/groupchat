@@ -1,31 +1,49 @@
-//! Layer A — the Catalog document (SCHEMA §4). ONE Loro document per workspace:
-//! the authoritative registry of which issue docs exist, project/label config,
-//! board ordering, the workflow columns, the (P3) signed ACL log, and the
-//! `DocMeta` row cache that lets lists/boards render without opening issue docs.
+//! Layer A — the Catalog document (SCHEMA §4): the workspace's **structure
+//! doc**. ONE Loro document per workspace holding the authoritative registry of
+//! which issue docs exist, project/label config, board ordering, the workflow
+//! columns, the sub-issue hierarchy, the issue-link edge set, and the `DocMeta`
+//! row cache that lets lists/boards render without opening issue docs.
+//!
+//! The catalog is the multi-document container the kernel structurally lacks
+//! (one Loro doc = one tree): issue docs are *content*, the catalog is *nodes,
+//! ordering, hierarchy, and edges* (LAIT-DATA-CONTRACT §3.2).
 //!
 //! **Authority (S§3).** `Catalog.docs` existence, `projects`, `labels`,
-//! `workflow`, board *ordering*, and `acl` are authoritative. `DocMeta` row
-//! fields are a **one-directional cache** of the issue doc (S§3.1): the issue
-//! doc is always truth; every local edit and every import recomputes the row via
-//! [`CatalogDoc::upsert_row`]. Nothing writes a row field as if it were
-//! authoritative.
+//! `workflow`, board *ordering*, `subs`, `edges`, and `acl` are authoritative.
+//! `DocMeta` row fields are a **one-directional cache** of the issue doc
+//! (S§3.1): the issue doc is always truth; every local edit and every import
+//! recomputes the row via [`CatalogDoc::upsert_row`]. Nothing writes a row
+//! field as if it were authoritative.
 //!
 //! **`head` (S§3.2).** `DocMeta.head` is a cache of the issue-doc frontiers —
 //! `blake3(frontiers.encode())`. Because mirroring it is a second write to a
 //! second doc, the store recomputes every head from the real issue frontiers on
 //! load ([`CatalogDoc::upsert_row`] is the single writer of it).
+//!
+//! **`subs` (contract §3.2).** Sub-issue hierarchy as a real tree-move CRDT,
+//! never an LWW `parentId`: two peers concurrently moving A under B and B under
+//! A each perform a locally-legal write whose combination is a cycle — only the
+//! merge can adjudicate, and the kernel's move algorithm (Kleppmann et al.,
+//! IEEE TPDS 2022) converges it to a valid tree on every replica.
+//!
+//! **`edges` (contract §3.2).** Issue links as an add-wins set keyed
+//! `"<from>|<kind>|<to>"`. Referential integrity is filtered at read time (an
+//! edge may name a tombstoned or not-yet-synced doc).
 
 use anyhow::{anyhow, Result};
 use loro::{
-    Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, LoroMovableList, ValueOrContainer,
+    Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroTree,
+    TreeID, TreeParentId, ValueOrContainer,
 };
 
 use crate::dto::{
     default_workflow, LabelDto, Priority, ProjectDto, StatusCategory, WorkflowState, SCHEMA_VERSION,
 };
 use crate::ids::{DocId, LabelId, ProjectId, UserId, WorkspaceId};
-use crate::issue::IssueDoc;
-use crate::loro_ext as lx;
+
+use super::issue::IssueDoc;
+use super::loro_ext as lx;
+use super::op::{self, OpCtx};
 
 const ROOT: &str = "catalog";
 const K_SCHEMA: &str = "schemaVersion";
@@ -38,6 +56,10 @@ const C_LABELS: &str = "labels";
 const C_WORKFLOW: &str = "workflow";
 const C_ACL: &str = "acl";
 const C_ALIASES: &str = "aliases";
+const C_SUBS: &str = "subs";
+const C_EDGES: &str = "edges";
+/// The tree-node meta key carrying the issue DocId a `subs` node stands for.
+const META_DOC: &str = "docId";
 
 /// Internal read of one `DocMeta` row (SCHEMA §4). The `Row` DTO is projected
 /// from this plus viewer context (UI "you" awareness) in the node layer.
@@ -63,6 +85,14 @@ pub struct RowMeta {
     pub provisional: bool,
 }
 
+/// One issue link (contract §3.2): `from --kind--> to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub from: DocId,
+    pub kind: String,
+    pub to: DocId,
+}
+
 /// A wrapper around the workspace's Catalog `LoroDoc`.
 pub struct CatalogDoc {
     doc: LoroDoc,
@@ -70,9 +100,15 @@ pub struct CatalogDoc {
 
 impl CatalogDoc {
     /// Create a fresh Catalog for a workspace, seeding schema + display name +
-    /// default workflow.
-    pub fn create(workspace_id: &WorkspaceId, name: &str) -> Result<Self> {
+    /// default workflow + the structure containers.
+    pub fn create(
+        workspace_id: &WorkspaceId,
+        name: &str,
+        peer: Option<u64>,
+        founder: &UserId,
+    ) -> Result<Self> {
         let doc = LoroDoc::new();
+        op::configure(&doc, peer);
         let root = doc.get_map(ROOT);
         root.insert(K_SCHEMA, SCHEMA_VERSION as i64)?;
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
@@ -83,32 +119,43 @@ impl CatalogDoc {
         root.insert_container(C_LABELS, LoroMap::new())?;
         root.insert_container(C_ALIASES, LoroMap::new())?;
         root.insert_container(C_ACL, LoroList::new())?;
+        root.insert_container(C_SUBS, LoroTree::new())?;
+        root.insert_container(C_EDGES, LoroMap::new())?;
         let wf = root.insert_container(C_WORKFLOW, LoroMovableList::new())?;
         for (i, state) in default_workflow().into_iter().enumerate() {
             let m = wf.insert_container(i, LoroMap::new())?;
             write_workflow_state(&m, &state)?;
         }
-        doc.commit();
+        op::commit_with(&doc, &OpCtx::structure("init", founder));
         Ok(Self { doc })
     }
 
-    pub fn from_doc(doc: LoroDoc) -> Self {
-        Self { doc }
+    /// Load from stored snapshot bytes, applying the contract's kernel config.
+    pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
+        let doc = LoroDoc::new();
+        op::configure(&doc, peer);
+        doc.import(bytes)
+            .map_err(|e| anyhow!("import catalog snapshot: {e}"))?;
+        Ok(Self { doc })
     }
+
     /// A bare, uninitialized catalog — used by a JOINER (A§10). A joiner must NOT
     /// `create()` its own containers: `create` mints peer-specific attached
     /// child containers (`docs`/`projects`/…), and merging the founder's ops
     /// would then LWW-resolve the root's child registers non-deterministically to
     /// an empty local container. Starting empty and importing the founder's full
     /// ops adopts the founder's exact container ids, so everything merges.
-    pub fn empty() -> Self {
-        Self {
-            doc: LoroDoc::new(),
-        }
+    pub fn empty(peer: Option<u64>) -> Self {
+        let doc = LoroDoc::new();
+        op::configure(&doc, peer);
+        Self { doc }
     }
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
+
+    /// Land staged ops as one metadata-carrying change (contract §6).
+    pub fn apply(&self, ctx: &OpCtx) {
+        op::commit_with(&self.doc, ctx);
     }
+
     pub fn snapshot(&self) -> Result<Vec<u8>> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -121,20 +168,35 @@ impl CatalogDoc {
             .map_err(|e| anyhow!("import catalog update: {e}"))
     }
     /// The catalog's own oplog frontiers — the catalog-first sync digest (A§8).
-    pub fn head(&self) -> Frontiers {
+    pub(in crate::engine) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
-
-    /// The catalog's oplog version vector (for the catalog-first VV-diff, A§8).
-    pub fn oplog_vv(&self) -> loro::VersionVector {
-        self.doc.oplog_vv()
+    /// The catalog head digest, wire form (gossip announce, A§8).
+    pub fn head_hash(&self) -> Vec<u8> {
+        head_hash(&self.head())
+    }
+    /// The raw encoded frontiers (input to the combined sync head, A§8).
+    pub fn head_bytes(&self) -> Vec<u8> {
+        self.head().encode()
     }
 
-    /// Export only the catalog ops a peer at `from` lacks (A§8 phase 1).
-    pub fn export_from(&self, from: &loro::VersionVector) -> Result<Vec<u8>> {
+    /// The catalog's oplog version vector, wire-encoded (A§8).
+    pub fn oplog_vv_bytes(&self) -> Vec<u8> {
+        self.doc.oplog_vv().encode()
+    }
+
+    /// Export only the catalog ops a peer lacks, from its wire-encoded VV (A§8).
+    pub fn export_from_bytes(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
+        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
         self.doc
-            .export(ExportMode::updates(from))
+            .export(ExportMode::updates(&vv))
             .map_err(|e| anyhow!("export catalog updates: {e}"))
+    }
+
+    /// The deep state as JSON — for convergence assertions and debugging.
+    pub fn state_json(&self) -> serde_json::Value {
+        use loro::ToJson;
+        self.doc.get_deep_value().to_json_value()
     }
 
     fn root(&self) -> LoroMap {
@@ -164,6 +226,24 @@ impl CatalogDoc {
     fn workflow_list(&self) -> Option<LoroMovableList> {
         match self.root().get(C_WORKFLOW) {
             Some(ValueOrContainer::Container(Container::MovableList(l))) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The sub-issue tree. Lazily created on first write so catalogs founded
+    /// before the container existed keep working (additive change, S§9 rule 1).
+    fn subs_tree(&self, create: bool) -> Option<LoroTree> {
+        match self.root().get(C_SUBS) {
+            Some(ValueOrContainer::Container(Container::Tree(t))) => Some(t),
+            _ if create => self.root().insert_container(C_SUBS, LoroTree::new()).ok(),
+            _ => None,
+        }
+    }
+    /// The issue-link edge set (same lazy-create rule as `subs`).
+    fn edges_map(&self, create: bool) -> Option<LoroMap> {
+        match self.root().get(C_EDGES) {
+            Some(ValueOrContainer::Container(Container::Map(m))) => Some(m),
+            _ if create => self.root().insert_container(C_EDGES, LoroMap::new()).ok(),
             _ => None,
         }
     }
@@ -385,7 +465,7 @@ impl CatalogDoc {
             .collect::<Vec<_>>()
             .join(",");
         m.insert("assignees", assignees.as_str())?;
-        let head = head_hash(&issue.head());
+        let head = issue.head_hash();
         m.insert("head", head.as_slice())?;
         Ok(())
     }
@@ -520,11 +600,166 @@ impl CatalogDoc {
         }
         Ok(())
     }
+
+    // ---- subs (sub-issue hierarchy — tree-move CRDT, contract §3.2) ----
+
+    /// Find the tree node standing for `doc_id`, skipping deleted nodes.
+    fn node_for(&self, tree: &LoroTree, doc_id: &DocId) -> Option<TreeID> {
+        tree.nodes().into_iter().find(|n| {
+            !tree.is_node_deleted(n).unwrap_or(true)
+                && tree
+                    .get_meta(*n)
+                    .ok()
+                    .and_then(|m| lx::get_str(&m, META_DOC))
+                    .as_deref()
+                    == Some(doc_id.as_str())
+        })
+    }
+
+    fn node_for_or_create(&self, tree: &LoroTree, doc_id: &DocId) -> Result<TreeID> {
+        if let Some(n) = self.node_for(tree, doc_id) {
+            return Ok(n);
+        }
+        let n = tree.create(TreeParentId::Root)?;
+        tree.get_meta(n)?.insert(META_DOC, doc_id.as_str())?;
+        Ok(n)
+    }
+
+    /// Parent `child` under `parent`, or unparent it (`None` → back to root).
+    /// A *locally visible* cycle is rejected with a friendly error; a cycle
+    /// formed only by concurrent moves is resolved by the kernel's merge
+    /// (greater-timestamped move ignored — Kleppmann et al. §3.5).
+    pub fn set_parent(&self, child: &DocId, parent: Option<&DocId>) -> Result<()> {
+        let tree = self
+            .subs_tree(true)
+            .ok_or_else(|| anyhow!("subs container unavailable"))?;
+        let child_node = self.node_for_or_create(&tree, child)?;
+        let target = match parent {
+            Some(p) => TreeParentId::Node(self.node_for_or_create(&tree, p)?),
+            None => TreeParentId::Root,
+        };
+        tree.mov(child_node, target).map_err(|e| match e {
+            loro::LoroError::TreeError(loro::LoroTreeError::CyclicMoveError) => {
+                anyhow!("that would make an issue its own ancestor")
+            }
+            other => anyhow!("move sub-issue: {other}"),
+        })
+    }
+
+    /// The parent issue of `doc_id` in the sub-issue tree, if any.
+    pub fn parent_of(&self, doc_id: &DocId) -> Option<DocId> {
+        let tree = self.subs_tree(false)?;
+        let node = self.node_for(&tree, doc_id)?;
+        match tree.parent(node) {
+            Some(TreeParentId::Node(p)) => tree
+                .get_meta(p)
+                .ok()
+                .and_then(|m| lx::get_str(&m, META_DOC))
+                .and_then(|s| DocId::parse(&s)),
+            _ => None,
+        }
+    }
+
+    /// The child issues of `doc_id` in the sub-issue tree.
+    pub fn children_of(&self, doc_id: &DocId) -> Vec<DocId> {
+        let Some(tree) = self.subs_tree(false) else {
+            return Vec::new();
+        };
+        let Some(node) = self.node_for(&tree, doc_id) else {
+            return Vec::new();
+        };
+        tree.children(TreeParentId::Node(node))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| !tree.is_node_deleted(n).unwrap_or(true))
+            .filter_map(|n| {
+                tree.get_meta(n)
+                    .ok()
+                    .and_then(|m| lx::get_str(&m, META_DOC))
+                    .and_then(|s| DocId::parse(&s))
+            })
+            .collect()
+    }
+
+    /// Every (child, parent) pair in the hierarchy — the adjacency projection's
+    /// rebuild source (parent `None` = a root node with children).
+    pub fn sub_pairs(&self) -> Vec<(DocId, Option<DocId>)> {
+        let Some(tree) = self.subs_tree(false) else {
+            return Vec::new();
+        };
+        let doc_of = |n: TreeID| {
+            tree.get_meta(n)
+                .ok()
+                .and_then(|m| lx::get_str(&m, META_DOC))
+                .and_then(|s| DocId::parse(&s))
+        };
+        tree.nodes()
+            .into_iter()
+            .filter(|n| !tree.is_node_deleted(n).unwrap_or(true))
+            .filter_map(|n| {
+                let child = doc_of(n)?;
+                let parent = match tree.parent(n) {
+                    Some(TreeParentId::Node(p)) => doc_of(p),
+                    _ => None,
+                };
+                Some((child, parent))
+            })
+            .collect()
+    }
+
+    // ---- edges (issue links — add-wins set, contract §3.2) ----
+
+    fn edge_key(from: &DocId, kind: &str, to: &DocId) -> String {
+        format!("{from}|{kind}|{to}")
+    }
+
+    /// Add a link. Concurrent adds converge trivially (add-wins set).
+    pub fn edge_add(&self, from: &DocId, kind: &str, to: &DocId) -> Result<()> {
+        if kind.is_empty() || kind.contains('|') {
+            anyhow::bail!("bad link kind '{kind}'");
+        }
+        self.edges_map(true)
+            .ok_or_else(|| anyhow!("edges container unavailable"))?
+            .insert(&Self::edge_key(from, kind, to), true)?;
+        Ok(())
+    }
+
+    /// Remove a link (a real key delete — set membership has no undelete
+    /// semantics to preserve, unlike doc tombstones).
+    pub fn edge_remove(&self, from: &DocId, kind: &str, to: &DocId) -> Result<bool> {
+        let Some(m) = self.edges_map(false) else {
+            return Ok(false);
+        };
+        let key = Self::edge_key(from, kind, to);
+        if m.get(&key).is_some() {
+            m.delete(&key)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Every link in the workspace. Referential integrity (tombstoned/unknown
+    /// endpoints) is the *caller's* read-time filter — the set itself is honest.
+    pub fn edges(&self) -> Vec<Edge> {
+        let Some(m) = self.edges_map(false) else {
+            return Vec::new();
+        };
+        lx::present_keys(&m)
+            .into_iter()
+            .filter_map(|k| {
+                let mut parts = k.split('|');
+                let from = DocId::parse(parts.next()?)?;
+                let kind = parts.next()?.to_string();
+                let to = DocId::parse(parts.next()?)?;
+                Some(Edge { from, kind, to })
+            })
+            .collect()
+    }
 }
 
 /// The opaque `DocMeta.head` digest: `blake3(frontiers.encode())` → 32 bytes
 /// (SCHEMA §3.2, `head: value<bytes32>`).
-pub fn head_hash(frontiers: &Frontiers) -> Vec<u8> {
+pub(in crate::engine) fn head_hash(frontiers: &Frontiers) -> Vec<u8> {
     blake3::hash(&frontiers.encode()).as_bytes().to_vec()
 }
 
@@ -555,13 +790,19 @@ mod tests {
     fn ws() -> WorkspaceId {
         WorkspaceId::mint(&SystemUlidSource)
     }
+    fn user() -> UserId {
+        UserId::from_key_string("a".repeat(64))
+    }
+    fn ctx(kind: &str) -> OpCtx {
+        OpCtx::structure(kind, &user())
+    }
 
     fn cat() -> (CatalogDoc, WorkspaceId, ProjectId) {
         let w = ws();
-        let c = CatalogDoc::create(&w, "test").unwrap();
+        let c = CatalogDoc::create(&w, "test", None, &user()).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         c.add_project(&p, "Engineering", "ENG", "blue").unwrap();
-        c.doc().commit();
+        c.apply(&ctx("project_new"));
         (c, w, p)
     }
 
@@ -572,9 +813,10 @@ mod tests {
             project_id: p.clone(),
             title: title.into(),
             priority: Priority::Medium,
-            created_by: UserId::from_key_string("a".repeat(64)),
+            created_by: user(),
             created_at: 42,
             body: None,
+            peer: None,
         })
         .unwrap()
     }
@@ -599,7 +841,7 @@ mod tests {
         assert_eq!(c.projects_list().len(), 1);
         let l = LabelId::mint(&SystemUlidSource);
         c.add_label(&l, "bug", "red").unwrap();
-        c.doc().commit();
+        c.apply(&ctx("label_new"));
         assert_eq!(c.label_by_name("BUG").map(|x| x.id), Some(l));
     }
 
@@ -609,19 +851,19 @@ mod tests {
         let (c, w, p) = cat();
         let issue = make_issue(&w, &p, "fix login");
         c.upsert_row(&issue).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("row"));
         let row = c.row(&issue.doc_id().unwrap()).unwrap();
         assert_eq!(row.title, "fix login");
         assert_eq!(row.status, "backlog");
         assert_eq!(row.priority, Priority::Medium);
         assert_eq!(row.project_id, p);
-        assert_eq!(row.head, head_hash(&issue.head()));
+        assert_eq!(row.head, issue.head_hash());
         // edit the issue → recompute → row follows
         issue.set_title("fix login race").unwrap();
         issue.set_status("done").unwrap();
-        issue.commit();
+        issue.apply(&OpCtx::content("edited", &user()));
         c.upsert_row(&issue).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("row"));
         let row = c.row(&issue.doc_id().unwrap()).unwrap();
         assert_eq!(row.title, "fix login race");
         assert_eq!(row.status, "done");
@@ -650,7 +892,7 @@ mod tests {
             c.upsert_row(i).unwrap();
             c.board_insert_bottom(&p, &i.doc_id().unwrap()).unwrap();
         }
-        c.doc().commit();
+        c.apply(&ctx("seed"));
         let (ai, bi, ci) = (
             a.doc_id().unwrap(),
             b.doc_id().unwrap(),
@@ -659,15 +901,15 @@ mod tests {
         assert_eq!(c.board_order(&p), vec![ai.clone(), bi.clone(), ci.clone()]);
         // move c before a
         c.board_move(&p, &ci, &ai, false).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("moved"));
         assert_eq!(c.board_order(&p), vec![ci.clone(), ai.clone(), bi.clone()]);
         // inserting an existing doc doesn't dup
         c.board_insert_bottom(&p, &ai).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("moved"));
         assert_eq!(c.board_order(&p).len(), 3);
         // remove
         c.board_remove(&p, &ai).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("moved"));
         assert_eq!(c.board_order(&p), vec![ci, bi]);
     }
 
@@ -684,10 +926,10 @@ mod tests {
                 id
             })
             .collect();
-        c.doc().commit();
+        c.apply(&ctx("seed"));
         // move a (idx 0) AFTER d (idx 2): expect [b, d, a, e]
         c.board_move(&p, &ids[0], &ids[2], true).unwrap();
-        c.doc().commit();
+        c.apply(&ctx("moved"));
         assert_eq!(
             c.board_order(&p),
             vec![
@@ -715,24 +957,18 @@ mod tests {
                 id
             })
             .collect();
-        c.doc().commit();
+        c.apply(&ctx("seed"));
         // fork a replica from a snapshot
         let snap = c.snapshot().unwrap();
-        let c2 = CatalogDoc::from_doc({
-            let d = LoroDoc::new();
-            d.import(&snap).unwrap();
-            d
-        });
+        let c2 = CatalogDoc::from_snapshot(&snap, None).unwrap();
         // both replicas move `a` concurrently to different anchors
         c.board_move(&p, &ids[0], &ids[3], true).unwrap(); // a after e
-        c.doc().commit();
+        c.apply(&ctx("moved"));
         c2.board_move(&p, &ids[0], &ids[1], true).unwrap(); // a after b
-        c2.doc().commit();
+        c2.apply(&ctx("moved"));
         // sync both directions
         c.import(&c2.snapshot().unwrap()).unwrap();
         c2.import(&c.snapshot().unwrap()).unwrap();
-        c.doc().commit();
-        c2.doc().commit();
         let o1 = c.board_order(&p);
         let o2 = c2.board_order(&p);
         assert_eq!(o1, o2, "raw board orders converge byte-identical");
@@ -746,20 +982,123 @@ mod tests {
     }
 
     #[test]
+    fn sub_hierarchy_parent_children_roundtrip() {
+        let (c, w, p) = cat();
+        let epic = make_issue(&w, &p, "epic").doc_id().unwrap();
+        let a = make_issue(&w, &p, "a").doc_id().unwrap();
+        let b = make_issue(&w, &p, "b").doc_id().unwrap();
+        c.set_parent(&a, Some(&epic)).unwrap();
+        c.set_parent(&b, Some(&epic)).unwrap();
+        c.apply(&ctx("parent"));
+        assert_eq!(c.parent_of(&a), Some(epic.clone()));
+        let mut kids = c.children_of(&epic);
+        kids.sort();
+        let mut expect = vec![a.clone(), b.clone()];
+        expect.sort();
+        assert_eq!(kids, expect);
+        // unparent
+        c.set_parent(&a, None).unwrap();
+        c.apply(&ctx("parent"));
+        assert_eq!(c.parent_of(&a), None);
+        assert_eq!(c.children_of(&epic), vec![b]);
+    }
+
+    #[test]
+    fn sub_hierarchy_rejects_local_cycle() {
+        let (c, w, p) = cat();
+        let a = make_issue(&w, &p, "a").doc_id().unwrap();
+        let b = make_issue(&w, &p, "b").doc_id().unwrap();
+        c.set_parent(&b, Some(&a)).unwrap();
+        c.apply(&ctx("parent"));
+        let err = c.set_parent(&a, Some(&b)).unwrap_err();
+        assert!(
+            err.to_string().contains("ancestor"),
+            "cycle rejected with a friendly error: {err}"
+        );
+    }
+
+    #[test]
+    fn concurrent_cycle_converges_to_a_valid_tree() {
+        // The contract §3.2 guarantee (Kleppmann et al. TPDS 2022): A→B and B→A
+        // performed concurrently converge on every replica to a tree, never a
+        // cycle — the exact scenario an LWW parentId cannot survive.
+        let (c, w, p) = cat();
+        let a = make_issue(&w, &p, "a").doc_id().unwrap();
+        let b = make_issue(&w, &p, "b").doc_id().unwrap();
+        // materialize both nodes before forking so replicas share tree ids
+        c.set_parent(&a, None).unwrap();
+        c.set_parent(&b, None).unwrap();
+        c.apply(&ctx("seed"));
+        let c2 = CatalogDoc::from_snapshot(&c.snapshot().unwrap(), None).unwrap();
+
+        c.set_parent(&b, Some(&a)).unwrap(); // replica 1: B under A
+        c.apply(&ctx("parent"));
+        c2.set_parent(&a, Some(&b)).unwrap(); // replica 2: A under B (concurrent)
+        c2.apply(&ctx("parent"));
+
+        c.import(&c2.snapshot().unwrap()).unwrap();
+        c2.import(&c.snapshot().unwrap()).unwrap();
+
+        assert_eq!(c.parent_of(&a), c2.parent_of(&a), "converged");
+        assert_eq!(c.parent_of(&b), c2.parent_of(&b), "converged");
+        // no cycle: at most one of the two parent links survives
+        let cycle = c.parent_of(&a) == Some(b.clone()) && c.parent_of(&b) == Some(a.clone());
+        assert!(!cycle, "concurrent moves must never converge to a cycle");
+    }
+
+    #[test]
+    fn edges_add_remove_and_concurrent_union() {
+        let (c, w, p) = cat();
+        let a = make_issue(&w, &p, "a").doc_id().unwrap();
+        let b = make_issue(&w, &p, "b").doc_id().unwrap();
+        let d = make_issue(&w, &p, "d").doc_id().unwrap();
+        c.edge_add(&a, "blocks", &b).unwrap();
+        c.apply(&ctx("link"));
+        let c2 = CatalogDoc::from_snapshot(&c.snapshot().unwrap(), None).unwrap();
+        // concurrent adds on both replicas
+        c.edge_add(&a, "relates", &d).unwrap();
+        c.apply(&ctx("link"));
+        c2.edge_add(&b, "blocks", &d).unwrap();
+        c2.apply(&ctx("link"));
+        c.import(&c2.snapshot().unwrap()).unwrap();
+        c2.import(&c.snapshot().unwrap()).unwrap();
+        let mut e1: Vec<String> = c
+            .edges()
+            .iter()
+            .map(|e| format!("{}|{}|{}", e.from, e.kind, e.to))
+            .collect();
+        let mut e2: Vec<String> = c2
+            .edges()
+            .iter()
+            .map(|e| format!("{}|{}|{}", e.from, e.kind, e.to))
+            .collect();
+        e1.sort();
+        e2.sort();
+        assert_eq!(e1, e2, "edge sets converge");
+        assert_eq!(e1.len(), 3, "all three concurrent adds survive");
+        // remove
+        assert!(c.edge_remove(&a, "blocks", &b).unwrap());
+        c.apply(&ctx("unlink"));
+        assert_eq!(c.edges().len(), 2);
+        assert!(!c.edge_remove(&a, "blocks", &b).unwrap(), "idempotent");
+    }
+
+    #[test]
     fn snapshot_roundtrip_preserves_catalog() {
         let (c, w, p) = cat();
         let i = make_issue(&w, &p, "keep me");
         c.upsert_row(&i).unwrap();
         c.board_insert_top(&p, &i.doc_id().unwrap()).unwrap();
-        c.doc().commit();
+        let child = make_issue(&w, &p, "child").doc_id().unwrap();
+        c.set_parent(&child, Some(&i.doc_id().unwrap())).unwrap();
+        c.edge_add(&child, "blocks", &i.doc_id().unwrap()).unwrap();
+        c.apply(&ctx("seed"));
         let snap = c.snapshot().unwrap();
-        let loaded = CatalogDoc::from_doc({
-            let d = LoroDoc::new();
-            d.import(&snap).unwrap();
-            d
-        });
+        let loaded = CatalogDoc::from_snapshot(&snap, None).unwrap();
         assert_eq!(loaded.project_by_key("ENG").map(|x| x.id), Some(p.clone()));
         assert_eq!(loaded.row(&i.doc_id().unwrap()).unwrap().title, "keep me");
         assert_eq!(loaded.board_order(&p).len(), 1);
+        assert_eq!(loaded.parent_of(&child), Some(i.doc_id().unwrap()));
+        assert_eq!(loaded.edges().len(), 1);
     }
 }

@@ -1,8 +1,8 @@
 //! Property-based CRDT convergence tests (SCHEMA §1: "all merge semantics live
 //! in Loro"). Each test drives a proptest-generated sequence of operations
-//! across 2–3 independent replicas of one document, exchanges Loro updates
-//! all-pairs until quiescence, and asserts every replica reaches byte-identical
-//! state (`LoroDoc::get_deep_value()` equality) plus the schema-level invariant
+//! across 2–3 independent replicas of one document, exchanges updates all-pairs
+//! until quiescence, and asserts every replica reaches identical state
+//! (deep-value equality via `state_json()`) plus the schema-level invariant
 //! that the merge rule promises:
 //!
 //!   * `issue_lww_converges`               — S§5.1 last-writer-wins registers
@@ -10,17 +10,23 @@
 //!   * `board_movable_list_converges`      — S§5.5 board ordering (movable list)
 //!   * `catalog_docs_grow_set_converges`   — S§4  the `docs` grow-only key set
 //!
+//! Post-contract note: these tests exercise the sealed engine surface only
+//! (LAIT-DATA-CONTRACT §6) — replicas fork via `from_snapshot`, mutate through
+//! the typed writers, land ops with `apply(OpCtx)`, and exchange bytes through
+//! `oplog_vv_bytes`/`export_from_bytes`/`import`. No raw kernel handle exists
+//! out here, which is itself part of what is under test.
+//!
 //! Determinism rule (the plan's "inject clocks/seeds"): all randomness that
 //! affects assertions flows through proptest inputs. `SystemUlidSource` is used
 //! ONLY to mint ids (whose *values* never enter an assertion — only their
 //! identity/uniqueness does), and `created_at` is a fixed constant. No
 //! wall-clock or RNG is read inside an assertion path.
 
-use loro::{ExportMode, LoroDoc};
 use proptest::prelude::*;
 
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
+use lait::engine::op::OpCtx;
 use lait::ids::{DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
 use lait::issue::{IssueDoc, NewIssue};
 
@@ -28,24 +34,66 @@ use lait::issue::{IssueDoc, NewIssue};
 /// replicas differ.
 const CREATED_AT: u64 = 1_000;
 
+fn tester() -> UserId {
+    UserId::from_key_string("a".repeat(64))
+}
+fn ctx() -> OpCtx {
+    OpCtx::content("test", &tester())
+}
+
+/// The engine surface a convergence test needs from any replicated doc.
+trait Replica {
+    fn vv(&self) -> Vec<u8>;
+    fn export_missing(&self, peer_vv: &[u8]) -> Vec<u8>;
+    fn import_bytes(&self, bytes: &[u8]);
+    fn state(&self) -> serde_json::Value;
+}
+
+impl Replica for IssueDoc {
+    fn vv(&self) -> Vec<u8> {
+        self.oplog_vv_bytes()
+    }
+    fn export_missing(&self, peer_vv: &[u8]) -> Vec<u8> {
+        self.export_from_bytes(peer_vv).expect("export updates")
+    }
+    fn import_bytes(&self, bytes: &[u8]) {
+        self.import(bytes).expect("import updates");
+    }
+    fn state(&self) -> serde_json::Value {
+        self.state_json()
+    }
+}
+
+impl Replica for CatalogDoc {
+    fn vv(&self) -> Vec<u8> {
+        self.oplog_vv_bytes()
+    }
+    fn export_missing(&self, peer_vv: &[u8]) -> Vec<u8> {
+        self.export_from_bytes(peer_vv).expect("export updates")
+    }
+    fn import_bytes(&self, bytes: &[u8]) {
+        self.import(bytes).expect("import updates");
+    }
+    fn state(&self) -> serde_json::Value {
+        self.state_json()
+    }
+}
+
 /// The core sync primitive (SCHEMA §8): all-pairs exchange of version-vector
-/// deltas. For every ordered pair (i, j) we ship i's ops that j is missing
-/// (`export(updates(j.oplog_vv()))`) into j. Running the full all-pairs loop
-/// three times drives the mesh to quiescence even when an update produced in an
-/// earlier round only becomes relevant to a third replica after a later import.
-fn sync_all(docs: &[&LoroDoc]) {
+/// deltas. For every ordered pair (i, j) we ship i's ops that j is missing into
+/// j. Running the full all-pairs loop three times drives the mesh to quiescence
+/// even when an update produced in an earlier round only becomes relevant to a
+/// third replica after a later import.
+fn sync_all<R: Replica>(docs: &[&R]) {
     for _ in 0..3 {
         for i in 0..docs.len() {
             for j in 0..docs.len() {
                 if i == j {
                     continue;
                 }
-                let missing = docs[j].oplog_vv();
-                let update = docs[i]
-                    .export(ExportMode::updates(&missing))
-                    .expect("export updates");
+                let update = docs[i].export_missing(&docs[j].vv());
                 if !update.is_empty() {
-                    docs[j].import(&update).expect("import updates");
+                    docs[j].import_bytes(&update);
                 }
             }
         }
@@ -54,11 +102,11 @@ fn sync_all(docs: &[&LoroDoc]) {
 
 /// Assert every replica's materialized deep value equals replica 0's — the
 /// definition of convergence (all replicas agree on the whole document state).
-fn assert_deep_values_converged(docs: &[&LoroDoc]) {
-    let base = docs[0].get_deep_value();
+fn assert_deep_values_converged<R: Replica>(docs: &[&R]) {
+    let base = docs[0].state();
     for (i, d) in docs.iter().enumerate().skip(1) {
         assert_eq!(
-            d.get_deep_value(),
+            d.state(),
             base,
             "replica {i} deep value diverged from replica 0",
         );
@@ -67,20 +115,16 @@ fn assert_deep_values_converged(docs: &[&LoroDoc]) {
 
 /// Fork an issue replica off a shared base snapshot. Replicas MUST descend from
 /// a common base doc: two docs created independently would share no history root
-/// and their overlapping container layouts could not merge. Importing the same
-/// snapshot into a fresh `LoroDoc` gives a replica the shared root while Loro
-/// still assigns it a distinct internal peer id.
+/// and their overlapping container layouts could not merge. `from_snapshot`
+/// gives a replica the shared root while the kernel still assigns it a distinct
+/// internal peer id.
 fn issue_replica_from(snap: &[u8]) -> IssueDoc {
-    let d = LoroDoc::new();
-    d.import(snap).expect("import base issue snapshot");
-    IssueDoc::from_doc(d)
+    IssueDoc::from_snapshot(snap, None).expect("import base issue snapshot")
 }
 
 /// Fork a catalog replica off a shared base snapshot (same rationale as above).
 fn catalog_replica_from(snap: &[u8]) -> CatalogDoc {
-    let d = LoroDoc::new();
-    d.import(snap).expect("import base catalog snapshot");
-    CatalogDoc::from_doc(d)
+    CatalogDoc::from_snapshot(snap, None).expect("import base catalog snapshot")
 }
 
 fn base_issue() -> IssueDoc {
@@ -90,9 +134,10 @@ fn base_issue() -> IssueDoc {
         project_id: ProjectId::mint(&SystemUlidSource),
         title: "base title".into(),
         priority: Priority::None,
-        created_by: UserId::from_key_string("a".repeat(64)),
+        created_by: tester(),
         created_at: CREATED_AT,
         body: None,
+        peer: None,
     })
     .expect("create base issue")
 }
@@ -152,10 +197,10 @@ proptest! {
                 LwwOp::SetStatus(i) => r.set_status(STATUSES[*i]).unwrap(),
                 LwwOp::SetPriority(p) => r.set_priority(*p).unwrap(),
             }
-            r.commit(); // a LoroDoc must commit before its ops can be exported
+            r.apply(&ctx()); // ops must land before they can be exported
         }
 
-        let docs: Vec<&LoroDoc> = replicas.iter().map(|r| r.doc()).collect();
+        let docs: Vec<&IssueDoc> = replicas.iter().collect();
         sync_all(&docs);
 
         assert_deep_values_converged(&docs);
@@ -222,10 +267,10 @@ proptest! {
                 SetOp::AddLabel(i) => r.add_label(&labels[*i]).unwrap(),
                 SetOp::RemoveLabel(i) => r.remove_label(&labels[*i]).unwrap(),
             }
-            r.commit();
+            r.apply(&ctx());
         }
 
-        let docs: Vec<&LoroDoc> = replicas.iter().map(|r| r.doc()).collect();
+        let docs: Vec<&IssueDoc> = replicas.iter().collect();
         sync_all(&docs);
 
         assert_deep_values_converged(&docs);
@@ -274,8 +319,7 @@ proptest! {
     /// from a shared board of K issues, concurrent reorders across replicas must
     /// converge to ONE identical raw order, whose S§5.5 projection (dedup) is a
     /// permutation of the same K docs. (The raw list may hold a duplicate after
-    /// a concurrent move-of-the-same-doc, since `board_move` reinserts rather
-    /// than `mov`s — see the assertion block; dedup is a projection-time rule.)
+    /// concurrent insert paths; dedup is a projection-time rule.)
     #[test]
     fn board_movable_list_converges(
         k in 3usize..=6,
@@ -284,7 +328,7 @@ proptest! {
     ) {
         // Shared base catalog: one project + K issues already on the board.
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let base = CatalogDoc::create(&ws, "test").unwrap();
+        let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
 
@@ -296,9 +340,10 @@ proptest! {
                 project_id: project.clone(),
                 title: format!("issue {n}"),
                 priority: Priority::None,
-                created_by: UserId::from_key_string("a".repeat(64)),
+                created_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
+                peer: None,
             })
             .unwrap();
             let id = issue.doc_id().unwrap();
@@ -306,7 +351,7 @@ proptest! {
             base.board_insert_bottom(&project, &id).unwrap();
             doc_ids.push(id);
         }
-        base.doc().commit();
+        base.apply(&ctx());
         let snap = base.snapshot().unwrap();
 
         let replicas: Vec<CatalogDoc> =
@@ -321,10 +366,10 @@ proptest! {
                 BoardOp::InsertTop(i) => c.board_insert_top(&project, &doc_ids[i % k]).unwrap(),
                 BoardOp::InsertBottom(i) => c.board_insert_bottom(&project, &doc_ids[i % k]).unwrap(),
             }
-            c.doc().commit();
+            c.apply(&ctx());
         }
 
-        let docs: Vec<&LoroDoc> = replicas.iter().map(|c| c.doc()).collect();
+        let docs: Vec<&CatalogDoc> = replicas.iter().collect();
         sync_all(&docs);
 
         assert_deep_values_converged(&docs);
@@ -332,14 +377,11 @@ proptest! {
         let order0 = replicas[0].board_order(&project);
 
         // Convergence proper: every replica agrees on the EXACT raw movable-list
-        // order — the CRDT guarantee. `board_move` is implemented as
-        // delete-then-insert of the doc id (catalog.rs), not the movable list's
-        // in-place `mov`, so two replicas concurrently moving the SAME doc each
-        // contribute a surviving insert and the merged raw list can carry a
-        // duplicate. That is expected: S§5.5 makes dedup a *projection-time*
-        // render rule (`board_order` returns the raw list, per its own doc
-        // comment), and Loro still totally-orders those concurrent inserts, so
-        // all replicas land on the identical raw list.
+        // order — the CRDT guarantee. Reorders of an already-listed doc use the
+        // native `mov` (no duplicate under concurrent same-doc moves); the
+        // insert paths can still contribute a surviving insert each, and Loro
+        // totally-orders those, so all replicas land on the identical raw list;
+        // S§5.5 makes dedup a *projection-time* render rule.
         for (i, c) in replicas.iter().enumerate() {
             prop_assert_eq!(c.board_order(&project), order0.clone(), "board order diverged at replica {}", i);
         }
@@ -371,10 +413,10 @@ proptest! {
         registrations in prop::collection::vec(0u8..3, 0..30),
     ) {
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let base = CatalogDoc::create(&ws, "test").unwrap();
+        let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
-        base.doc().commit();
+        base.apply(&ctx());
         let snap = base.snapshot().unwrap();
 
         let replicas: Vec<CatalogDoc> =
@@ -391,18 +433,19 @@ proptest! {
                 project_id: project.clone(),
                 title: "grow".into(),
                 priority: Priority::None,
-                created_by: UserId::from_key_string("a".repeat(64)),
+                created_by: tester(),
                 created_at: CREATED_AT,
                 body: None,
+                peer: None,
             })
             .unwrap();
             expected.push(issue.doc_id().unwrap());
             c.upsert_row(&issue).unwrap();
-            c.doc().commit();
+            c.apply(&ctx());
         }
         expected.sort();
 
-        let docs: Vec<&LoroDoc> = replicas.iter().map(|c| c.doc()).collect();
+        let docs: Vec<&CatalogDoc> = replicas.iter().collect();
         sync_all(&docs);
 
         assert_deep_values_converged(&docs);
@@ -411,6 +454,132 @@ proptest! {
             let mut ids = c.doc_ids();
             ids.sort();
             prop_assert_eq!(ids, expected.clone(), "docs set diverged at replica {}", i);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — sub-issue hierarchy (contract §3.2): the tree-move CRDT converges,
+// concurrent cross-replica cycles never survive the merge.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Contract §3.2 / Kleppmann et al. TPDS 2022: arbitrary concurrent
+    /// `set_parent` operations across replicas converge to ONE identical
+    /// hierarchy that is always a valid forest — every doc has at most one
+    /// parent and no doc is its own ancestor — even when replicas concurrently
+    /// perform moves whose combination would be a cycle.
+    #[test]
+    fn sub_hierarchy_converges_and_never_cycles(
+        k in 3usize..=6,
+        n_replicas in 2usize..=3,
+        moves in prop::collection::vec((0u8..3, 0usize..6, prop::option::of(0usize..6)), 0..30),
+    ) {
+        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
+        let project = ProjectId::mint(&SystemUlidSource);
+        base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
+        let doc_ids: Vec<DocId> = (0..k).map(|_| DocId::mint(&SystemUlidSource)).collect();
+        // Materialize every node at root before forking, so replicas share
+        // tree-node identities (same reason replicas share a base snapshot).
+        for id in &doc_ids {
+            base.set_parent(id, None).unwrap();
+        }
+        base.apply(&ctx());
+        let snap = base.snapshot().unwrap();
+
+        let replicas: Vec<CatalogDoc> =
+            (0..n_replicas).map(|_| catalog_replica_from(&snap)).collect();
+
+        for (who, child, parent) in &moves {
+            let c = &replicas[(*who as usize) % n_replicas];
+            let child_id = &doc_ids[child % k];
+            let parent_id = parent.map(|p| doc_ids[p % k].clone());
+            if parent_id.as_ref() == Some(child_id) {
+                continue; // self-parent is rejected at Layer B; skip in the driver
+            }
+            // A locally-visible cycle errors (that's the local guard); ignore it
+            // — the interesting cycles are the cross-replica concurrent ones.
+            let _ = c.set_parent(child_id, parent_id.as_ref());
+            c.apply(&ctx());
+        }
+
+        let docs: Vec<&CatalogDoc> = replicas.iter().collect();
+        sync_all(&docs);
+
+        assert_deep_values_converged(&docs);
+
+        // Identical hierarchy everywhere…
+        let parents0: Vec<Option<DocId>> =
+            doc_ids.iter().map(|d| replicas[0].parent_of(d)).collect();
+        for (i, c) in replicas.iter().enumerate().skip(1) {
+            let parents: Vec<Option<DocId>> = doc_ids.iter().map(|d| c.parent_of(d)).collect();
+            prop_assert_eq!(&parents, &parents0, "hierarchy diverged at replica {}", i);
+        }
+        // …and it is a valid forest: walking up from any node terminates
+        // without revisiting (no cycles), in at most k steps.
+        for d in &doc_ids {
+            let mut seen = std::collections::HashSet::new();
+            let mut cur = Some(d.clone());
+            while let Some(c) = cur {
+                prop_assert!(seen.insert(c.clone()), "cycle through {}", c);
+                cur = replicas[0].parent_of(&c);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — issue links (contract §3.2): the edge set is an add-wins union.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Contract §3.2: `edges` is an add-wins set keyed by the whole edge triple.
+    /// Concurrent adds union; concurrent add/remove of the same edge resolves
+    /// deterministically; the converged edge set is identical everywhere.
+    #[test]
+    fn edge_set_converges(
+        n_replicas in 2usize..=3,
+        ops in prop::collection::vec((0u8..3, 0usize..4, 0usize..4, any::<bool>()), 0..40),
+    ) {
+        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
+        let doc_ids: Vec<DocId> = (0..4).map(|_| DocId::mint(&SystemUlidSource)).collect();
+        base.apply(&ctx());
+        let snap = base.snapshot().unwrap();
+
+        let replicas: Vec<CatalogDoc> =
+            (0..n_replicas).map(|_| catalog_replica_from(&snap)).collect();
+
+        for (who, from, to, add) in &ops {
+            if from == to {
+                continue;
+            }
+            let c = &replicas[(*who as usize) % n_replicas];
+            if *add {
+                c.edge_add(&doc_ids[*from], "blocks", &doc_ids[*to]).unwrap();
+            } else {
+                let _ = c.edge_remove(&doc_ids[*from], "blocks", &doc_ids[*to]).unwrap();
+            }
+            c.apply(&ctx());
+        }
+
+        let docs: Vec<&CatalogDoc> = replicas.iter().collect();
+        sync_all(&docs);
+
+        assert_deep_values_converged(&docs);
+
+        let key = |e: &lait::catalog::Edge| format!("{}|{}|{}", e.from, e.kind, e.to);
+        let mut edges0: Vec<String> = replicas[0].edges().iter().map(&key).collect();
+        edges0.sort();
+        for (i, c) in replicas.iter().enumerate().skip(1) {
+            let mut edges: Vec<String> = c.edges().iter().map(&key).collect();
+            edges.sort();
+            prop_assert_eq!(&edges, &edges0, "edge set diverged at replica {}", i);
         }
     }
 }
