@@ -423,26 +423,20 @@ pub async fn ensure_daemon_as(home: &Path, identity: Option<&Path>) -> Result<()
     // the whole diagnosis, and `Stdio::null()` used to throw exactly that away.
     let log_path = daemon_log_path(home);
     let log = std::fs::File::create(&log_path).ok();
-    let stderr = match log.as_ref().and_then(|f| f.try_clone().ok()) {
-        Some(f) => Stdio::from(f),
-        None => Stdio::null(),
-    };
-    // Pin the resolved store for the spawned daemon so it binds the exact same
-    // store regardless of its cwd (DUR-5). LAIT_HOME, when set (self-
-    // contained / --home / resume), is inherited from our env and takes
-    // precedence, so this is a no-op in that mode.
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .env("LAIT_STORE", home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr);
-    // An explicit identity overrides the inherited one — the supervisor case,
-    // where our own env cannot speak for the home we are starting.
-    if let Some(identity) = identity {
-        cmd.env("LAIT_HOME", identity);
-    }
-    let mut child = cmd.spawn().context("spawn daemon")?;
+    // The daemon outlives us, so it must come up holding *only* what we hand it:
+    // on Windows a plain spawn would also give it every other inheritable handle
+    // we own — including a captured caller's stdout pipe, which then never sees
+    // EOF. See `daemon_spawn`.
+    //
+    // `identity` rides as an argv (`--home`), not an env var. On Windows the
+    // spawn deliberately hands the child our *own* env block so the OS keeps it
+    // correctly sorted — which means an env override there would be a
+    // process-wide `set_var`. That is fine for `LAIT_STORE` in a CLI that
+    // resolves one store and exits, and wrong for `lait serve`, which holds N
+    // homes across two identity kinds at once and would race itself. An argument
+    // is scoped to the child by construction.
+    let mut child =
+        crate::daemon_spawn::spawn(&exe, home, log, identity).context("spawn daemon")?;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         if request(home, &Request::Status).await.is_ok() {
