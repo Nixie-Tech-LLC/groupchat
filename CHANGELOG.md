@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.5.1 — `lait update` actually updates
+
+`lait update` has never worked on Windows. It always failed with `specified file
+not found in archive`, because the path it asked self_update to pull out of the
+release zip was `lait.exe.exe`: self_update appends the platform's executable
+suffix to `bin_name` *before* expanding `{{ bin }}`, so the template spelled
+`.exe` a second time. v0.4.8 shipped that as a *fix* for this exact symptom, and
+v0.5.0 carried it forward.
+
+- **The path is checked against the release, not against itself.** The in-archive
+  path is a claim about cargo-dist's layout, and the test only compared that claim
+  to our own code — it asserted the template string verbatim, so it restated the
+  bug rather than catching it. A new CI job downloads the archives users actually
+  download and asserts the path self_update would extract is really inside them.
+- **Every platform's path is now computable from any host.** It was behind
+  `#[cfg(windows)]`, which can only ever be exercised on the platform it selects —
+  which is why the Windows arm went unexercised through two releases. It takes the
+  target as an argument and reads `self_update::get_target()`, the same string
+  self_update substitutes, so what we plan and what it does cannot drift apart.
+
+> **Updating from v0.5.0 or earlier on Windows needs one manual step**, since the
+> broken code is in the binary doing the updating. Re-run the installer once and
+> `lait update` works from then on:
+>
+> ```
+> powershell -ExecutionPolicy Bypass -c "irm https://github.com/Nixie-Tech-LLC/lait/releases/latest/download/lait-installer.ps1 | iex"
+> ```
+
 ## v0.5.0 — the browser is the interactive surface
 
 The 0.4.x line was a chat engine wearing an issue tracker's clothes. This one is
