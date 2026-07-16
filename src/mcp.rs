@@ -40,6 +40,10 @@ pub const REQUIRED_TRACKER_COMMANDS: &[&str] = &[
     "label",
     "comment",
     "issue_delete",
+    "issue_link",
+    "issue_unlink",
+    "issue_parent",
+    "issue_graph",
     "issue_view",
     "list",
     "board",
@@ -70,6 +74,10 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "label",
     "comment",
     "issue_delete",
+    "issue_link",
+    "issue_unlink",
+    "issue_parent",
+    "issue_graph",
     "issue_view",
     "list",
     "board",
@@ -181,6 +189,24 @@ pub struct LabelArgs {
 pub struct CommentArgs {
     pub reff: String,
     pub body: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkArgs {
+    /// The issue the link is stated from.
+    pub reff: String,
+    /// Link kind: `blocks` | `relates` | `duplicates`.
+    pub kind: String,
+    /// The issue the link points at.
+    pub target: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ParentArgs {
+    pub reff: String,
+    /// Parent issue ref; omit to clear (make it a top-level issue).
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -461,6 +487,60 @@ impl LaitMcp {
         Parameters(a): Parameters<RefArg>,
     ) -> Result<CallToolResult, McpError> {
         self.run(Request::IssueDelete { reff: a.reff }).await
+    }
+
+    #[tool(
+        description = "Link two issues (kinds: blocks, relates, duplicates). `reff kind target`."
+    )]
+    async fn issue_link(
+        &self,
+        Parameters(a): Parameters<LinkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueLink {
+            reff: a.reff,
+            kind: a.kind,
+            target: a.target,
+        })
+        .await
+    }
+
+    #[tool(description = "Remove an issue link. `reff kind target`.")]
+    async fn issue_unlink(
+        &self,
+        Parameters(a): Parameters<LinkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueUnlink {
+            reff: a.reff,
+            kind: a.kind,
+            target: a.target,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Set an issue's parent in the sub-issue hierarchy (omit parent to clear). \
+                       Concurrent conflicting parents can never converge to a cycle."
+    )]
+    async fn issue_parent(
+        &self,
+        Parameters(a): Parameters<ParentArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueParent {
+            reff: a.reff,
+            parent: a.parent,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "An issue's graph neighborhood: parent, sub-issues, links, and the \
+                       transitively-open blockers."
+    )]
+    async fn issue_graph(
+        &self,
+        Parameters(a): Parameters<RefArg>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run(Request::IssueGraph { reff: a.reff }).await
     }
 
     #[tool(

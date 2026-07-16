@@ -1162,6 +1162,37 @@ pub fn err_no_store_here(out: Out) {
     }
 }
 
+/// Render the issue-graph neighborhood (`lait graph <ref>`).
+fn print_graph(g: &crate::dto::GraphView, out: Out) {
+    let row_line = |r: &crate::dto::Row| {
+        let handle = r.key_alias.as_deref().unwrap_or(&r.reff);
+        format!("{handle}  {}  ({})", r.title, r.status)
+    };
+    println!("{}", paint(out.color, ansi::BOLD, &g.reff));
+    if let Some(p) = &g.parent {
+        println!("  parent    {}", row_line(p));
+    }
+    for c in &g.children {
+        println!("  child     {}", row_line(c));
+    }
+    for l in &g.links {
+        let arrow = if l.direction == "out" { "→" } else { "←" };
+        println!("  {} {arrow}  {}", l.kind, row_line(&l.row));
+    }
+    if !g.blocked_by.is_empty() {
+        println!(
+            "{}",
+            paint(out.color, ansi::YELLOW, "  blocked by (open, transitive):")
+        );
+        for b in &g.blocked_by {
+            println!("    ⚠ {}", row_line(b));
+        }
+    }
+    if g.parent.is_none() && g.children.is_empty() && g.links.is_empty() {
+        println!("  (no relations — `lait link <ref> blocks <ref>` or `lait parent <ref> <epic>`)");
+    }
+}
+
 /// Print a response; return the process exit code it implies.
 pub fn print_response(resp: &Response, out: Out) -> i32 {
     if out.json {
@@ -1200,6 +1231,10 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
         }
         Response::Board(b) => {
             print_board(b, out);
+            0
+        }
+        Response::Graph(g) => {
+            print_graph(g, out);
             0
         }
         Response::Inbox { entries, unread } => {

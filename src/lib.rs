@@ -23,7 +23,6 @@
 
 pub mod acl;
 pub mod app;
-pub mod catalog;
 pub mod cli;
 pub mod cmdspec;
 pub mod config;
@@ -32,16 +31,14 @@ pub mod crypto;
 pub mod daemon_spawn;
 pub mod diagnose;
 pub mod dto;
+pub mod engine;
 pub mod ids;
 pub mod inbox;
 pub mod index;
 pub mod install;
-pub mod issue;
 pub mod list_picker;
-pub mod loro_ext;
 pub mod mcp;
 pub mod members_ui;
-pub mod membership;
 pub mod node;
 pub mod presence;
 pub mod proto;
@@ -51,3 +48,8 @@ pub mod store;
 pub mod sync;
 pub mod tracker;
 pub mod workspaces;
+
+// Path compatibility: the engine wrappers keep their historical crate-root
+// paths (`crate::issue::IssueDoc`, …) while living behind the sealed
+// `engine` module boundary.
+pub use engine::{catalog, issue, membership};

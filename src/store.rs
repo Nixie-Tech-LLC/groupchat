@@ -25,7 +25,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
-use loro::LoroDoc;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogDoc;
@@ -59,6 +58,14 @@ pub struct Store {
     /// it — every `.loro` write is fsync'd in [`write_atomic`] — so coalescing
     /// commits only coarsens git history, never risks data.
     pending: AtomicU64,
+    /// The store's **stable peer id** (LAIT-DATA-CONTRACT §5): minted randomly
+    /// once per store and persisted beside the docs, so a daemon restart reuses
+    /// it (no version-vector growth per session) while a re-created store mints
+    /// a fresh one (reusing a peer id over an empty store and then importing
+    /// the old ops silently drops them — verified against the kernel). Copying
+    /// a store directory to a second live node stays forbidden, as it already
+    /// was for the identity key.
+    peer_id: u64,
 }
 
 impl Store {
@@ -76,11 +83,18 @@ impl Store {
             let _ = run_git(&repo, &["config", "user.email", "lait@localhost"]);
             let _ = run_git(&repo, &["config", "user.name", "lait"]);
         }
+        let peer_id = load_or_mint_peer_id(&repo)?;
         Ok(Self {
             repo,
             git,
             pending: AtomicU64::new(0),
+            peer_id,
         })
+    }
+
+    /// The stable per-store kernel peer id (see the field docs).
+    pub fn peer_id(&self) -> u64 {
+        self.peer_id
     }
 
     pub fn repo_path(&self) -> &Path {
@@ -136,10 +150,7 @@ impl Store {
             return Ok(None);
         }
         let bytes = fs::read(&p).context("read catalog.loro")?;
-        let doc = LoroDoc::new();
-        doc.import(&bytes)
-            .map_err(|e| anyhow!("import catalog: {e}"))?;
-        let catalog = CatalogDoc::from_doc(doc);
+        let catalog = CatalogDoc::from_snapshot(&bytes, Some(self.peer_id))?;
         // Refuse a store written by a newer lait before handing it out (SCHEMA §9).
         check_schema_version(catalog.schema_version())?;
         Ok(Some(catalog))
@@ -163,10 +174,10 @@ impl Store {
             return Ok(None);
         }
         let bytes = fs::read(&p).context("read membership.loro")?;
-        let doc = LoroDoc::new();
-        doc.import(&bytes)
-            .map_err(|e| anyhow!("import membership: {e}"))?;
-        Ok(Some(crate::membership::MembershipDoc::from_doc(doc)))
+        Ok(Some(crate::membership::MembershipDoc::from_snapshot(
+            &bytes,
+            Some(self.peer_id),
+        )?))
     }
 
     pub fn save_membership(&self, m: &crate::membership::MembershipDoc) -> Result<()> {
@@ -200,10 +211,7 @@ impl Store {
             return Ok(None);
         }
         let bytes = fs::read(&p).context("read issue.loro")?;
-        let doc = LoroDoc::new();
-        doc.import(&bytes)
-            .map_err(|e| anyhow!("import issue: {e}"))?;
-        Ok(Some(IssueDoc::from_doc(doc)))
+        Ok(Some(IssueDoc::from_snapshot(&bytes, Some(self.peer_id))?))
     }
 
     pub fn save_issue(&self, issue: &IssueDoc) -> Result<()> {
@@ -294,6 +302,22 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     // the filesystem, so it's a no-op there.
     fsync_parent_dir(path);
     Ok(())
+}
+
+/// Load the store's persisted peer id, minting (and persisting) a random one
+/// on first open. See `Store::peer_id` for the design constraints.
+fn load_or_mint_peer_id(repo: &Path) -> Result<u64> {
+    let p = repo.join("peer_id");
+    if let Ok(s) = fs::read_to_string(&p) {
+        if let Ok(v) = u64::from_str_radix(s.trim(), 16) {
+            return Ok(v);
+        }
+    }
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("getrandom");
+    let v = u64::from_le_bytes(buf);
+    write_atomic(&p, format!("{v:016x}").as_bytes())?;
+    Ok(v)
 }
 
 /// Best-effort `fsync` of a path's parent directory so a just-created/renamed
@@ -399,7 +423,8 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws, "test").unwrap();
+        let me = UserId::from_key_string("a".repeat(64));
+        let cat = CatalogDoc::create(&ws, "test", None, &me).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
         let issue = IssueDoc::create(NewIssue {
@@ -408,13 +433,14 @@ mod tests {
             project_id: p.clone(),
             title: "persist me".into(),
             priority: Priority::Low,
-            created_by: UserId::from_key_string("a".repeat(64)),
+            created_by: me.clone(),
             created_at: 7,
             body: None,
+            peer: None,
         })
         .unwrap();
         cat.upsert_row(&issue).unwrap();
-        cat.doc().commit();
+        cat.apply(&crate::engine::op::OpCtx::structure("seed", &me));
         store.save_catalog(&cat).unwrap();
         store.save_issue(&issue).unwrap();
 
@@ -434,7 +460,8 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws, "test").unwrap();
+        let cat = CatalogDoc::create(&ws, "test", None, &UserId::from_key_string("a".repeat(64)))
+            .unwrap();
         store.save_catalog(&cat).unwrap();
         assert!(!store.repo.join("catalog.tmp").exists());
         assert!(store.repo.join("catalog.loro").exists());

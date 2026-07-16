@@ -23,14 +23,20 @@ use crate::catalog::{CatalogDoc, RowMeta};
 use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
 use crate::crypto::{self, WorkspaceKey};
 use crate::dto::{
-    ActivityEvent, BoardColumn, BoardView, CommentDto, FieldChange, IssueView, LabelDto, Priority,
-    ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
+    ActivityEvent, BoardColumn, BoardView, CommentDto, FieldChange, GraphView, IssueView, LabelDto,
+    LinkDto, Priority, ProjectDto, Row, StatusCategory, SCHEMA_VERSION,
 };
+use crate::engine::history;
+use crate::engine::op::OpCtx;
 use crate::ids::{DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
 use crate::store::{Genesis, Store};
+
+/// Issue-link kinds the Layer-B façade accepts (contract §3.2). `relates` is
+/// symmetric and canonicalized (sorted endpoints) so one edge represents it.
+pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 
 /// A 4-byte big-endian epoch tag prefixed to every AEAD ciphertext so the reader
 /// selects the right key-epoch from its keyring (lazy revocation, A§11).
@@ -196,7 +202,7 @@ pub fn found_workspace(
         anyhow::bail!("store already initialized — this directory already holds a workspace");
     }
     let ws = WorkspaceId::mint(clock);
-    let cat = CatalogDoc::create(&ws, name)?;
+    let cat = CatalogDoc::create(&ws, name, Some(store.peer_id()), me)?;
     // Seed the first project so a fresh workspace is usable on the very next
     // command. Plain catalog data — a joiner never hits this path.
     let project_name = if name.trim().is_empty() {
@@ -207,19 +213,19 @@ pub fn found_workspace(
     let project_id = ProjectId::mint(clock);
     let project_key = derive_project_key(project_name);
     cat.add_project(&project_id, project_name, &project_key, "blue")?;
-    cat.doc().commit();
+    cat.apply(&OpCtx::structure("project_new", me));
     let genesis = Genesis {
         workspace_id: ws.clone(),
         founding_admins: vec![me.clone()],
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&cat)?;
-    let membership = MembershipDoc::create(&ws)?;
+    let membership = MembershipDoc::create(&ws, Some(store.peer_id()), me)?;
     let key = crypto::random_key();
     if let Some(sealed) = crypto::seal_to(me, &key) {
         membership.put_sealed(0, me, &sealed)?;
     }
-    membership.doc().commit();
+    membership.apply(&OpCtx::authority("seal", me));
     store.save_membership(&membership)?;
     store.commit("init workspace");
     let project = cat
@@ -246,8 +252,8 @@ pub fn join_workspace_store(store: &Store, workspace: &str, founder: &str) -> Re
         founding_admins,
     };
     store.write_genesis(&genesis)?;
-    store.save_catalog(&CatalogDoc::empty())?;
-    store.save_membership(&MembershipDoc::empty())?;
+    store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
+    store.save_membership(&MembershipDoc::empty(Some(store.peer_id())))?;
     store.commit("join workspace from ticket");
     Ok(ws_id)
 }
@@ -291,7 +297,7 @@ impl Tracker {
             Some(m) => m,
             None => {
                 // Defensive only — both creation verbs write a membership doc.
-                let m = MembershipDoc::empty();
+                let m = MembershipDoc::empty(Some(store.peer_id()));
                 store.save_membership(&m)?;
                 m
             }
@@ -376,7 +382,7 @@ impl Tracker {
             }
         }
         if changed {
-            self.catalog.doc().commit();
+            self.catalog.apply(&OpCtx::structure("row_heal", &self.me));
             self.store.save_catalog(&self.catalog)?;
         }
         Ok(())
@@ -476,6 +482,12 @@ impl Tracker {
             Request::Label { reff, add, remove } => self.label(reff, add, remove),
             Request::Comment { reff, body } => self.comment(reff, body),
             Request::IssueDelete { reff } => self.issue_delete(reff),
+            Request::IssueLink { reff, kind, target } => self.issue_link(reff, kind, target, true),
+            Request::IssueUnlink { reff, kind, target } => {
+                self.issue_link(reff, kind, target, false)
+            }
+            Request::IssueParent { reff, parent } => self.issue_parent(reff, parent),
+            Request::IssueGraph { reff } => self.issue_graph(reff).map(|r| (r, None)),
             Request::IssueStart { reff } => self.work_state(reff, WorkAction::Start),
             Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
             Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
@@ -643,6 +655,7 @@ impl Tracker {
             created_by: self.me.clone(),
             created_at: self.now_secs(),
             body,
+            peer: Some(self.store.peer_id()),
         })?;
         for u in &assignee_ids {
             issue.add_assignee(u)?;
@@ -650,12 +663,12 @@ impl Tracker {
         for l in &label_ids {
             issue.add_label(l)?;
         }
-        issue.commit();
+        issue.apply(&OpCtx::content("created", &self.me));
 
         self.catalog.upsert_row(&issue)?;
         self.catalog.assign_alias_seq(&doc_id, &project.id)?;
         self.catalog.board_insert_top(&project.id, &doc_id)?;
-        self.catalog.doc().commit();
+        self.catalog.apply(&OpCtx::structure("created", &self.me));
 
         self.store.save_issue(&issue)?;
         self.store.save_catalog(&self.catalog)?;
@@ -707,6 +720,7 @@ impl Tracker {
             return Ok((Response::err("nothing to edit"), None));
         }
 
+        let ctx = OpCtx::content("edited", &self.me);
         let project_id;
         let mut changes = Vec::new();
         let mut status_transition: Option<(String, String)> = None;
@@ -746,8 +760,8 @@ impl Tracker {
                 });
             }
             if let Some(d) = &description {
-                // Full-buffer replace (P0, UI.md §5.3). Bodies are too big for
-                // the activity row — record the transition, elide the values.
+                // Spliced into the RGA text (contract §3.1). Bodies are too big
+                // for the activity row — record the transition, elide the values.
                 issue.set_description(d)?;
                 changes.push(FieldChange {
                     field: "description".into(),
@@ -755,7 +769,7 @@ impl Tracker {
                     to: None,
                 });
             }
-            issue.commit();
+            issue.apply(&ctx);
         }
         // completion policy (S§5.7): entering a done-category status removes the
         // doc from the board list; reopening re-inserts it at the top.
@@ -769,7 +783,7 @@ impl Tracker {
             }
         }
 
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, "edited")?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "edited", changes, "");
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
@@ -808,6 +822,7 @@ impl Tracker {
             ));
         };
         let me = self.me.clone();
+        let ctx = OpCtx::content(kind, &self.me);
 
         let project_id;
         let mut changes = Vec::new();
@@ -853,7 +868,7 @@ impl Tracker {
                 // Already exactly there — idempotent: no commit, no activity.
                 return self.issue_view(reff).map(|r| (r, None));
             }
-            issue.commit();
+            issue.apply(&ctx);
         }
         // completion policy (S§5.7): entering a done-category status removes the
         // doc from the board list; leaving one re-inserts it at the top.
@@ -868,7 +883,7 @@ impl Tracker {
             }
         }
 
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, kind)?;
         let canonical = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &canonical, kind, changes, "");
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
@@ -924,7 +939,7 @@ impl Tracker {
             if np.id != old_project {
                 let issue = self.issues.get(&doc_id).unwrap();
                 issue.set_project(&np.id)?;
-                issue.commit();
+                issue.apply(&OpCtx::content("moved", &self.me));
                 // fix both board lists (cache maintenance)
                 self.catalog.board_remove(&old_project, &doc_id)?;
                 self.catalog.board_insert_top(&np.id, &doc_id)?;
@@ -958,7 +973,7 @@ impl Tracker {
             }
         }
 
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, "moved")?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "moved", vec![], "");
         let mut dirty =
@@ -990,6 +1005,8 @@ impl Tracker {
                 None => return Ok((Response::not_found(format!("no user matches '{w}'")), None)),
             }
         }
+        let kind = if add { "assigned" } else { "unassigned" };
+        let ctx = OpCtx::content(kind, &self.me);
         let project_id = {
             let issue = self
                 .issue(&doc_id)?
@@ -1001,10 +1018,10 @@ impl Tracker {
                     issue.remove_assignee(u)?;
                 }
             }
-            issue.commit();
+            issue.apply(&ctx);
             issue.project_id().ok_or_else(|| anyhow!("no project"))?
         };
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, kind)?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(
             Some(&doc_id),
@@ -1050,6 +1067,7 @@ impl Tracker {
             created_any |= created;
             add_ids.push(id);
         }
+        let ctx = OpCtx::content("labeled", &self.me);
         let project_id = {
             let issue = self
                 .issue(&doc_id)?
@@ -1060,10 +1078,10 @@ impl Tracker {
             for l in &remove_ids {
                 issue.remove_label(l)?;
             }
-            issue.commit();
+            issue.apply(&ctx);
             issue.project_id().ok_or_else(|| anyhow!("no project"))?
         };
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, "labeled")?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "labeled", vec![], "");
         let mut dirty = DirtySet::issue(&project_id, &doc_id);
@@ -1083,15 +1101,16 @@ impl Tracker {
         };
         let ts = self.now_secs();
         let me = self.me.clone();
+        let ctx = OpCtx::content("commented", &self.me);
         let project_id = {
             let issue = self
                 .issue(&doc_id)?
                 .ok_or_else(|| anyhow!("issue body not present"))?;
             issue.add_comment(&me, ts, &body)?;
-            issue.commit();
+            issue.apply(&ctx);
             issue.project_id().ok_or_else(|| anyhow!("no project"))?
         };
-        self.persist_issue_and_row(&doc_id)?;
+        self.persist_issue_and_row(&doc_id, "commented")?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "commented", vec![], &body);
         Ok((
@@ -1110,10 +1129,11 @@ impl Tracker {
             .row(&doc_id)
             .map(|r| r.project_id)
             .ok_or_else(|| anyhow!("no such row"))?;
-        // tombstone (S§5.6) + remove from board ordering
+        // tombstone (S§5.6) + remove from board ordering. Soft-delete is the
+        // I-confluent T2 shape (contract §2.1): undelete stays a flag flip.
         self.catalog.set_tombstone(&doc_id, true)?;
         self.catalog.board_remove(&project_id, &doc_id)?;
-        self.catalog.doc().commit();
+        self.catalog.apply(&OpCtx::authority("deleted", &self.me));
         self.store.save_catalog(&self.catalog)?;
         self.store.mark_dirty();
         let reff = self.aliases.canonical_for(&doc_id);
@@ -1127,6 +1147,205 @@ impl Tracker {
             },
             Some(dirty),
         ))
+    }
+
+    /// Add or remove an issue link (contract §3.2 `edges`). `relates` is
+    /// symmetric and canonicalized by sorted endpoints so one edge represents it.
+    fn issue_link(
+        &mut self,
+        reff: String,
+        kind: String,
+        target: String,
+        add: bool,
+    ) -> Result<(Response, Option<DirtySet>)> {
+        let kind = kind.to_ascii_lowercase();
+        if !LINK_KINDS.contains(&kind.as_str()) {
+            return Ok((
+                Response::err(format!(
+                    "unknown link kind '{kind}' — one of: {}",
+                    LINK_KINDS.join(", ")
+                )),
+                None,
+            ));
+        }
+        let from = match self.resolve_issue(&reff) {
+            Ok(id) => id,
+            Err(resp) => return Ok((resp, None)),
+        };
+        let to = match self.resolve_issue(&target) {
+            Ok(id) => id,
+            Err(resp) => return Ok((resp, None)),
+        };
+        if from == to {
+            return Ok((Response::err("an issue cannot link to itself"), None));
+        }
+        let (a, b) = if kind == "relates" && to < from {
+            (to.clone(), from.clone())
+        } else {
+            (from.clone(), to.clone())
+        };
+        if add {
+            self.catalog.edge_add(&a, &kind, &b)?;
+        } else if !self.catalog.edge_remove(&a, &kind, &b)? {
+            return Ok((
+                Response::not_found(format!("no such link: {reff} {kind} {target}")),
+                None,
+            ));
+        }
+        let verb = if add { "linked" } else { "unlinked" };
+        self.catalog.apply(&OpCtx::structure(verb, &self.me));
+        self.store.save_catalog(&self.catalog)?;
+        self.store.mark_dirty();
+        let canonical = self.aliases.canonical_for(&from);
+        let other = self.aliases.canonical_for(&to);
+        self.push_activity(
+            Some(&from),
+            &canonical,
+            verb,
+            vec![],
+            &format!("{kind} {other}"),
+        );
+        let mut dirty = DirtySet::default();
+        for id in [&from, &to] {
+            if let Some(r) = self.catalog.row(id) {
+                dirty.merge(DirtySet::issue(&r.project_id, id));
+            }
+        }
+        Ok((Response::Ref { reff: canonical }, Some(dirty)))
+    }
+
+    /// Set or clear an issue's parent in the sub-issue hierarchy (contract
+    /// §3.2 `subs` — a tree-move CRDT, so concurrent conflicting parents can
+    /// never converge to a cycle).
+    fn issue_parent(
+        &mut self,
+        reff: String,
+        parent: Option<String>,
+    ) -> Result<(Response, Option<DirtySet>)> {
+        let child = match self.resolve_issue(&reff) {
+            Ok(id) => id,
+            Err(resp) => return Ok((resp, None)),
+        };
+        let parent_id = match &parent {
+            Some(p) => match self.resolve_issue(p) {
+                Ok(id) => Some(id),
+                Err(resp) => return Ok((resp, None)),
+            },
+            None => None,
+        };
+        if parent_id.as_ref() == Some(&child) {
+            return Ok((Response::err("an issue cannot be its own parent"), None));
+        }
+        // validate-then-commit: reject a locally visible cycle before staging
+        // any op (the engine's CyclicMoveError is the backstop; concurrent
+        // cross-peer cycles are resolved by the merge itself).
+        let mut cur = parent_id.clone();
+        while let Some(p) = cur {
+            if p == child {
+                return Ok((
+                    Response::err("that would make an issue its own ancestor"),
+                    None,
+                ));
+            }
+            cur = self.catalog.parent_of(&p);
+        }
+        self.catalog.set_parent(&child, parent_id.as_ref())?;
+        self.catalog.apply(&OpCtx::structure("parented", &self.me));
+        self.store.save_catalog(&self.catalog)?;
+        self.store.mark_dirty();
+        let canonical = self.aliases.canonical_for(&child);
+        let text = match &parent_id {
+            Some(p) => format!("under {}", self.aliases.canonical_for(p)),
+            None => "unparented".to_string(),
+        };
+        self.push_activity(Some(&child), &canonical, "parented", vec![], &text);
+        let mut dirty = DirtySet::default();
+        for id in std::iter::once(&child).chain(parent_id.iter()) {
+            if let Some(r) = self.catalog.row(id) {
+                dirty.merge(DirtySet::issue(&r.project_id, id));
+            }
+        }
+        Ok((Response::Ref { reff: canonical }, Some(dirty)))
+    }
+
+    /// The issue's graph neighborhood: parent, children, links, and the
+    /// transitively-open blockers. The catalog IS the graph index — this is a
+    /// read over the structure doc, no issue doc is opened.
+    fn issue_graph(&mut self, reff: String) -> Result<Response> {
+        let doc_id = match self.resolve_issue(&reff) {
+            Ok(id) => id,
+            Err(resp) => return Ok(resp),
+        };
+        let canonical = self.aliases.canonical_for(&doc_id);
+        let rows: HashMap<DocId, RowMeta> = self
+            .catalog
+            .all_rows()
+            .into_iter()
+            .map(|r| (r.doc_id.clone(), r))
+            .collect();
+        let live = |id: &DocId| rows.get(id).filter(|r| !r.tombstone);
+
+        let parent = self
+            .catalog
+            .parent_of(&doc_id)
+            .and_then(|p| live(&p).map(|r| self.project_row(r)));
+        let children: Vec<Row> = self
+            .catalog
+            .children_of(&doc_id)
+            .iter()
+            .filter_map(|c| live(c).map(|r| self.project_row(r)))
+            .collect();
+
+        let edges = self.catalog.edges();
+        let mut links = Vec::new();
+        for e in &edges {
+            let (direction, other) = if e.from == doc_id {
+                ("out", &e.to)
+            } else if e.to == doc_id {
+                ("in", &e.from)
+            } else {
+                continue;
+            };
+            if let Some(r) = live(other) {
+                links.push(LinkDto {
+                    kind: e.kind.clone(),
+                    direction: direction.into(),
+                    row: self.project_row(r),
+                });
+            }
+        }
+
+        // Transitive open blockers: walk `blocks` edges backwards from this
+        // issue; a blocker counts while it is live and not in a done-category
+        // status. BFS with a visited set — link cycles are legal in a general
+        // edge set and must not hang the walk.
+        let mut blocked_by = Vec::new();
+        let mut seen: std::collections::HashSet<DocId> = std::collections::HashSet::new();
+        let mut queue: VecDeque<DocId> = VecDeque::new();
+        seen.insert(doc_id.clone());
+        queue.push_back(doc_id.clone());
+        while let Some(cur) = queue.pop_front() {
+            for e in &edges {
+                if e.kind == "blocks" && e.to == cur && seen.insert(e.from.clone()) {
+                    if let Some(r) = live(&e.from) {
+                        if !self.is_done_status(&r.status) {
+                            blocked_by.push(self.project_row(r));
+                            queue.push_back(e.from.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Response::Graph(Box::new(GraphView {
+            schema_version: SCHEMA_VERSION,
+            reff: canonical,
+            doc_id,
+            parent,
+            children,
+            links,
+            blocked_by,
+        })))
     }
 
     fn project_new(&mut self, name: String, key: String) -> Result<(Response, Option<DirtySet>)> {
@@ -1152,7 +1371,8 @@ impl Tracker {
         }
         let id = ProjectId::mint(&*self.clock);
         self.catalog.add_project(&id, name.trim(), &key, "blue")?;
-        self.catalog.doc().commit();
+        self.catalog
+            .apply(&OpCtx::structure("project_new", &self.me));
         self.store.save_catalog(&self.catalog)?;
         self.store.commit(&format!("new project {key}"));
         Ok((
@@ -1178,7 +1398,7 @@ impl Tracker {
         let id = LabelId::mint(&*self.clock);
         self.catalog
             .add_label(&id, name.trim(), color.as_deref().unwrap_or("gray"))?;
-        self.catalog.doc().commit();
+        self.catalog.apply(&OpCtx::structure("label_new", &self.me));
         self.store.save_catalog(&self.catalog)?;
         self.store.commit(&format!("new label {}", name.trim()));
         Ok((
@@ -1223,15 +1443,16 @@ impl Tracker {
     }
 
     /// Persist an issue doc + recompute its row + save the catalog (the common
-    /// tail of every issue mutation).
-    fn persist_issue_and_row(&mut self, doc_id: &DocId) -> Result<()> {
+    /// tail of every issue mutation). `kind` labels the catalog-side change so
+    /// the structure doc's oplog stays as legible as the issue docs'.
+    fn persist_issue_and_row(&mut self, doc_id: &DocId, kind: &str) -> Result<()> {
         let issue = self
             .issues
             .get(doc_id)
             .ok_or_else(|| anyhow!("issue not loaded"))?;
         self.store.save_issue(issue)?;
         self.catalog.upsert_row(issue)?;
-        self.catalog.doc().commit();
+        self.catalog.apply(&OpCtx::structure(kind, &self.me));
         self.store.save_catalog(&self.catalog)?;
         // Incremental alias upkeep. The table is a pure function of {DocId set,
         // projectId, seq}: a plain field edit changes none of these, so this is a
@@ -1514,16 +1735,38 @@ impl Tracker {
         Ok(Response::Issue(Box::new(view)))
     }
 
+    /// The issue's history, derived from the **oplog on disk** (contract §5):
+    /// durable across daemon restarts, field-level, attributed (advisory) for
+    /// remote changes, with DAG-derived collision flags. The per-session
+    /// activity ring stays what it is — the workspace feed's batch cursor.
     fn history(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
             Err(resp) => return Ok(resp),
         };
-        let events: Vec<ActivityEvent> = self
-            .activity
-            .iter()
-            .filter(|e| e.doc_id.as_ref() == Some(&doc_id))
-            .cloned()
+        let canonical = self.aliases.canonical_for(&doc_id);
+        let issue = self
+            .issue(&doc_id)?
+            .ok_or_else(|| anyhow!("issue body not present"))?;
+        let events: Vec<ActivityEvent> = history::issue_history(issue)
+            .into_iter()
+            .enumerate()
+            .map(|(i, ch)| ActivityEvent {
+                seq: (i + 1) as u64,
+                doc_id: Some(doc_id.clone()),
+                reff: canonical.clone(),
+                kind: ch.kind.unwrap_or_else(|| "change".into()),
+                changes: ch.changes,
+                actor: ch.actor,
+                actor_nick: String::new(),
+                text: ch
+                    .comments
+                    .first()
+                    .map(|c| c.body.clone())
+                    .unwrap_or_default(),
+                ts: ch.ts,
+                collision: ch.collision,
+            })
             .collect();
         let last = events.last().map(|e| e.seq).unwrap_or(0);
         Ok(Response::Activity { events, last })
@@ -1549,9 +1792,8 @@ impl Tracker {
         changes: Vec<FieldChange>,
         text: &str,
     ) {
-        self.activity_seq += 1;
-        self.activity.push_back(ActivityEvent {
-            seq: self.activity_seq,
+        self.push_activity_from(ActivityEvent {
+            seq: 0,
             doc_id: doc_id.cloned(),
             reff: reff.to_string(),
             kind: kind.to_string(),
@@ -1562,6 +1804,14 @@ impl Tracker {
             ts: self.now_secs(),
             collision: false,
         });
+    }
+
+    /// Ring-append a fully-built event (remote imports carry their own actor
+    /// and collision flag); `seq` is stamped here.
+    fn push_activity_from(&mut self, mut event: ActivityEvent) {
+        self.activity_seq += 1;
+        event.seq = self.activity_seq;
+        self.activity.push_back(event);
         while self.activity.len() > ACTIVITY_RING {
             self.activity.pop_front();
         }
@@ -1593,12 +1843,12 @@ impl Tracker {
 
     /// The catalog's oplog version vector, wire-encoded (sync handshake).
     pub fn catalog_vv_bytes(&self) -> Vec<u8> {
-        self.catalog.oplog_vv().encode()
+        self.catalog.oplog_vv_bytes()
     }
 
     /// The catalog head digest, wire form (gossip announce, A§8).
     pub fn catalog_head_bytes(&self) -> Vec<u8> {
-        crate::catalog::head_hash(&self.catalog.head())
+        self.catalog.head_hash()
     }
 
     /// A combined sync head over catalog + membership (the gossip announce
@@ -1606,8 +1856,8 @@ impl Tracker {
     /// the catalog) still moves this head so peers pull and receive it (A§8/§11).
     pub fn sync_head_bytes(&self) -> Vec<u8> {
         let mut h = blake3::Hasher::new();
-        h.update(&self.catalog.head().encode());
-        h.update(&self.membership.head().encode());
+        h.update(&self.catalog.head_bytes());
+        h.update(&self.membership.head_bytes());
         h.finalize().as_bytes().to_vec()
     }
 
@@ -1615,18 +1865,16 @@ impl Tracker {
 
     /// The membership doc's oplog VV, wire-encoded.
     pub fn membership_vv_bytes(&self) -> Vec<u8> {
-        self.membership.oplog_vv().encode()
+        self.membership.oplog_vv_bytes()
     }
     /// **Provider side.** Export the membership ops (plaintext) a puller lacks.
     pub fn export_membership_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
-        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
-        self.membership.export_from(&vv)
+        self.membership.export_from_bytes(peer_vv)
     }
     /// **Puller side.** Import a membership update (plaintext), then refresh our
     /// keyring — we may have just been added and can now decrypt the workspace.
     pub fn import_membership(&mut self, update: &[u8]) -> Result<()> {
         self.membership.import(update)?;
-        self.membership.doc().commit();
         self.store.save_membership(&self.membership)?;
         self.refresh_keyring();
         Ok(())
@@ -1668,7 +1916,7 @@ impl Tracker {
             self.membership.heads(),
             &self.workspace_id,
         );
-        if let Err(e) = self.member_apply(op, |t| {
+        if let Err(e) = self.member_apply(op, "member_add", |t| {
             let epochs: Vec<(u32, WorkspaceKey)> =
                 t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
             for (epoch, key) in epochs {
@@ -1744,7 +1992,7 @@ impl Tracker {
             &self.workspace_id,
         );
         let nonce = *nonce;
-        if let Err(e) = self.member_apply(op, |t| {
+        if let Err(e) = self.member_apply(op, "invite_redeem", |t| {
             let epochs: Vec<(u32, WorkspaceKey)> =
                 t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
             for (epoch, key) in epochs {
@@ -1790,7 +2038,7 @@ impl Tracker {
             self.membership.heads(),
             &self.workspace_id,
         );
-        if let Err(e) = self.member_apply(op, |t| t.rotate_key()) {
+        if let Err(e) = self.member_apply(op, "member_remove", |t| t.rotate_key()) {
             return (Response::err(format!("{e:#}")), None);
         }
         self.push_activity(None, &user.short(), "member_removed", vec![], &user.short());
@@ -1812,7 +2060,7 @@ impl Tracker {
         }
         match self.rotate_key() {
             Ok(()) => {
-                if let Err(e) = self.persist_membership() {
+                if let Err(e) = self.persist_membership("key_rotate") {
                     return (Response::err(format!("{e:#}")), None);
                 }
                 (
@@ -1868,15 +2116,16 @@ impl Tracker {
     fn member_apply(
         &mut self,
         op: SignedOp,
+        kind: &str,
         extra: impl FnOnce(&mut Self) -> Result<()>,
     ) -> Result<()> {
         self.membership.add_op(&op)?;
         extra(self)?;
-        self.persist_membership()
+        self.persist_membership(kind)
     }
 
-    fn persist_membership(&mut self) -> Result<()> {
-        self.membership.doc().commit();
+    fn persist_membership(&mut self, kind: &str) -> Result<()> {
+        self.membership.apply(&OpCtx::authority(kind, &self.me));
         self.store.save_membership(&self.membership)?;
         self.store.commit("membership change");
         self.refresh_keyring();
@@ -1901,8 +2150,7 @@ impl Tracker {
     /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks,
     /// **encrypted** with the current workspace key (blind-relay envelope, A§11).
     pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
-        let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
-        Ok(self.encrypt_payload(self.catalog.export_from(&vv)?))
+        Ok(self.encrypt_payload(self.catalog.export_from_bytes(peer_vv)?))
     }
 
     /// **Provider side.** Export a single issue doc's updates from `peer_vv`
@@ -1913,10 +2161,7 @@ impl Tracker {
         };
         // Clone the epoch/key context before the issue borrow.
         let plain = match self.issue(&id)? {
-            Some(issue) => {
-                let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
-                issue.export_from(&vv)?
-            }
+            Some(issue) => issue.export_from_bytes(peer_vv)?,
             None => return Ok(None),
         };
         Ok(Some(self.encrypt_payload(plain)))
@@ -1933,7 +2178,6 @@ impl Tracker {
             return Ok(Vec::new());
         };
         self.catalog.import(&update)?;
-        self.catalog.doc().commit();
         let mut needs = Vec::new();
         let mut healed = false;
         for doc_id in self.catalog.doc_ids() {
@@ -1945,7 +2189,7 @@ impl Tracker {
                 // `head`/row fields LWW-merged to a peer's value, but OUR issue
                 // doc is the truth for our row — recompute it from the issue doc.
                 let issue = self.issues.get(&doc_id).unwrap();
-                let local_head = crate::catalog::head_hash(&issue.head());
+                let local_head = issue.head_hash();
                 let cat_head = self
                     .catalog
                     .row(&doc_id)
@@ -1958,7 +2202,7 @@ impl Tracker {
                     // cheap empty diff.
                     needs.push(DocNeed {
                         doc_id: doc_id.as_str().to_string(),
-                        vv: issue.oplog_vv().encode(),
+                        vv: issue.oplog_vv_bytes(),
                     });
                 }
                 self.catalog.upsert_row(issue)?;
@@ -1971,7 +2215,7 @@ impl Tracker {
             }
         }
         if healed {
-            self.catalog.doc().commit();
+            self.catalog.apply(&OpCtx::structure("row_heal", &self.me));
         }
         // Incremental alias upkeep after a catalog reconcile: reconcile every doc
         // the catalog now knows (O(1) per already-consistent doc, so O(N) total —
@@ -1987,6 +2231,12 @@ impl Tracker {
     /// **Puller side.** Import a fetched issue-doc update (creating the doc if
     /// new), persist it, and recompute its catalog row from the issue doc
     /// (writer-direction, S§3.1). Returns a dirty-set for a coalesced doorbell.
+    ///
+    /// The activity row and the inbox are derived from the **oplog diff** around
+    /// the import (contract §5): field-level changes, exactly-the-new comments
+    /// (wherever they merged in the list — CRDT-positional, not index
+    /// arithmetic), the DAG concurrency flag, and the incoming changes' advisory
+    /// actor claims (their commit messages travel with the ops).
     pub fn import_doc(&mut self, doc_id: &str, bytes: &[u8]) -> Result<Option<DirtySet>> {
         let Some(id) = DocId::parse(doc_id) else {
             return Ok(None);
@@ -1995,23 +2245,19 @@ impl Tracker {
         let Some(bytes) = self.decrypt_payload(bytes) else {
             return Ok(None);
         };
-        // Capture the pre-import state relevant to *this viewer* — the only
-        // honest source for the inbox (S§8.1): remote ops carry no trusted
-        // actor, so "addressed to you" is detected as a state transition, not
-        // read from attribution. `None` ⇒ the doc is new to this node.
-        let prior = self.issues.get(&id).map(|i| {
-            (
-                i.assignees().contains(&self.me),
-                i.status(),
-                i.comments().len(),
-            )
-        });
+        // Viewer-relative pre-import state for the inbox's assigned/status
+        // entries (S§8.1): "addressed to you" is a state transition, never
+        // trusted attribution. `None` ⇒ the doc is new to this node.
+        let prior = self
+            .issues
+            .get(&id)
+            .map(|i| (i.assignees().contains(&self.me), i.status()));
+        let mark = self.issues.get(&id).map(|i| i.import_mark());
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
-            let doc = loro::LoroDoc::new();
-            doc.import(&bytes)
+            let doc = IssueDoc::from_snapshot(&bytes, Some(self.store.peer_id()))
                 .map_err(|e| anyhow!("import new issue doc: {e}"))?;
-            self.issues.insert(id.clone(), IssueDoc::from_doc(doc));
+            self.issues.insert(id.clone(), doc);
         } else {
             self.issues
                 .get(&id)
@@ -2021,20 +2267,45 @@ impl Tracker {
         }
         // persist + recompute the row from the issue doc (disjoint field borrows).
         let issue = self.issues.get(&id).unwrap();
+        let delta = mark
+            .as_ref()
+            .map(|m| history::import_delta(issue, m))
+            .unwrap_or_default();
         self.store.save_issue(issue)?;
         self.catalog.upsert_row(issue)?;
-        self.catalog.doc().commit();
+        self.catalog.apply(&OpCtx::structure("synced", &self.me));
         let project_id = issue.project_id();
         self.store.save_catalog(&self.catalog)?;
         // Incremental upkeep for the one fetched doc (new or updated), O(log N).
         self.aliases.reconcile_doc(&self.catalog, &id);
         // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
         let reff = self.aliases.canonical_for(&id);
-        self.push_activity(Some(&id), &reff, "synced", vec![], "");
+        // Attribute the row to the incoming ops' actor when it is unambiguous;
+        // advisory, exactly like `createdBy` (non-goal 6).
+        let actor = match delta.actors.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        };
+        self.push_activity_from(ActivityEvent {
+            seq: 0, // stamped by push_activity_from
+            doc_id: Some(id.clone()),
+            reff: reff.clone(),
+            kind: "synced".into(),
+            changes: delta.fields.clone(),
+            actor,
+            actor_nick: String::new(),
+            text: delta
+                .new_comments
+                .first()
+                .map(|c| c.body.clone())
+                .unwrap_or_default(),
+            ts: self.now_secs(),
+            collision: delta.collision,
+        });
         // Inbox entries carry the friendly `KEY-n` handle when one exists —
         // they're read by a human scanning a summary line.
         let inbox_reff = self.aliases.alias_for(&id).unwrap_or(reff);
-        self.derive_inbox_entries(&id, &inbox_reff, prior);
+        self.derive_inbox_entries(&id, &inbox_reff, prior, &delta);
         match project_id {
             Some(p) => Ok(Some(DirtySet::issue(&p, &id))),
             None => Ok(None),
@@ -2043,14 +2314,19 @@ impl Tracker {
 
     /// Emit durable inbox entries for a just-imported doc: assignments to me,
     /// new comments on my work or mentioning `@mynick`, and status moves on my
-    /// work. Backfill-bounded by construction: a brand-new-to-me doc (`prior ==
-    /// None`) contributes at most one `assigned` entry, never a comment/status
-    /// flood. Best-effort — inbox failure never affects the import.
+    /// work. Comments come from the import's **oplog diff** (`delta`), so a
+    /// concurrent comment that merged mid-list is detected exactly — the
+    /// index-arithmetic `skip(prior_len)` this replaces both re-notified an old
+    /// comment and dropped the new one in that case. Backfill-bounded by
+    /// construction: a brand-new-to-me doc (`prior == None`) contributes at most
+    /// one `assigned` entry, never a comment/status flood. Best-effort — inbox
+    /// failure never affects the import.
     fn derive_inbox_entries(
         &mut self,
         id: &DocId,
         reff: &str,
-        prior: Option<(bool, String, usize)>,
+        prior: Option<(bool, String)>,
+        delta: &history::ImportDelta,
     ) {
         let Some(issue) = self.issues.get(id) else {
             return;
@@ -2078,7 +2354,7 @@ impl Tracker {
                     entries.push(entry("assigned", "you were assigned".into(), None));
                 }
             }
-            Some((was_assigned_to_me, prior_status, prior_comments)) => {
+            Some((was_assigned_to_me, prior_status)) => {
                 if !was_assigned_to_me && assigned_to_me {
                     entries.push(entry("assigned", "you were assigned".into(), None));
                 }
@@ -2087,7 +2363,7 @@ impl Tracker {
                     entries.push(entry("status", format!("{prior_status} → {status}"), None));
                 }
                 let mention = format!("@{}", self.my_nick).to_ascii_lowercase();
-                for c in issue.comments().into_iter().skip(prior_comments) {
+                for c in &delta.new_comments {
                     if &c.author == me {
                         continue;
                     }
@@ -2125,10 +2401,7 @@ impl Tracker {
             RefResolution::One(id) => id,
             _ => return None,
         };
-        self.issue(&id)
-            .ok()
-            .flatten()
-            .map(|i| crate::catalog::head_hash(&i.head()))
+        self.issue(&id).ok().flatten().map(|i| i.head_hash())
     }
 }
 
@@ -2478,9 +2751,9 @@ mod tests {
         let ids = store.issue_doc_ids();
         let issue = store.load_issue(&ids[0]).unwrap().unwrap();
         issue.set_title("healed on disk").unwrap();
-        issue.commit();
+        issue.apply(&OpCtx::content("edited", &me()));
         store.save_issue(&issue).unwrap();
-        let real_head = crate::catalog::head_hash(&issue.head());
+        let real_head = issue.head_hash();
         assert_ne!(real_head, stale_head, "precondition: the head moved");
 
         // Reopen the tracker — recompute_all_rows must reconcile the row.
@@ -3104,6 +3377,229 @@ mod tests {
             3,
             "unrelated docs stay out"
         );
+    }
+
+    #[test]
+    fn history_survives_daemon_restart() {
+        // The contract §5 headline: `lait history` is derived from the oplog on
+        // disk, not a per-session ring — a fresh tracker over the same store
+        // (the daemon-restart case, which idle-shutdown makes the NORMAL case)
+        // returns the full feed with kinds, actors, timestamps and transitions.
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        let reff = new_issue(&mut n.tracker, "durable");
+        let (resp, _) = n.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("in_progress".into()),
+            priority: Some("high".into()),
+            description: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+
+        // "Restart": a brand-new tracker over the same store. The old activity
+        // ring is dropped with the old instance.
+        let store2 = Store::open(&n.home).unwrap();
+        let mut t2 = Tracker::open(
+            store2,
+            me(),
+            "tester".into(),
+            ME_SEED,
+            Box::new(FakeClock::new(1_000_000)),
+        )
+        .unwrap();
+        let (resp, _) = t2.handle(Request::History { reff });
+        let events = match resp {
+            Response::Activity { events, .. } => events,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(events.len(), 2, "created + edited: {events:?}");
+        assert_eq!(events[0].kind, "created");
+        assert_eq!(events[1].kind, "edited");
+        assert_eq!(events[1].actor, Some(me()), "advisory actor survives");
+        let status = events[1]
+            .changes
+            .iter()
+            .find(|c| c.field == "status")
+            .expect("status transition recorded");
+        assert_eq!(status.from.as_deref(), Some("backlog"));
+        assert_eq!(status.to.as_deref(), Some("in_progress"));
+        assert!(
+            events[1].changes.iter().any(|c| c.field == "priority"),
+            "multi-field edit keeps all transitions: {events:?}"
+        );
+    }
+
+    #[test]
+    fn synced_rows_carry_field_changes_actor_and_collision() {
+        // Contract §5 + A§9: a remote change arrives with field-level changes
+        // and its (advisory) actor, and a genuinely concurrent import raises
+        // the DAG collision flag — the compensating control for LWW fields.
+        let mut a = new_node();
+        with_project(&mut a.tracker);
+        let b_seed = [9u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let a_ws = a.tracker.workspace_str();
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, me().as_str());
+        let (resp, _) = a.tracker.member_add(&b_user, Role::Member);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let reff = new_issue(&mut a.tracker, "contested");
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // Concurrent edits: A moves the title while B moves the status.
+        let (resp, _) = a.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: Some("renamed by a".into()),
+            status: None,
+            priority: None,
+            description: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        let (resp, _) = b.tracker.handle(Request::IssueEdit {
+            reff: reff.clone(),
+            title: None,
+            status: Some("in_progress".into()),
+            priority: None,
+            description: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+
+        let before = b.tracker.activity_high_water();
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (resp, _) = b.tracker.handle(Request::Activity { since: before });
+        let events = match resp {
+            Response::Activity { events, .. } => events,
+            other => panic!("{other:?}"),
+        };
+        let synced = events
+            .iter()
+            .find(|e| e.kind == "synced")
+            .expect("import produces a synced row");
+        assert!(
+            synced
+                .changes
+                .iter()
+                .any(|c| { c.field == "title" && c.to.as_deref() == Some("renamed by a") }),
+            "field-level change on the synced row: {synced:?}"
+        );
+        assert_eq!(
+            synced.actor,
+            Some(me()),
+            "the incoming change's advisory actor is surfaced"
+        );
+        assert!(
+            synced.collision,
+            "concurrent branches must raise the collision flag: {synced:?}"
+        );
+    }
+
+    #[test]
+    fn link_parent_graph_roundtrip() {
+        let mut n = new_node();
+        with_project(&mut n.tracker);
+        new_issue(&mut n.tracker, "epic");
+        new_issue(&mut n.tracker, "child");
+        new_issue(&mut n.tracker, "blocker");
+        // Re-resolve after all creates: a canonical short handle minted earlier
+        // can become ambiguous once same-millisecond siblings share its prefix.
+        let by_title = |t: &mut Tracker, title: &str| -> String {
+            match t
+                .handle(Request::List {
+                    project: None,
+                    filter: Filter::default(),
+                })
+                .0
+            {
+                Response::List { rows } => rows
+                    .into_iter()
+                    .find(|r| r.title == title)
+                    .map(|r| r.reff)
+                    .expect("row present"),
+                other => panic!("{other:?}"),
+            }
+        };
+        let epic = by_title(&mut n.tracker, "epic");
+        let child = by_title(&mut n.tracker, "child");
+        let blocker = by_title(&mut n.tracker, "blocker");
+
+        let (resp, dirty) = n.tracker.handle(Request::IssueParent {
+            reff: child.clone(),
+            parent: Some(epic.clone()),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        assert!(dirty.is_some(), "a parent change rings a doorbell");
+
+        let (resp, _) = n.tracker.handle(Request::IssueLink {
+            reff: blocker.clone(),
+            kind: "blocks".into(),
+            target: child.clone(),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+
+        let (resp, _) = n.tracker.handle(Request::IssueGraph {
+            reff: child.clone(),
+        });
+        let g = match resp {
+            Response::Graph(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(g.parent.as_ref().map(|r| r.title.as_str()), Some("epic"));
+        assert_eq!(g.links.len(), 1);
+        assert_eq!(g.links[0].kind, "blocks");
+        assert_eq!(g.links[0].direction, "in");
+        assert_eq!(
+            g.blocked_by
+                .iter()
+                .map(|r| r.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["blocker"],
+            "open blocker surfaces transitively"
+        );
+
+        // Finishing the blocker clears the blocked_by set (it is open-only)…
+        let (resp, _) = n.tracker.handle(Request::IssueDone {
+            reff: blocker.clone(),
+        });
+        assert!(matches!(resp, Response::Issue(_)), "{resp:?}");
+        let (resp, _) = n.tracker.handle(Request::IssueGraph {
+            reff: child.clone(),
+        });
+        let g = match resp {
+            Response::Graph(g) => g,
+            other => panic!("{other:?}"),
+        };
+        assert!(g.blocked_by.is_empty(), "{:?}", g.blocked_by);
+        // …while the link itself remains until unlinked.
+        assert_eq!(g.links.len(), 1);
+        let (resp, _) = n.tracker.handle(Request::IssueUnlink {
+            reff: blocker.clone(),
+            kind: "blocks".into(),
+            target: child.clone(),
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+
+        // Cycle guard: the epic cannot become its own descendant.
+        let (resp, dirty) = n.tracker.handle(Request::IssueParent {
+            reff: epic.clone(),
+            parent: Some(child.clone()),
+        });
+        assert!(
+            matches!(&resp, Response::Error { message, .. } if message.contains("ancestor")),
+            "{resp:?}"
+        );
+        assert!(dirty.is_none(), "a rejected parent rings no doorbell");
+
+        // Unparent restores a top-level issue.
+        let (resp, _) = n.tracker.handle(Request::IssueParent {
+            reff: child.clone(),
+            parent: None,
+        });
+        assert!(matches!(resp, Response::Ref { .. }), "{resp:?}");
+        let (resp, _) = n.tracker.handle(Request::IssueGraph { reff: child });
+        match resp {
+            Response::Graph(g) => assert!(g.parent.is_none()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

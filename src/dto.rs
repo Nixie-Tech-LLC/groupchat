@@ -259,6 +259,33 @@ pub struct FieldChange {
     pub to: Option<String>,
 }
 
+/// One issue link projected for the graph view (contract §3.2). `direction`
+/// is relative to the requested issue: `out` = it names the other, `in` = the
+/// other names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkDto {
+    /// `blocks` | `relates` | `duplicates`.
+    pub kind: String,
+    /// `out` | `in`.
+    pub direction: String,
+    pub row: Row,
+}
+
+/// An issue's graph neighborhood (reply to `IssueGraph`): sub-issue hierarchy,
+/// links, and the transitively-open blockers — all read from the catalog
+/// structure doc, no issue doc opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphView {
+    pub schema_version: u32,
+    pub reff: String,
+    pub doc_id: DocId,
+    pub parent: Option<Row>,
+    pub children: Vec<Row>,
+    pub links: Vec<LinkDto>,
+    /// Issues that transitively block this one and are still open.
+    pub blocked_by: Vec<Row>,
+}
+
 /// A disambiguation candidate when a ref resolves to many (UI.md §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
