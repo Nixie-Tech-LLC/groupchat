@@ -130,6 +130,20 @@ prefixed_id!(
     /// Workspace id — minted at `workspace init`, part of the genesis (A§6).
     WorkspaceId, "ws_"
 );
+
+impl WorkspaceId {
+    /// Derive a **self-certifying** workspace id from a 16-byte digest that
+    /// commits to the founding device + salt (`lait/space/1`): `ws_<crockford128>`.
+    /// The id is bound to its trust root rather than random, so a joiner can
+    /// verify a ticket's founder anchor against the id (see [`crate::space`]).
+    pub fn from_digest(digest: [u8; 16]) -> Self {
+        Self(format!(
+            "{}{}",
+            Self::PREFIX,
+            encode_ulid(u128::from_be_bytes(digest))
+        ))
+    }
+}
 prefixed_id!(
     /// Issue document id — app-minted, content-independent, the key in
     /// `Catalog.docs`, the filename in git, and the routing key on the wire.

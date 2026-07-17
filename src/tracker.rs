@@ -205,7 +205,18 @@ pub fn found_workspace(
     if store.is_initialized() {
         anyhow::bail!("store already initialized — this directory already holds a workspace");
     }
-    let ws = WorkspaceId::mint(clock);
+    // Self-certifying workspace id (lait/space/1): derive it from the founding
+    // device + a random salt so the id commits to its trust root. The salt is
+    // chosen BEFORE the founding actor is incepted — an inception is scoped to a
+    // workspace id, so the id cannot itself depend on the inception. Derive from
+    // the SEED's public key (the inception's author), so the id commits to
+    // exactly the key that signs the founding inception.
+    let founding_device = {
+        let sk = ed25519_dalek::SigningKey::from_bytes(device_seed);
+        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()))
+    };
+    let salt = rand16();
+    let ws = crate::space::derive_workspace_id(&founding_device, &salt);
     let cat = CatalogDoc::create(&ws, name, Some(store.peer_id()), me)?;
     // Seed the first project so a fresh workspace is usable on the very next
     // command. Plain catalog data — a joiner never hits this path.
@@ -230,6 +241,7 @@ pub fn found_workspace(
     let genesis = Genesis {
         workspace_id: ws.clone(),
         founding_actors: vec![actor_id.clone()],
+        salt,
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&cat)?;
@@ -326,26 +338,34 @@ fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
 /// importing the founder's ops adopts identical container ids (see
 /// [`CatalogDoc::empty`] — `create()` would mint conflicting containers).
 /// Errors if the store already holds a workspace; the CLI guarantees it doesn't.
-pub fn join_workspace_store(store: &Store, workspace: &str, founder: &str) -> Result<WorkspaceId> {
+pub fn join_workspace_store(
+    store: &Store,
+    workspace: &str,
+    salt: &[u8; 16],
+    founder_inception: &actor::SignedEvent,
+) -> Result<WorkspaceId> {
     if store.is_initialized() {
         anyhow::bail!("store already initialized — this directory already holds a workspace");
     }
     let ws_id = WorkspaceId::parse(workspace)
         .ok_or_else(|| anyhow!("invalid workspace id in ticket: {workspace}"))?;
-    // Fail loud on a missing/garbled founder anchor rather than minting a genesis
-    // with no admin (which would silently brick the join — no actor could ever
-    // authorize a membership op).
-    let founder_actor = crate::ids::ActorId::parse(founder).ok_or_else(|| {
-        anyhow!("ticket has no valid founder actor — it may be truncated or from an older lait; ask for a fresh one")
-    })?;
-    let founding_actors = vec![founder_actor];
+    // Verify the trust root offline: the id must commit to the founder, and the
+    // founding inception must validly incept for THIS workspace. A tampered
+    // anchor fails here rather than silently forking the joiner (lait/space/1).
+    let founder_actor = crate::space::verify_founding(&ws_id, salt, founder_inception)
+        .context("verify workspace founding — ask for a fresh invite")?;
     let genesis = Genesis {
         workspace_id: ws_id.clone(),
-        founding_actors,
+        founding_actors: vec![founder_actor],
+        salt: *salt,
     };
     store.write_genesis(&genesis)?;
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
-    store.save_membership(&MembershipDoc::empty(Some(store.peer_id())))?;
+    // Seed the verified founding inception so the actor plane roots correctly
+    // from the first replay, before any sync.
+    let membership = MembershipDoc::empty(Some(store.peer_id()));
+    membership.add_actor_event(founder_inception)?;
+    store.save_membership(&membership)?;
     store.commit("join workspace from ticket");
     Ok(ws_id)
 }
@@ -2240,6 +2260,19 @@ impl Tracker {
     pub fn founding_actor(&self) -> Option<ActorId> {
         self.genesis.founding_actors.first().cloned()
     }
+    /// The verifiable founding proof to put in a ticket (`lait/space/1`): the
+    /// `(salt, founder_inception)` a joiner checks the workspace id against. Any
+    /// correctly-joined node holds both — the salt in genesis, the founder's
+    /// inception in the membership actor log.
+    pub fn founding_proof(&self) -> Option<([u8; 16], actor::SignedEvent)> {
+        let founder = self.genesis.founding_actors.first()?;
+        let incept = self
+            .membership
+            .actor_events()
+            .into_iter()
+            .find(|ev| ActorId::from_incept_hash(&ev.hash()) == *founder)?;
+        Some((self.genesis.salt, incept))
+    }
     pub fn is_member_actor(&self, actor: &ActorId) -> bool {
         self.acl_state().is_member(actor)
     }
@@ -3615,8 +3648,15 @@ mod tests {
     }
 
     /// A node whose store was bootstrapped from a ticket (the `lait join` path):
-    /// genesis rooted on `ws`/`founder`, empty catalog/membership awaiting sync.
-    fn new_joiner_node_as(user: UserId, seed: [u8; 32], ws: &str, founder: &str) -> TestNode {
+    /// genesis rooted on the verified founding proof `(salt, founder_inception)`,
+    /// empty catalog/membership awaiting sync. Obtain the proof from the founder
+    /// node via `founding_proof()`.
+    fn new_joiner_node_as(
+        user: UserId,
+        seed: [u8; 32],
+        ws: &str,
+        proof: &([u8; 16], actor::SignedEvent),
+    ) -> TestNode {
         let home = std::env::temp_dir().join(format!(
             "gc-trk-{}-{}",
             std::process::id(),
@@ -3624,7 +3664,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         let store = Store::open(&home).unwrap();
-        join_workspace_store(&store, ws, founder).unwrap();
+        join_workspace_store(&store, ws, &proof.0, &proof.1).unwrap();
         let clock = FakeClock::new(1_000_000 + seed[0] as u64 * 100_000);
         let tracker = Tracker::open(store, user, "tester".into(), seed, Box::new(clock)).unwrap();
         TestNode { tracker, home }
@@ -4064,7 +4104,12 @@ mod tests {
         // device of any actor and holds no key.
         let c_seed = [70u8; 32];
         let c_user = user_from_seed(c_seed);
-        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &x.to_string());
+        let mut c = new_joiner_node_as(
+            c_user.clone(),
+            c_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
 
         // dC learns the actor plane (X's inception + recovery commitment) and the
         // encrypted catalog, but cannot read it — no key, no membership.
@@ -4145,7 +4190,12 @@ mod tests {
 
         // dB bootstraps its own store on X's workspace and syncs — it is the SAME
         // actor (the founder), so it unseals the key and decrypts.
-        let mut b = new_joiner_node_as(db_user.clone(), db_seed, &a_ws, &x.to_string());
+        let mut b = new_joiner_node_as(
+            db_user.clone(),
+            db_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         sync_all(&mut a.tracker, &mut b.tracker);
         assert_eq!(
             b.tracker.my_actor(),
@@ -4178,10 +4228,14 @@ mod tests {
         // invite for different actors; after merge exactly one is admitted, and
         // both replicas agree (nonce bound into the op + deterministic dedup).
         let mut a = new_node(); // founder/admin
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
         let a_ws = a.tracker.workspace_str();
 
-        let mut b = new_joiner_node_as(user_from_seed([2; 32]), [2; 32], &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            user_from_seed([2; 32]),
+            [2; 32],
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         a.tracker
             .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
@@ -4218,12 +4272,26 @@ mod tests {
         // members — no split-brain undecryptable key.
         let mut a = new_node(); // founder/admin
         with_project(&mut a.tracker);
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
         let a_ws = a.tracker.workspace_str();
 
-        let mut b = new_joiner_node_as(user_from_seed([2; 32]), [2; 32], &a_ws, &a_actor);
-        let mut c = new_joiner_node_as(user_from_seed([3; 32]), [3; 32], &a_ws, &a_actor);
-        let mut d = new_joiner_node_as(user_from_seed([4; 32]), [4; 32], &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            user_from_seed([2; 32]),
+            [2; 32],
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let mut c = new_joiner_node_as(
+            user_from_seed([3; 32]),
+            [3; 32],
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let mut d = new_joiner_node_as(
+            user_from_seed([4; 32]),
+            [4; 32],
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         let c_incept = c.tracker.self_inception().unwrap();
         let d_incept = d.tracker.self_inception().unwrap();
@@ -4292,8 +4360,12 @@ mod tests {
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
         // B's store is bootstrapped from the ticket (the `lait join` path).
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         assert_eq!(
             b.tracker.workspace_str(),
             a_ws,
@@ -4342,11 +4414,10 @@ mod tests {
         let proj = with_project(&mut a.tracker);
         new_issue(&mut a.tracker, "existing");
         let a_ws = a.tracker.workspace_str();
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
 
         let b_seed = [12u8; 32];
         let b_user = user_from_seed(b_seed);
-        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.tracker.founding_proof().unwrap());
         let b_incept = b.tracker.self_inception().unwrap();
         let b_actor = actor_of(&b_incept);
 
@@ -4486,7 +4557,12 @@ mod tests {
         // B joins, is admitted as an ADMIN, and syncs.
         let b_seed = [21u8; 32];
         let b_user = user_from_seed(b_seed);
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor.to_string());
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         let b_actor = actor_of(&b_incept);
         let (resp, _) = a
@@ -4544,12 +4620,11 @@ mod tests {
         // rather than claiming a rotation that would be inert.
         let mut a = new_node(); // founder/admin
         let a_ws = a.tracker.workspace_str();
-        let a_actor = a.tracker.my_actor().unwrap();
 
         // B joins as a plain WRITER (no admin).
         let b_seed = [41u8; 32];
         let b_user = user_from_seed(b_seed);
-        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor.to_string());
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.tracker.founding_proof().unwrap());
         let b_incept = b.tracker.self_inception().unwrap();
         let b_actor = actor_of(&b_incept);
         a.tracker.admit_member(&b_incept, vec![Grant::Write]); // writer, not admin
@@ -4607,7 +4682,7 @@ mod tests {
         // B joins rooted on A (as A's ticket would), admitted admin, and syncs.
         let b_seed = [51u8; 32];
         let b_user = user_from_seed(b_seed);
-        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor.to_string());
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a.tracker.founding_proof().unwrap());
         let b_incept = b.tracker.self_inception().unwrap();
         let b_actor = actor_of(&b_incept);
         a.tracker
@@ -4626,13 +4701,12 @@ mod tests {
             "never on the inviter"
         );
 
-        // C joins on the anchor B would ship, is admitted by B, and syncs through
-        // B. Rooted on A, C converges — sees the founder's authority AND adopts
-        // the founder's key-epoch to read founder content.
-        let anchor = b.tracker.founding_actor().unwrap().to_string();
+        // C joins on the founding proof B would ship (which is A's, not B's), is
+        // admitted by B, and syncs through B. Rooted on A, C converges — sees the
+        // founder's authority AND adopts the founder's key-epoch to read content.
         let c_seed = [52u8; 32];
         let c_user = user_from_seed(c_seed);
-        let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &anchor);
+        let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &b.tracker.founding_proof().unwrap());
         let c_incept = c.tracker.self_inception().unwrap();
         b.tracker.admit_member(&c_incept, vec![Grant::Write]);
         sync_all(&mut b.tracker, &mut c.tracker);
@@ -4646,25 +4720,24 @@ mod tests {
             "C adopts the founder's key-epoch and reads founder content"
         );
 
-        // Negative control — the fork the fix prevents. A node rooted on the
-        // INVITER (B), as the old inviter-anchored ticket would produce, is
-        // admitted by B but forks: the founder's authority and key-epoch are
-        // unauthorized under a genesis rooted on B, so it can never read founder
-        // content.
-        let d_seed = [53u8; 32];
-        let d_user = user_from_seed(d_seed);
-        let mut d = new_joiner_node_as(d_user, d_seed, &a_ws, &b_actor.to_string());
-        let d_incept = d.tracker.self_inception().unwrap();
-        b.tracker.admit_member(&d_incept, vec![Grant::Write]);
-        sync_all(&mut b.tracker, &mut d.tracker);
+        // Negative control — the fork is now CRYPTOGRAPHICALLY impossible. A
+        // forged ticket that presents the inviter's own inception as the founder
+        // for A's workspace is rejected at join: the self-certifying id does not
+        // commit to B's device (lait/space/1), so verify_founding fails.
+        let (a_salt, _a_incept) = a.tracker.founding_proof().unwrap();
+        let forged_home = std::env::temp_dir().join(format!(
+            "gc-trk-{}-{}",
+            std::process::id(),
+            DocId::mint(&crate::ids::SystemUlidSource)
+        ));
+        std::fs::create_dir_all(&forged_home).unwrap();
+        let forged_store = Store::open(&forged_home).unwrap();
+        let err = join_workspace_store(&forged_store, &a_ws, &a_salt, &b_incept);
         assert!(
-            !d.tracker.acl_state().is_admin(&a_actor),
-            "rooted on the inviter, the true founder holds no authority (the fork)"
+            err.is_err(),
+            "a ticket rooting on the inviter's inception is rejected, not forked"
         );
-        assert!(
-            !titles(&mut d.tracker).contains(&"founders-secret".to_string()),
-            "the forked node never adopts the founder's key-epoch"
-        );
+        let _ = std::fs::remove_dir_all(&forged_home);
     }
 
     #[test]
@@ -5099,8 +5172,12 @@ mod tests {
         let b_seed = [8u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
@@ -5223,8 +5300,12 @@ mod tests {
         let b_seed = [9u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
@@ -5410,8 +5491,12 @@ mod tests {
         let b_seed = [21u8; 32];
         let b_user = user_from_seed(b_seed);
         let a_ws = a.tracker.workspace_str();
-        let a_actor = a.tracker.my_actor().unwrap().to_string();
-        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &a_actor);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
         let b_incept = b.tracker.self_inception().unwrap();
         let (resp, _) = a.tracker.admit_member(&b_incept, vec![Grant::Write]);
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");

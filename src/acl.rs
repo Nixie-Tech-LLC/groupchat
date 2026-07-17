@@ -704,6 +704,7 @@ mod tests {
             genesis: Genesis {
                 workspace_id: wsid,
                 founding_actors: vec![actors[&founder].clone()],
+                salt: [0u8; 16],
             },
             events,
             actors,

@@ -229,11 +229,18 @@ pub struct WorkspaceTicket {
     pub host: EndpointId,
     /// Nick of the host who minted this ticket (for one-step `connect`).
     pub host_nick: String,
-    /// The founding **actor** id (`act_…`) the joiner roots its genesis on —
-    /// trust anchors in the founder's self-certifying identity, not a device key
-    /// (lait/actor/1). The founder's inception syncs in the membership doc.
+    /// The salt that, with the founding device, derives `workspace`
+    /// (`lait/space/1`). Ships so the joiner can verify the id commits to the
+    /// founder rather than trusting a bare anchor string.
     #[serde(default)]
-    pub founder_actor: String,
+    pub salt: [u8; 16],
+    /// The founder's signed inception. Together with `salt` it makes the trust
+    /// root **verifiable offline**: the joiner checks `workspace` commits to this
+    /// inception's device, that the inception validly incepts for `workspace`,
+    /// and roots genesis on its `ActorId` — so a tampered anchor is detected, not
+    /// silently forked (see [`crate::space::verify_founding`]).
+    #[serde(default)]
+    pub founder_inception: Option<crate::actor::SignedEvent>,
     /// An optional pre-authorization capability (Pattern A). Present ⇒ a joiner is
     /// auto-admitted on `join` (the seal happens without a manual `members
     /// approve`). Absent ⇒ the classic request→approve flow. The joiner echoes it
@@ -365,7 +372,8 @@ mod tests {
             name: "demo".into(),
             host: host_key(),
             host_nick: "alice".into(),
-            founder_actor: format!("act_{}", "0".repeat(64)),
+            salt: [0u8; 16],
+            founder_inception: None,
             invite: None,
         }
     }

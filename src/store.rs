@@ -44,6 +44,11 @@ use crate::issue::IssueDoc;
 pub struct Genesis {
     pub workspace_id: WorkspaceId,
     pub founding_actors: Vec<crate::ids::ActorId>,
+    /// The salt that, with the founding device key, derives `workspace_id`
+    /// (`lait/space/1`). Retained so this node can re-mint verifiable tickets and
+    /// so a replica can confirm the id commits to its founder.
+    #[serde(default)]
+    pub salt: [u8; 16],
 }
 
 /// Whether `home` holds an initialized store — a pure probe (no dirs created,
@@ -419,6 +424,7 @@ mod tests {
         let g = Genesis {
             workspace_id: WorkspaceId::mint(&SystemUlidSource),
             founding_actors: vec![crate::ids::ActorId::from_incept_hash(&"a".repeat(64))],
+            salt: [0u8; 16],
         };
         store.write_genesis(&g).unwrap();
         assert_eq!(store.genesis().unwrap(), Some(g));

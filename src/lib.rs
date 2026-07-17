@@ -47,6 +47,7 @@ pub mod proto;
 pub mod registry;
 pub mod serve;
 pub mod sigdag;
+pub mod space;
 pub mod store;
 pub mod sync;
 pub mod tracker;

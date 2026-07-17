@@ -1618,16 +1618,17 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
-                // Anchor the ticket on the workspace's TRUE founding actor (the
-                // genesis trust root), NOT the inviter's own actor — otherwise a
-                // non-founder's invite roots the joiner on a forked genesis where
-                // the real founder and the founding key-epoch carry no authority.
-                // Every correctly-joined node shares this same root.
-                let founder_actor = match self.tracker.lock().unwrap().founding_actor() {
-                    Some(a) => a.to_string(),
+                // Carry the verifiable founding proof (salt + founder inception),
+                // NOT a bare anchor string. The joiner checks the workspace id
+                // commits to it, so a non-founder's invite still roots the joiner
+                // on the TRUE founder and a tampered anchor is rejected — every
+                // correctly-joined node holds the same proof (lait/space/1).
+                let (salt, founder_inception) = match self.tracker.lock().unwrap().founding_proof()
+                {
+                    Some(p) => p,
                     None => {
                         return Ok(Response::err(
-                            "this workspace has no founding actor — cannot mint an invite",
+                            "this workspace has no founding proof — cannot mint an invite",
                         ))
                     }
                 };
@@ -1636,7 +1637,8 @@ impl Node {
                     name,
                     host: self.shared.my_id,
                     host_nick: self.shared.nick(),
-                    founder_actor,
+                    salt,
+                    founder_inception: Some(founder_inception),
                     invite,
                 };
                 Ok(Response::Text {

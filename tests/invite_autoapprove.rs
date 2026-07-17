@@ -136,8 +136,15 @@ fn found_home(home: &Path) {
 fn join_home(home: &Path, ticket: &str) {
     let t: lait::proto::WorkspaceTicket = ticket.parse().expect("parse ticket");
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::join_workspace_store(&store, &t.workspace, &t.founder_actor)
-        .expect("bootstrap joiner store");
+    lait::tracker::join_workspace_store(
+        &store,
+        &t.workspace,
+        &t.salt,
+        t.founder_inception
+            .as_ref()
+            .expect("ticket carries a founding proof"),
+    )
+    .expect("bootstrap joiner store");
 }
 
 #[test]

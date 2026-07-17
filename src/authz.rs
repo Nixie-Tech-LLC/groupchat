@@ -311,6 +311,7 @@ mod tests {
             g: Genesis {
                 workspace_id: w,
                 founding_actors: vec![actors[&founder].0.clone()],
+                salt: [0u8; 16],
             },
             events,
             actors,

@@ -672,7 +672,17 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
         }
     } else {
         let store = Store::open(&target)?;
-        crate::tracker::join_workspace_store(&store, &ticket.workspace, &ticket.founder_actor)?;
+        let founder_inception = ticket.founder_inception.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "this invite carries no founding proof — it may be from an older lait; ask for a fresh one"
+            )
+        })?;
+        crate::tracker::join_workspace_store(
+            &store,
+            &ticket.workspace,
+            &ticket.salt,
+            founder_inception,
+        )?;
     }
 
     // Set the display name before the daemon is auto-spawned so a cold joiner
