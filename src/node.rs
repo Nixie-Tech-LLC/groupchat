@@ -348,6 +348,38 @@ impl ProtocolHandler for SyncHandler {
     }
 }
 
+/// Seal a pre-authorization to the host and bind it to the joiner's actor, for
+/// `Payload::JoinRequest`. Sealing keeps the invite nonce off the shared gossip
+/// topic; binding the redeemer means a *copied* blob can only ever admit that
+/// actor, not an eavesdropper re-pairing it with its own inception.
+fn seal_bound_invite(
+    host: &UserId,
+    invite: &SignedInvite,
+    redeemer: &crate::ids::ActorId,
+) -> Option<Vec<u8>> {
+    let payload = postcard::to_stdvec(&(invite.clone(), redeemer.clone())).ok()?;
+    crate::crypto::seal_to(host, &payload)
+}
+
+/// Open a sealed, redeemer-bound pre-authorization. Returns the invite only if it
+/// was sealed to `me` (the host) AND the request's `incept` is the actor the seal
+/// names — so a blob copied off the topic and re-paired with a different
+/// inception is refused. `my_seed` is the host's identity seed.
+fn open_bound_invite(
+    my_seed: &[u8; 32],
+    me: &UserId,
+    sealed: &[u8],
+    incept: &crate::actor::SignedEvent,
+) -> Option<SignedInvite> {
+    let raw = crate::crypto::open_sealed(my_seed, me, sealed)?;
+    let (invite, redeemer): (SignedInvite, crate::ids::ActorId) =
+        postcard::from_bytes(&raw).ok()?;
+    if crate::ids::ActorId::from_incept_hash(&incept.hash()) != redeemer {
+        return None;
+    }
+    Some(invite)
+}
+
 /// Append-only-ish ring buffer of presence/system events (P1 transport surface).
 #[derive(Debug, Default)]
 pub struct EventLog {
@@ -810,11 +842,21 @@ impl Node {
         self.join_topic(ticket.topic(), vec![ticket.host]).await?;
         // Mint (or recover) our actor inception so an admin can admit our actor.
         let incept = self.tracker.lock().unwrap().self_inception().ok();
+        // Seal the pre-authorization to the HOST and bind it to our actor, so the
+        // invite nonce never rides the shared topic in the clear (a removed member
+        // subscribed to the topic can't lift it), and a copied blob can only ever
+        // admit us — not an eavesdropper re-pairing it with their own inception.
+        let sealed_invite = match (&ticket.invite, &incept) {
+            (Some(inv), Some(ic)) => {
+                let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
+                let host_user = UserId::from_key_string(ticket.host.to_string());
+                seal_bound_invite(&host_user, inv, &redeemer)
+            }
+            _ => None,
+        };
         self.broadcast(Payload::JoinRequest {
             nick: self.shared.nick(),
-            // Echo the ticket's pre-authorization (if any) so an admin receiver can
-            // auto-seal us the key without a manual approve (Pattern A).
-            invite: ticket.invite.clone(),
+            invite: sealed_invite,
             incept,
         })
         .await
@@ -1083,9 +1125,20 @@ impl Node {
     fn try_auto_approve(
         self: Arc<Self>,
         _joiner_id: EndpointId,
-        invite: SignedInvite,
+        sealed: Vec<u8>,
         incept: Option<crate::actor::SignedEvent>,
     ) {
+        // A pre-actor peer carries no inception — a v2 daemon cannot admit it.
+        let Some(incept) = incept else { return };
+        // Only we (the host) can open the sealed pre-authorization — that is what
+        // kept the nonce off the topic — and only for the actor it names, so a
+        // blob copied off the wire cannot be re-paired with an eavesdropper's
+        // inception.
+        let me = UserId::from_key_string(self.shared.my_id.to_string());
+        let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
+        else {
+            return;
+        };
         let (issuer_pk, grant) = match invite.verify() {
             Ok(v) => v,
             Err(_) => return,
@@ -1094,8 +1147,6 @@ impl Node {
         if grant.is_expired(now) {
             return;
         }
-        // A pre-actor peer carries no inception — a v2 daemon cannot admit it.
-        let Some(incept) = incept else { return };
         let issuer = UserId::from_key_string(issuer_pk.to_string());
         let (changed, dirty) = {
             let mut t = self.tracker.lock().unwrap();
@@ -2184,6 +2235,46 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sealed_invite_binds_to_its_redeemer_and_hides_from_the_topic() {
+        use crate::actor::incept_single;
+        use crate::ids::{SystemUlidSource, WorkspaceId};
+        use crate::proto::{InviteGrant, SignedInvite};
+
+        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let host_seed = [10u8; 32];
+        let host_sk = SecretKey::from_bytes(&host_seed);
+        let host = UserId::from_key_string(host_sk.public().to_string());
+
+        // The legit joiner and an eavesdropper, each with their own actor.
+        let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
+        let (atk_incept, _atk_actor) = incept_single(&[12u8; 32], &ws, [3u8; 16], [4u8; 16], None);
+
+        // An admin mints + signs an invite; the joiner seals it bound to itself.
+        let grant = InviteGrant::mint(ws.to_string(), 0, 3600, true);
+        let invite = SignedInvite::sign(&host_sk, &grant).unwrap();
+        let sealed = seal_bound_invite(&host, &invite, &j_actor).unwrap();
+
+        // The host opens it for the bound joiner.
+        assert!(
+            open_bound_invite(&host_seed, &host, &sealed, &j_incept).is_some(),
+            "the host admits the bound joiner"
+        );
+        // Hijack attempt: an eavesdropper COPIES the opaque blob and re-pairs it
+        // with its OWN inception — the redeemer binding refuses it.
+        assert!(
+            open_bound_invite(&host_seed, &host, &sealed, &atk_incept).is_none(),
+            "a copied blob cannot admit a different actor"
+        );
+        // And a non-host cannot even read the blob — the nonce stays off the topic.
+        let atk_user =
+            UserId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        assert!(
+            open_bound_invite(&[12u8; 32], &atk_user, &sealed, &j_incept).is_none(),
+            "only the host can open the sealed invite"
+        );
+    }
 
     #[test]
     fn idle_shutdown_only_when_unused_and_past_window() {

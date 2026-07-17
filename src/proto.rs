@@ -126,8 +126,16 @@ pub enum Payload {
     /// valid, an admin receiver auto-seals the workspace key with no manual step.
     JoinRequest {
         nick: String,
+        /// The pre-authorization, **sealed to the host** (`ticket.host`) and bound
+        /// to the joiner's actor: `seal_to(host, postcard((SignedInvite, redeemer)))`.
+        /// Sealing keeps the nonce off the shared gossip topic — a removed member
+        /// on the topic sees only ciphertext, so it cannot lift the invite to
+        /// hijack the seat. Binding the redeemer means a *copied* blob only ever
+        /// admits the original joiner (an eavesdropper cannot re-pair it with its
+        /// own inception). Only the host can open it, so the host auto-admits;
+        /// other admins fall back to the manual approve of the stashed request.
         #[serde(default)]
-        invite: Option<SignedInvite>,
+        invite: Option<Vec<u8>>,
         /// The joiner's self-certifying actor inception (lait/actor/1), so an
         /// admin can admit its *actor* before doc-sync delivers it. Absent only
         /// from a pre-actor peer (which a v2 daemon will not admit).
