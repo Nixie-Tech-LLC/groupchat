@@ -235,11 +235,29 @@ pub fn found_workspace(
     store.save_catalog(&cat)?;
     let membership = MembershipDoc::create(&ws, Some(store.peer_id()), me)?;
     membership.add_actor_event(&incept_ev)?;
-    // Mint the founding key epoch (id-addressed, generation 0), sealed to the
-    // founder's device.
+    // Mint the founding key epoch (id-addressed, generation 0) via a SIGNED
+    // MintEpoch op authored by the founder, and seal it to the founder's device.
+    // The signed mint is what any replica adopts — never a raw epoch record.
     let key = crypto::random_key();
     let epoch0 = rand16();
-    membership.add_epoch(&epoch0, 0, &[actor_id.to_string()])?;
+    let key_commit = *blake3::hash(&key).as_bytes();
+    let mint = acl::sign_op(
+        device_seed,
+        &AclOp {
+            action: AclAction::MintEpoch {
+                id: epoch0,
+                gen: 0,
+                key_commit,
+                members: vec![actor_id.clone()],
+            },
+            by: actor_id.clone(),
+            actor_asof: vec![incept_ev.hash()],
+            nonce: None,
+        },
+        membership.heads(),
+        &ws,
+    );
+    membership.add_op(&mint)?;
     if let Some(sealed) = crypto::seal_to(me, &key) {
         membership.put_sealed(&epoch0, me, &sealed)?;
     }
@@ -399,29 +417,41 @@ impl Tracker {
         Ok(tracker)
     }
 
-    /// Rebuild the keyring: unseal every epoch's envelope addressed to *any* of
-    /// our own devices (A§11 lazy revocation — we keep older keys so already-
-    /// synced content stays readable). Called after any membership change/import.
+    /// Rebuild the keyring: unseal every **authorized** epoch's envelope
+    /// addressed to our device (A§11 lazy revocation — we keep older keys so
+    /// already-synced content stays readable). Called after any membership
+    /// change/import.
+    ///
+    /// Two authenticity gates, both essential: we consider only epochs a valid
+    /// writer-signed [`acl::AclAction::MintEpoch`] authorized (never a raw synced
+    /// epoch), and we adopt the unsealed key only if `blake3(key)` matches that
+    /// mint's `key_commit` — so a forged sealed envelope (an attacker overwriting
+    /// our `(epoch, device)` slot with a key it chose) is rejected, not adopted.
     fn refresh_keyring(&mut self) {
-        for e in self.membership.epochs() {
+        for e in self.acl_state().epochs() {
             if self.keyring.contains_key(&e.id) {
                 continue;
             }
             if let Some(sealed) = self.membership.get_sealed(&e.id, &self.me) {
                 if let Some(raw) = crypto::open_sealed(&self.seed, &self.me, &sealed) {
                     if let Ok(key) = <WorkspaceKey>::try_from(raw.as_slice()) {
-                        self.keyring.insert(e.id, key);
+                        // Bind the envelope to the signed mint: reject a key whose
+                        // hash does not match the committed value.
+                        if *blake3::hash(&key).as_bytes() == e.key_commit {
+                            self.keyring.insert(e.id, key);
+                        }
                     }
                 }
             }
         }
     }
 
-    /// The deterministic active epoch (the encryption target): highest
-    /// generation, ties broken by the largest id — a pure function of the epoch
-    /// set, so every replica agrees even after concurrent rotations.
-    fn active_epoch(&self) -> Option<crate::membership::EpochRec> {
-        self.membership
+    /// The deterministic active epoch (the encryption target): the highest
+    /// `(gen, id)` among **authorized** epochs — a pure function of the signed
+    /// mint set, so every replica agrees even after concurrent rotations, and an
+    /// injected (unauthorized) epoch is never selected.
+    fn active_epoch(&self) -> Option<acl::EpochAuth> {
+        self.acl_state()
             .epochs()
             .into_iter()
             .max_by(|a, b| a.gen.cmp(&b.gen).then_with(|| a.id.cmp(&b.id)))
@@ -3034,14 +3064,28 @@ impl Tracker {
     /// [`heal_stale_epoch`] re-rotates if a merge leaves the tip sealed to a
     /// since-removed actor.
     ///
+    /// The mint is a **signed [`acl::AclAction::MintEpoch`]** authored as our own
+    /// actor, so the epoch rides the same trust boundary as membership: a replica
+    /// adopts it only when this author held write standing at position. If we are
+    /// not a writer the op is inert everywhere (never selected, never a key), so
+    /// this degrades gracefully rather than splitting state. The op commits to
+    /// `blake3(new_key)`, binding the sealed envelopes we write next.
+    ///
     /// [`heal_stale_epoch`]: Self::heal_stale_epoch
     fn rotate_key(&mut self) -> Result<()> {
         let gen = self.active_epoch().map(|e| e.gen + 1).unwrap_or(0);
         let id = rand16();
         let new_key = crypto::random_key();
+        let key_commit = *blake3::hash(&new_key).as_bytes();
         let members: Vec<(ActorId, Vec<Grant>)> = self.acl_state().members();
-        let member_ids: Vec<String> = members.iter().map(|(a, _)| a.to_string()).collect();
-        self.membership.add_epoch(&id, gen, &member_ids)?;
+        let member_actors: Vec<ActorId> = members.iter().map(|(a, _)| a.clone()).collect();
+        let op = self.author_acl(AclAction::MintEpoch {
+            id,
+            gen,
+            key_commit,
+            members: member_actors,
+        })?;
+        self.membership.add_op(&op)?;
         let plane = self.actor_plane();
         for (actor, _grants) in &members {
             for d in plane.devices_of(actor) {
@@ -3106,11 +3150,11 @@ impl Tracker {
         let Some(active) = self.active_epoch() else {
             return Ok(());
         };
-        let members: std::collections::BTreeSet<String> = self
+        let members: std::collections::BTreeSet<ActorId> = self
             .acl_state()
             .members()
             .into_iter()
-            .map(|(a, _)| a.to_string())
+            .map(|(a, _)| a)
             .collect();
         let stale = active.members.iter().any(|m| !members.contains(m));
         if stale && self.am_i_admin() {
@@ -4258,6 +4302,79 @@ mod tests {
         assert!(
             matches!(resp, Response::Ref { .. }) && dirty.is_some(),
             "a granted member's write succeeds: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn injected_epoch_without_an_authorized_mint_is_never_adopted() {
+        // Regression for the unauthenticated-epoch hijack. An attacker on the
+        // workspace topic pushes a membership diff that injects a HIGHER-gen epoch
+        // — a FORGED MintEpoch signed by an actor it self-incepted (so the
+        // device→actor binding resolves) but that is NOT a member/writer, plus a
+        // sealed envelope carrying an attacker-chosen key. Because the mint fails
+        // the write-standing check in acl::replay, the epoch is never authorized,
+        // so the victim never selects it and never adopts the attacker's key.
+        use crate::membership::MembershipDoc;
+        let mut a = new_node(); // founder/admin (victim)
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let victim_dev = a.tracker.me.clone();
+        let victim_actor = a.tracker.my_actor().unwrap();
+        let ws = a.tracker.workspace_id().clone();
+        let legit_epoch = a.tracker.active_epoch().unwrap().id;
+        let a_vv = a.tracker.membership_vv_bytes();
+
+        // Attacker self-incepts an actor that never joined, then forges the mint.
+        let atk_seed = [0x33u8; 32];
+        let atk_dev = user_from_seed(atk_seed);
+        let (atk_incept, atk_actor) =
+            actor::incept_single(&atk_seed, &ws, [0x44u8; 16], [0x45u8; 16], None);
+        let attacker_key = crate::crypto::random_key(); // the attacker knows this
+        let poison_id = [0xEEu8; 16];
+        let key_commit = *blake3::hash(&attacker_key).as_bytes();
+
+        let evil = MembershipDoc::empty(None);
+        evil.import(&a.tracker.export_membership_from(&[]).unwrap())
+            .unwrap();
+        evil.add_actor_event(&atk_incept).unwrap();
+        let forged_mint = acl::sign_op(
+            &atk_seed,
+            &AclOp {
+                action: AclAction::MintEpoch {
+                    id: poison_id,
+                    gen: 9999, // far above the legit tip — would win IF authorized
+                    key_commit,
+                    members: vec![victim_actor.clone()],
+                },
+                by: atk_actor.clone(),
+                actor_asof: vec![atk_incept.hash()],
+                nonce: None,
+            },
+            evil.heads(),
+            &ws,
+        );
+        evil.add_op(&forged_mint).unwrap();
+        let sealed = crate::crypto::seal_to(&victim_dev, &attacker_key).unwrap();
+        evil.put_sealed(&poison_id, &victim_dev, &sealed).unwrap();
+        evil.apply(&crate::engine::op::OpCtx::authority("poison", &atk_dev));
+        let diff = evil.export_from_bytes(&a_vv).unwrap();
+
+        // Victim imports it over sync (import_membership is ungated by design).
+        a.tracker.import_membership(&diff).unwrap();
+
+        // The forged epoch is NOT authorized, so it is never the active tip...
+        assert_eq!(
+            a.tracker.active_epoch().map(|e| e.id),
+            Some(legit_epoch),
+            "an injected epoch with no authorized mint must never be selected"
+        );
+        // ...and new content stays under the legit key — the attacker cannot read.
+        new_issue(&mut a.tracker, "STILL-SECRET-after-injection");
+        let export = a.tracker.export_catalog_from(&[]).unwrap();
+        let (_id, ct) = export.split_at(16);
+        assert!(
+            crate::crypto::aead_decrypt(&attacker_key, ct).is_none(),
+            "the attacker's key must not decrypt the victim's content"
         );
     }
 

@@ -76,17 +76,46 @@ pub enum AclAction {
     AddAgent {
         actor: ActorId,
     },
+    /// Mint a workspace key-epoch (A§11). **Signed, and authorized only when its
+    /// author holds content-write standing** (`can_write`), so the key-lifecycle
+    /// rides the same trust boundary as membership: a replica adopts an epoch only
+    /// when a valid mint op authorizes it, never because it merely appeared in the
+    /// synced doc. `key_commit = blake3(workspace_key)` binds the (unsigned,
+    /// per-device) sealed envelopes — a device accepts an unsealed key only if its
+    /// hash matches, so a forged envelope is inert. Grow-only and orthogonal to
+    /// the member set (no subject actor); concurrent mints coexist by `id` and the
+    /// deterministic `max(gen, id)` tip picks one.
+    MintEpoch {
+        id: [u8; 16],
+        gen: u32,
+        key_commit: [u8; 32],
+        /// The actor set the minter sealed the key to (for stale-tip healing).
+        members: Vec<ActorId>,
+    },
 }
 
 impl AclAction {
-    pub fn actor(&self) -> &ActorId {
+    /// The subject actor an action targets, or `None` for actions with no single
+    /// subject ([`AclAction::MintEpoch`]).
+    pub fn actor(&self) -> Option<&ActorId> {
         match self {
             AclAction::AddMember { actor, .. }
             | AclAction::RemoveMember { actor }
             | AclAction::SetGrants { actor, .. }
-            | AclAction::AddAgent { actor } => actor,
+            | AclAction::AddAgent { actor } => Some(actor),
+            AclAction::MintEpoch { .. } => None,
         }
     }
+}
+
+/// One authorized key-epoch, materialized from a valid [`AclAction::MintEpoch`].
+/// The trusted record other planes/selection read — never the raw synced doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochAuth {
+    pub id: [u8; 16],
+    pub gen: u32,
+    pub key_commit: [u8; 32],
+    pub members: Vec<ActorId>,
 }
 
 /// A membership op: the action, the actor its author claims to be, and the
@@ -141,9 +170,23 @@ pub struct AclState {
     /// agent actor → sponsoring actor. Every key here is also in `members`;
     /// an agent's presence is derived from its sponsor's.
     agents: BTreeMap<ActorId, ActorId>,
+    /// Every **authorized** key-epoch (a valid writer-signed [`AclAction::MintEpoch`]),
+    /// keyed by id. The trusted epoch set — key selection and keyring adoption
+    /// read this, never the raw synced doc, so an injected epoch is never live.
+    epochs: BTreeMap<[u8; 16], EpochAuth>,
 }
 
 impl AclState {
+    /// The authorized key-epochs, sorted by id. Selection picks the highest
+    /// `(gen, id)` among these (the deterministic active tip).
+    pub fn epochs(&self) -> Vec<EpochAuth> {
+        self.epochs.values().cloned().collect()
+    }
+    /// The authorized epoch with a given id, if any (its `key_commit` binds the
+    /// sealed envelopes).
+    pub fn epoch(&self, id: &[u8; 16]) -> Option<&EpochAuth> {
+        self.epochs.get(id)
+    }
     /// Whether `a` is sealed into the workspace (humans and agents alike).
     pub fn is_member(&self, a: &ActorId) -> bool {
         self.members.contains_key(a)
@@ -284,6 +327,9 @@ pub fn replay_with_audit(
     // ---- pass 1 (topo): authorize ops, tracking standing as it evolves ----
     let mut admins: BTreeSet<ActorId> = genesis.founding_actors.iter().cloned().collect();
     let mut humans: BTreeSet<ActorId> = admins.clone();
+    // Write-standing actors (Admin or Write grant) — who may mint a key-epoch.
+    // Founding actors are seeded [Admin, Write], so they start here too.
+    let mut writers: BTreeSet<ActorId> = admins.clone();
     let mut agents_now: BTreeMap<ActorId, ActorId> = BTreeMap::new();
 
     let mut authorized: Vec<String> = Vec::new();
@@ -305,12 +351,13 @@ pub fn replay_with_audit(
             continue;
         };
         entry.by = Some(op.by.clone());
-        entry.subject = Some(op.action.actor().clone());
+        entry.subject = op.action.actor().cloned();
         entry.kind = match &op.action {
             AclAction::AddMember { .. } => "add_member",
             AclAction::RemoveMember { .. } => "remove_member",
             AclAction::SetGrants { .. } => "set_grants",
             AclAction::AddAgent { .. } => "add_agent",
+            AclAction::MintEpoch { .. } => "mint_epoch",
         };
         if let AclAction::AddMember { grants, .. } | AclAction::SetGrants { grants, .. } =
             &op.action
@@ -343,6 +390,12 @@ pub fn replay_with_audit(
                         && !humans.contains(actor)
                         && !agents_now.contains_key(actor)
                 }
+                // Minting a key-epoch requires **content-write standing** (A§11):
+                // re-keying content is a content-authority action, so a viewer,
+                // agent, or non-member cannot mint. This is the fence that stops
+                // an injected epoch from ever going live — an attacker is not a
+                // writer, so its mint never authorizes on any replica.
+                AclAction::MintEpoch { .. } => writers.contains(by),
             };
         entry.authorized = ok;
         audit.push(entry);
@@ -359,6 +412,11 @@ pub fn replay_with_audit(
                 } else {
                     admins.remove(actor);
                 }
+                if grants.contains(&Grant::Admin) || grants.contains(&Grant::Write) {
+                    writers.insert(actor.clone());
+                } else {
+                    writers.remove(actor);
+                }
             }
             AclAction::AddAgent { actor } => {
                 agents_now.insert(actor.clone(), op.by.clone());
@@ -366,11 +424,14 @@ pub fn replay_with_audit(
             AclAction::RemoveMember { actor } => {
                 humans.remove(actor);
                 admins.remove(actor);
+                writers.remove(actor);
                 agents_now.remove(actor);
                 // in-pass sponsor cascade so an orphaned agent cannot author
                 // (nothing to author anyway) nor be counted as standing.
                 agents_now.retain(|_, sponsor| sponsor != actor);
             }
+            // Epoch mints don't touch the member set; recorded in pass 2.
+            AclAction::MintEpoch { .. } => {}
         }
     }
 
@@ -382,6 +443,9 @@ pub fn replay_with_audit(
         .map(|a| (a.clone(), founding.clone()))
         .collect();
     let mut agents: BTreeMap<ActorId, ActorId> = BTreeMap::new();
+    // Authorized epoch mints, keyed by id (grow-only; a re-mint of the same id is
+    // idempotent — the id is content-random so this only happens on replay).
+    let mut epochs: BTreeMap<[u8; 16], EpochAuth> = BTreeMap::new();
 
     for h in &authorized {
         let op = decoded[h].as_ref().expect("authorized ops decoded");
@@ -398,6 +462,19 @@ pub fn replay_with_audit(
                 members.remove(actor);
                 agents.remove(actor);
             }
+            AclAction::MintEpoch {
+                id,
+                gen,
+                key_commit,
+                members: recipients,
+            } => {
+                epochs.entry(*id).or_insert_with(|| EpochAuth {
+                    id: *id,
+                    gen: *gen,
+                    key_commit: *key_commit,
+                    members: recipients.clone(),
+                });
+            }
         }
     }
 
@@ -406,7 +483,11 @@ pub fn replay_with_audit(
     // concurrent add appeared later in topo order. AddAgent counts as an add.
     let subjects: BTreeSet<ActorId> = authorized
         .iter()
-        .filter_map(|h| decoded[h].as_ref().map(|op| op.action.actor().clone()))
+        .filter_map(|h| {
+            decoded[h]
+                .as_ref()
+                .and_then(|op| op.action.actor().cloned())
+        })
         .collect();
     for subject in subjects {
         let adds: Vec<&String> = authorized
@@ -526,7 +607,14 @@ pub fn replay_with_audit(
         members.remove(&k);
     }
 
-    (AclState { members, agents }, audit)
+    (
+        AclState {
+            members,
+            agents,
+            epochs,
+        },
+        audit,
+    )
 }
 
 #[cfg(test)]

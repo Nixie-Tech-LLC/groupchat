@@ -27,33 +27,17 @@ const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
 const C_ACL: &str = "acl";
 const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
-                                 // Content-addressed key epochs (grow-only). Concurrent rotations mint distinct
-                                 // epoch ids instead of colliding on a shared counter slot, so their per-device
-                                 // envelopes coexist and no replica ends up with an undecryptable epoch.
-const C_EPOCHS: &str = "epochs"; // epoch_id(hex) -> { gen: i64, members: [actorId] }
+                                 // Per-device sealed key envelopes, keyed by content-addressed epoch id. The
+                                 // epoch's *authorization* (gen, recipient set, key commitment) is NOT here — it
+                                 // rides a signed `AclAction::MintEpoch` on the ACL DAG (C_ACL), so a replica
+                                 // adopts a key only when a valid writer-signed mint authorizes its epoch. These
+                                 // envelopes are unsigned ciphertext, but each is bound to its mint by
+                                 // `blake3(key) == mint.key_commit`, so a forged envelope is inert.
 const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
 const C_REDEEMED: &str = "redeemed"; // invite nonce(hex) -> redeemer UserId
-const K_GEN: &str = "gen";
-const K_MEMBERS: &str = "members";
-
-/// One key epoch's public metadata (the key itself lives only in the sealed
-/// per-device envelopes). `members` is the actor set the minter sealed it to —
-/// used to detect a stale epoch that still includes a since-removed actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EpochRec {
-    pub id: [u8; 16],
-    pub gen: u32,
-    pub members: Vec<String>,
-}
 
 fn epoch_hex(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
-}
-fn epoch_from_hex(s: &str) -> Option<[u8; 16]> {
-    let v = data_encoding::HEXLOWER_PERMISSIVE
-        .decode(s.as_bytes())
-        .ok()?;
-    v.as_slice().try_into().ok()
 }
 
 /// A wrapper around the workspace's membership `LoroDoc`.
@@ -69,7 +53,6 @@ impl MembershipDoc {
         root.insert(K_WORKSPACE, workspace_id.as_str())?;
         root.insert_container(C_ACL, LoroList::new())?;
         root.insert_container(C_ACTORS, LoroList::new())?;
-        root.insert_container(C_EPOCHS, LoroMap::new())?;
         root.insert_container(C_KEYS, LoroMap::new())?;
         root.insert_container(C_REDEEMED, LoroMap::new())?;
         op::commit_with(&doc, &OpCtx::authority("init", founder));
@@ -153,13 +136,6 @@ impl MembershipDoc {
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
-    }
-    fn epochs_map(&self, create: bool) -> Option<LoroMap> {
-        match self.root().get(C_EPOCHS) {
-            Some(ValueOrContainer::Container(Container::Map(m))) => Some(m),
-            _ if create => self.root().insert_container(C_EPOCHS, LoroMap::new()).ok(),
-            _ => None,
-        }
     }
 
     // ---- ACL ops (grow-only) ----
@@ -275,59 +251,7 @@ impl MembershipDoc {
             .collect()
     }
 
-    // ---- content-addressed key epochs + sealed envelopes ----
-
-    /// Record a new key epoch's metadata (its per-device sealed envelopes go
-    /// through [`put_sealed`]). Idempotent by id. `members` is the actor set the
-    /// minter sealed the key to.
-    ///
-    /// [`put_sealed`]: Self::put_sealed
-    pub fn add_epoch(&self, id: &[u8; 16], gen: u32, members: &[String]) -> Result<()> {
-        let map = self
-            .epochs_map(true)
-            .ok_or_else(|| anyhow!("epochs container missing"))?;
-        let hx = epoch_hex(id);
-        if matches!(map.get(&hx), Some(ValueOrContainer::Container(_))) {
-            return Ok(());
-        }
-        let rec = map.insert_container(&hx, LoroMap::new())?;
-        rec.insert(K_GEN, gen as i64)?;
-        let list = rec.insert_container(K_MEMBERS, LoroList::new())?;
-        for m in members {
-            list.insert(list.len(), m.as_str())?;
-        }
-        Ok(())
-    }
-
-    /// All recorded key epochs (grow-only set).
-    pub fn epochs(&self) -> Vec<EpochRec> {
-        let Some(map) = self.epochs_map(false) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for hx in lx::map_keys(&map) {
-            let Some(id) = epoch_from_hex(&hx) else {
-                continue;
-            };
-            let Some(ValueOrContainer::Container(Container::Map(rec))) = map.get(&hx) else {
-                continue;
-            };
-            let gen = lx::get_u64(&rec, K_GEN).unwrap_or(0) as u32;
-            let members = match rec.get(K_MEMBERS) {
-                Some(ValueOrContainer::Container(Container::List(l))) => (0..l.len())
-                    .filter_map(|i| match l.get(i) {
-                        Some(ValueOrContainer::Value(loro::LoroValue::String(s))) => {
-                            Some(s.to_string())
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            out.push(EpochRec { id, gen, members });
-        }
-        out
-    }
+    // ---- per-epoch sealed key envelopes (authorization lives on the ACL DAG) ----
 
     fn epoch_keymap(&self, id: &[u8; 16], create: bool) -> Result<Option<LoroMap>> {
         let keys = self
@@ -469,10 +393,11 @@ mod tests {
 
     #[test]
     fn sealed_keys_per_epoch_roundtrip() {
+        // Epoch *authorization* now rides a signed MintEpoch op on the ACL DAG;
+        // the doc only holds the per-device sealed envelopes, keyed by epoch id.
         let m = fresh(&ws());
         let e0 = [0u8; 16];
         let e1 = [1u8; 16];
-        m.add_epoch(&e0, 0, &[actor(1).to_string()]).unwrap();
         m.put_sealed(&e0, &user(1), b"sealed-for-1").unwrap();
         m.put_sealed(&e0, &user(2), b"sealed-for-2").unwrap();
         m.apply(&ctx("seal"));
@@ -490,11 +415,6 @@ mod tests {
         let mut expect = vec![user(1), user(2)];
         expect.sort();
         assert_eq!(devs, expect);
-        let epochs = m.epochs();
-        assert_eq!(epochs.len(), 1);
-        assert_eq!(epochs[0].id, e0);
-        assert_eq!(epochs[0].gen, 0);
-        assert_eq!(epochs[0].members, vec![actor(1).to_string()]);
     }
 
     #[test]
@@ -523,14 +443,11 @@ mod tests {
         let op = add_op(2, vec![Grant::Admin], vec![], &w);
         m.add_op(&op).unwrap();
         let e0 = [9u8; 16];
-        m.add_epoch(&e0, 3, &[actor(2).to_string()]).unwrap();
         m.put_sealed(&e0, &user(2), b"k").unwrap();
         m.apply(&ctx("member_add"));
         let snap = m.snapshot().unwrap();
         let loaded = MembershipDoc::from_snapshot(&snap, None).unwrap();
         assert_eq!(loaded.ops().len(), 1);
-        assert_eq!(loaded.epochs().len(), 1);
-        assert_eq!(loaded.epochs()[0].gen, 3);
         assert_eq!(loaded.get_sealed(&e0, &user(2)).as_deref(), Some(&b"k"[..]));
     }
 }
