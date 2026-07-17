@@ -305,6 +305,13 @@ pub enum Request {
     /// `Recover` events. Distinct from [`Recover`](Self::Recover), which resets a
     /// single actor's devices.
     SpaceRecover,
+    /// Elevate the workspace recovery authority from a solo bootstrap key to a
+    /// `k`-of-N FROST group key over `cofounders` (device keys) + this device,
+    /// via a dealer-free DKG that rides the synced ceremony bulletin board.
+    SpaceElevate {
+        cofounders: Vec<String>,
+        k: u16,
+    },
     /// Recover our actor with the offline recovery key: reset the device set to
     /// this device (identity is restored; content-key access is re-sealed lazily
     /// by an admin/peer).

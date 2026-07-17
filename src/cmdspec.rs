@@ -1150,9 +1150,34 @@ pub fn specs() -> Vec<Spec> {
             "recover-workspace",
             "Break-glass: re-root the WHOLE workspace to this device using the \
              offline workspace recovery keys (threshold K-of-N), when the admins \
-             are lost or compromised. Sync from a surviving peer first.",
+             are lost or compromised. Sync from a surviving peer first. Under a \
+             group key, repeat on each holder until the threshold co-signs.",
             vec![],
             |_| Ok(Request::SpaceRecover),
+        ),
+        Spec::req(
+            "elevate-recovery",
+            "Elevate the workspace recovery authority from your solo bootstrap key \
+             to a K-of-N group key (dealer-free FROST DKG), sharing the recovery \
+             burden with co-founders. Run where space-recovery.key lives; the \
+             co-founders must already be admitted members.",
+            vec![
+                A::pos_multi(
+                    "cofounders",
+                    "Co-founder device keys to share the recovery authority with.",
+                ),
+                A::val(
+                    "threshold",
+                    "Signatures required to recover (K). Defaults to all holders (N-of-N).",
+                )
+                .default("0"),
+            ],
+            |m| {
+                Ok(Request::SpaceElevate {
+                    cofounders: multi(m, "cofounders"),
+                    k: u64_arg(m, "threshold")? as u16,
+                })
+            },
         ),
         Spec::req(
             "activity",

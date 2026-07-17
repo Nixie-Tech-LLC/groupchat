@@ -47,6 +47,16 @@ pub enum CeremonyOp {
         to: String,
         sealed: Vec<u8>,
     },
+    /// Open a threshold-signing session: the space-plane op (serialized) the
+    /// group should sign. Authored by any holder; others co-sign it.
+    SignRequest { session: [u8; 16], op: Vec<u8> },
+    /// A broadcast signing round-1 commitment.
+    SignRound1 {
+        session: [u8; 16],
+        commitments: Vec<u8>,
+    },
+    /// A broadcast signing round-2 signature share (not secret).
+    SignRound2 { session: [u8; 16], share: Vec<u8> },
 }
 
 impl CeremonyOp {
@@ -54,7 +64,10 @@ impl CeremonyOp {
         match self {
             CeremonyOp::Propose { session, .. }
             | CeremonyOp::Round1 { session, .. }
-            | CeremonyOp::Round2 { session, .. } => *session,
+            | CeremonyOp::Round2 { session, .. }
+            | CeremonyOp::SignRequest { session, .. }
+            | CeremonyOp::SignRound1 { session, .. }
+            | CeremonyOp::SignRound2 { session, .. } => *session,
         }
     }
 }

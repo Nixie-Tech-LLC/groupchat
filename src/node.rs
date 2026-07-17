@@ -1256,6 +1256,7 @@ impl Node {
                 | Request::MemberRemove { .. }
                 | Request::Assign { .. }
                 | Request::IssueNew { .. }
+                | Request::SpaceElevate { .. }
         ) {
             return Ok(req);
         }
@@ -1286,6 +1287,13 @@ impl Node {
             Request::MemberRemove { who } => Request::MemberRemove {
                 who: resolve(&who)?,
             },
+            Request::SpaceElevate { cofounders, k } => {
+                let mut out = Vec::with_capacity(cofounders.len());
+                for w in &cofounders {
+                    out.push(resolve(w)?);
+                }
+                Request::SpaceElevate { cofounders: out, k }
+            }
             Request::Assign { reff, who, add } => {
                 let mut out = Vec::with_capacity(who.len());
                 for w in &who {
@@ -1384,6 +1392,7 @@ impl Node {
             | Request::DeviceRevoke { .. }
             | Request::DeviceList
             | Request::Recover
+            | Request::SpaceElevate { .. }
             | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {

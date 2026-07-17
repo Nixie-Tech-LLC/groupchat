@@ -31,6 +31,35 @@ pub struct SignedNode {
     pub parents: Vec<String>,
 }
 
+/// The 32-byte message a node's signature covers — public so a **threshold
+/// group** (FROST) can sign the exact bytes [`SignedNode::verify_sig`] checks,
+/// then assemble the node with [`assemble_signed`].
+pub fn payload_to_sign(
+    domain: &[u8],
+    op: &[u8],
+    author: &UserId,
+    parents: &[String],
+    workspace_id: &str,
+) -> [u8; 32] {
+    signing_payload(domain, op, author, parents, workspace_id)
+}
+
+/// Assemble a [`SignedNode`] from an externally produced signature (e.g. a FROST
+/// group signature) over [`payload_to_sign`], with the group public key as author.
+pub fn assemble_signed(
+    op: Vec<u8>,
+    author: UserId,
+    sig: Vec<u8>,
+    parents: Vec<String>,
+) -> SignedNode {
+    SignedNode {
+        op,
+        author,
+        sig,
+        parents,
+    }
+}
+
 /// The canonical bytes a node's signature covers.
 fn signing_payload(
     domain: &[u8],

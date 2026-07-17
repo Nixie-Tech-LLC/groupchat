@@ -742,6 +742,7 @@ impl Tracker {
             Request::DeviceList => Ok((self.device_list_response(), None)),
             Request::Recover => Ok(self.recover()),
             Request::SpaceRecover => Ok(self.space_recover_cmd()),
+            Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
             Request::Members => Ok((self.members_response(), None)),
             Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
@@ -2783,29 +2784,39 @@ impl Tracker {
     ///
     /// [`bootstrap_root_epoch_if_needed`]: Self::bootstrap_root_epoch_if_needed
     pub fn space_recover_cmd(&mut self) -> (Response, Option<DirtySet>) {
-        let Some(secret) = self.read_space_recovery_key() else {
-            return (
-                Response::err(
-                    "no space-recovery.key beside the store — restore your offline recovery key first (or run the group recovery ceremony)",
-                ),
-                None,
-            );
-        };
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        // The held key must be the current recovery authority.
-        let held_commit = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret));
-        if held_commit != Some(cur.recovery_commit) {
-            return (
-                Response::err(
-                    "this recovery key is not the workspace's current recovery authority (it may have been rotated)",
-                ),
-                None,
-            );
+        // Solo path: a held recovery key that IS the current authority signs the
+        // Recover directly.
+        if let Some(secret) = self.read_space_recovery_key() {
+            let held = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret));
+            if held == Some(cur.recovery_commit) {
+                return self.space_recover_solo(&cur, &secret);
+            }
         }
+        // Group path: this device holds a threshold share of the current group
+        // recovery key — open (or drive) a FROST signing ceremony that produces
+        // the Recover group signature. The plane verifies one signature either
+        // way; the threshold is invisible to it.
+        if self.active_dkg_session().is_some() {
+            return self.space_recover_group(&cur);
+        }
+        (
+            Response::err(
+                "no way to recover from this device — need either the workspace's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
+            ),
+            None,
+        )
+    }
+
+    fn space_recover_solo(
+        &mut self,
+        cur: &crate::space::RootState,
+        secret: &[u8; 32],
+    ) -> (Response, Option<DirtySet>) {
         // Re-root to this device's actor (self-incept if needed).
         let me_actor = match self.self_inception() {
             Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
@@ -2815,7 +2826,7 @@ impl Tracker {
             new_root: vec![me_actor.clone()],
             gen: cur.gen + 1,
         };
-        let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
+        let ev = crate::space::sign_op(secret, &op, vec![], &self.workspace_id);
         let res = (|| -> Result<()> {
             self.membership.add_space_event(&ev)?;
             self.persist_membership("space_recover")
@@ -2833,6 +2844,72 @@ impl Tracker {
                     "recovered the workspace — root reset to {} and re-keyed",
                     me_actor.short()
                 )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Break-glass recovery under a K-of-N group key: post a signing request for a
+    /// Recover re-rooting to this device (reusing one already open for this gen),
+    /// then drive the ceremony as far as this device can. Holders converge on the
+    /// group signature and any of them installs it; idempotent across re-runs.
+    fn space_recover_group(
+        &mut self,
+        cur: &crate::space::RootState,
+    ) -> (Response, Option<DirtySet>) {
+        let me_actor = match self.self_inception() {
+            Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let op = crate::space::SpaceOp::Recover {
+            new_root: vec![me_actor.clone()],
+            gen: cur.gen + 1,
+        };
+        let op_bytes = match postcard::to_stdvec(&op) {
+            Ok(b) => b,
+            Err(e) => return (Response::err(format!("encode recover op: {e}")), None),
+        };
+        // Reuse an open request for this exact Recover; else open one.
+        let existing = self
+            .membership
+            .ceremony_events()
+            .iter()
+            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
+            .find_map(|op| match op {
+                crate::dkg::CeremonyOp::SignRequest { session, op: req } if req == op_bytes => {
+                    Some(session)
+                }
+                _ => None,
+            });
+        if existing.is_none() {
+            let session = rand16();
+            if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::SignRequest {
+                session,
+                op: op_bytes,
+            }) {
+                return (Response::err(format!("{e:#}")), None);
+            }
+        }
+        if let Err(e) = self.dkg_advance() {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        let after = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let installed = after.gen > cur.gen && after.root == vec![me_actor.clone()];
+        let message = if installed {
+            format!(
+                "recovered the workspace — root reset to {} and re-keyed",
+                me_actor.short()
+            )
+        } else {
+            "group recovery signing ceremony under way — run `space recover` on the other holders until the threshold co-signs".to_string()
+        };
+        (
+            Response::Ok {
+                message: Some(message),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -2915,6 +2992,8 @@ impl Tracker {
         participants.insert(self.me.as_str().to_string());
         let participants: Vec<String> = participants.into_iter().collect();
         let n = participants.len() as u16;
+        // k == 0 means "all holders" (N-of-N) — the safe default.
+        let k = if k == 0 { n } else { k };
         if !(1..=n).contains(&k) || n < 2 {
             return (
                 Response::err("elevation needs ≥2 participants and threshold in 1..=N"),
@@ -2985,7 +3064,196 @@ impl Tracker {
         for session in sessions {
             progressed |= self.dkg_advance_session(&session, &events)?;
         }
+        // Threshold-signing sessions (break-glass group recovery) I can co-sign.
+        let sign_sessions: Vec<[u8; 16]> = {
+            let mut seen = std::collections::BTreeSet::new();
+            events
+                .iter()
+                .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
+                .filter_map(|op| match op {
+                    crate::dkg::CeremonyOp::SignRequest { session, .. } => Some(session),
+                    _ => None,
+                })
+                .filter(|s| seen.insert(*s))
+                .collect()
+        };
+        for session in sign_sessions {
+            progressed |= self.sign_advance_session(&session, &events)?;
+        }
         Ok(progressed)
+    }
+
+    /// The DKG session whose derived group key is the workspace's *current*
+    /// recovery authority — i.e. the share this device would sign a break-glass
+    /// `Recover` with. `None` if this device holds no share for the live group.
+    fn active_dkg_session(&self) -> Option<[u8; 16]> {
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let dir = self.store.home_path().join("dkg");
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(hex) = name.strip_suffix("-group") else {
+                continue;
+            };
+            let Ok(bytes) = data_encoding::HEXLOWER_PERMISSIVE.decode(hex.as_bytes()) else {
+                continue;
+            };
+            let Ok(session) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+                continue;
+            };
+            let group_key = self
+                .dkg_read(&session, "group")
+                .and_then(|b| String::from_utf8(b).ok())
+                .map(UserId::from_key_string);
+            if group_key.as_ref().and_then(crate::space::recovery_commit)
+                == Some(cur.recovery_commit)
+            {
+                return Some(session);
+            }
+        }
+        None
+    }
+
+    /// Advance one FROST threshold-signing session over the bulletin board: post
+    /// my commitment, then my signature share once the signer set has committed,
+    /// then (any holder) aggregate the group signature and install the signed
+    /// space op. The signer set is fixed as the `threshold` lowest-index holders,
+    /// so every participant assembles the identical `SigningPackage`.
+    fn sign_advance_session(
+        &mut self,
+        sign_session: &[u8; 16],
+        events: &[crate::space::SignedSpaceEvent],
+    ) -> Result<bool> {
+        let Some(dkg) = self.active_dkg_session() else {
+            return Ok(false);
+        };
+        let (Some(share), Some(pkp)) = (self.dkg_read(&dkg, "share"), self.dkg_read(&dkg, "pkp"))
+        else {
+            return Ok(false);
+        };
+        let threshold: u16 = self
+            .dkg_read(&dkg, "threshold")
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let participants: Vec<String> = self
+            .dkg_read(&dkg, "participants")
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(|s| s.lines().map(String::from).collect())
+            .unwrap_or_default();
+        let group_key = self
+            .dkg_read(&dkg, "group")
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(UserId::from_key_string);
+        let (Some(group_key), true) = (group_key, threshold >= 1) else {
+            return Ok(false);
+        };
+        let index_of = |dev: &str| {
+            participants
+                .iter()
+                .position(|p| p == dev)
+                .map(|i| i as u16 + 1)
+        };
+        let Some(my_index) = index_of(self.me.as_str()) else {
+            return Ok(false);
+        };
+
+        let parsed = crate::dkg::parse_ceremony(events, &self.workspace_id, sign_session);
+        // The op the group is being asked to sign (first request wins).
+        let Some(op_bytes) = parsed.iter().find_map(|(_, op)| match op {
+            crate::dkg::CeremonyOp::SignRequest { op, .. } => Some(op.clone()),
+            _ => None,
+        }) else {
+            return Ok(false);
+        };
+        // The exact 32-byte message `verify_sig` will check for a group-authored node.
+        let message = crate::sigdag::payload_to_sign(
+            crate::space::SPACE_EVENT_DOMAIN,
+            &op_bytes,
+            &group_key,
+            &[],
+            self.workspace_id.as_str(),
+        );
+        // Fixed signer set: the `threshold` lowest-index holders.
+        let in_set = my_index <= threshold;
+
+        // Round-1 commitments from the signer set, keyed by index.
+        let mut r1: crate::dkg::Packages = std::collections::BTreeMap::new();
+        for (author, op) in &parsed {
+            if let crate::dkg::CeremonyOp::SignRound1 { commitments, .. } = op {
+                if let Some(i) = index_of(author.as_str()) {
+                    if i <= threshold {
+                        r1.entry(i).or_insert_with(|| commitments.clone());
+                    }
+                }
+            }
+        }
+        let i_posted_r1 = parsed.iter().any(|(a, op)| {
+            a == &self.me && matches!(op, crate::dkg::CeremonyOp::SignRound1 { .. })
+        });
+
+        // Step 1 — post my commitment (if I'm in the signer set).
+        if in_set && !i_posted_r1 {
+            let (nonces, commitments) = crate::dkg::sign_round1(&share)?;
+            self.dkg_write(sign_session, "nonces", &nonces)?;
+            self.post_ceremony(crate::dkg::CeremonyOp::SignRound1 {
+                session: *sign_session,
+                commitments,
+            })?;
+            return Ok(true);
+        }
+
+        // Step 2 — once the whole signer set has committed, post my signature share.
+        let i_posted_r2 = parsed.iter().any(|(a, op)| {
+            a == &self.me && matches!(op, crate::dkg::CeremonyOp::SignRound2 { .. })
+        });
+        if in_set
+            && r1.len() == threshold as usize
+            && !i_posted_r2
+            && self.dkg_has(sign_session, "nonces")
+        {
+            let nonces = self.dkg_read(sign_session, "nonces").unwrap();
+            let share_sig = crate::dkg::sign_round2(&r1, &message, &nonces, &share)?;
+            self.post_ceremony(crate::dkg::CeremonyOp::SignRound2 {
+                session: *sign_session,
+                share: share_sig,
+            })?;
+            return Ok(true);
+        }
+
+        // Step 3 — any holder aggregates the group signature and installs the op.
+        let mut r2: crate::dkg::Packages = std::collections::BTreeMap::new();
+        for (author, op) in &parsed {
+            if let crate::dkg::CeremonyOp::SignRound2 { share, .. } = op {
+                if let Some(i) = index_of(author.as_str()) {
+                    if i <= threshold {
+                        r2.entry(i).or_insert_with(|| share.clone());
+                    }
+                }
+            }
+        }
+        if r1.len() == threshold as usize && r2.len() == threshold as usize {
+            let sig = crate::dkg::aggregate(&r1, &message, &r2, &pkp)?;
+            let node = crate::sigdag::assemble_signed(op_bytes, group_key, sig, vec![]);
+            let fresh = !self
+                .membership
+                .space_events()
+                .iter()
+                .any(|e| e.hash() == node.hash());
+            if fresh
+                && node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, self.workspace_id.as_str())
+            {
+                self.membership.add_space_event(&node)?;
+                self.persist_membership("group_recover")?;
+                self.bootstrap_root_epoch_if_needed()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn dkg_advance_session(
@@ -3094,6 +3362,9 @@ impl Tracker {
             self.dkg_write(session, "share", &share)?;
             self.dkg_write(session, "pkp", &pkp)?;
             self.dkg_write(session, "group", group_key.as_str().as_bytes())?;
+            self.dkg_write(session, "index", my_index.to_string().as_bytes())?;
+            self.dkg_write(session, "threshold", k.to_string().as_bytes())?;
+            self.dkg_write(session, "participants", participants.join("\n").as_bytes())?;
             return Ok(true);
         }
 
@@ -5283,12 +5554,93 @@ mod tests {
         );
         assert_eq!(after.recovery_commit, b_after.recovery_commit);
 
-        // A's solo key is no longer the authority — solo recovery is refused.
+        // A's solo key is retired: recovery now runs through the group ceremony,
+        // and a lone holder cannot meet the 2-of-2 threshold by itself.
         let (resp, _) = a.tracker.space_recover_cmd();
-        assert!(
-            matches!(resp, Response::Error { .. }),
-            "the retired solo key cannot recover the elevated space: {resp:?}"
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let still = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
         );
+        assert!(
+            !still.recovered,
+            "one holder alone cannot complete a 2-of-2 group recovery"
+        );
+    }
+
+    #[test]
+    fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
+        // After elevation to a 2-of-2 group key, break-glass recovery is a FROST
+        // signing ceremony: a holder (B) requests a Recover, both holders co-sign
+        // over the synced bulletin board, and the aggregated group signature
+        // re-roots the workspace — convergently, with no solo key anywhere.
+        let mut a = new_node();
+        with_project(&mut a.tracker);
+        let a_ws = a.tracker.workspace_str();
+        let a_actor = a.tracker.my_actor().unwrap();
+
+        let b_seed = [82u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // Elevate {A, B} to a 2-of-2 group recovery key.
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let elevated = crate::space::replay(
+            &b.tracker.genesis,
+            &b.tracker.workspace_id,
+            &b.tracker.membership.space_events(),
+        );
+        assert!(!elevated.recovered);
+
+        // B triggers break-glass recovery. B alone cannot meet 2-of-2 yet.
+        let (resp, _) = b.tracker.space_recover_cmd();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let b_actor = b.tracker.my_actor().unwrap();
+        assert!(
+            !crate::space::replay(
+                &b.tracker.genesis,
+                &b.tracker.workspace_id,
+                &b.tracker.membership.space_events(),
+            )
+            .recovered,
+            "the request alone does not recover — the threshold must co-sign"
+        );
+
+        // A co-signs as the rounds sync; the group signature aggregates and installs.
+        for _ in 0..6 {
+            sync_all(&mut b.tracker, &mut a.tracker);
+            sync_all(&mut a.tracker, &mut b.tracker);
+        }
+
+        // The workspace is re-rooted to B, evicting A, convergently on both.
+        for t in [&b.tracker, &a.tracker] {
+            let acl = t.acl_state();
+            assert!(acl.is_admin(&b_actor), "recovered root is the new admin");
+            assert!(!acl.is_admin(&a_actor), "old root is evicted");
+        }
+        let rb = crate::space::replay(
+            &b.tracker.genesis,
+            &b.tracker.workspace_id,
+            &b.tracker.membership.space_events(),
+        );
+        assert!(rb.recovered && rb.root == vec![b_actor]);
     }
 
     #[test]
