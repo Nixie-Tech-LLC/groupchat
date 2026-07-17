@@ -477,6 +477,13 @@ pub fn replay_with_audit(
                 .push((h.clone(), actor.clone()));
         }
     }
+    // Pass 1: pick each nonce's winner and collect *every* losing op globally.
+    // A loser of one race must not count as an "independent seat" while
+    // resolving another — both are spent-nonce admissions, not standing grants,
+    // so an actor that double-spends two invites and loses both must not slip
+    // through by having each race point at the other's losing op.
+    let mut all_losing: BTreeSet<String> = BTreeSet::new();
+    let mut races: Vec<(ActorId, Vec<(String, ActorId)>)> = Vec::new();
     for (_n, mut group) in by_nonce {
         let distinct: BTreeSet<&ActorId> = group.iter().map(|(_, a)| a).collect();
         if distinct.len() <= 1 {
@@ -484,22 +491,23 @@ pub fn replay_with_audit(
         }
         group.sort_by(|a, b| a.0.cmp(&b.0));
         let winner = group[0].1.clone();
-        // Hashes of this nonce's losing AddMember ops.
-        let losing_hashes: BTreeSet<&String> = group
-            .iter()
-            .filter(|(_, a)| *a != winner)
-            .map(|(h, _)| h)
-            .collect();
+        for (h, actor) in &group {
+            if *actor != winner {
+                all_losing.insert(h.clone());
+            }
+        }
+        races.push((winner, group));
+    }
+    // Pass 2: evict a loser unless it holds a seat that is NOT itself a spent-
+    // nonce admission — a nonce-less grant, a direct re-grant, an agent
+    // sponsorship, or an admission that won its own race.
+    for (winner, group) in races {
         for (_, actor) in &group {
             if *actor == winner {
                 continue;
             }
-            // Evict a loser only if the spent nonce is its *sole* claim to a
-            // seat. If any other authorized op seats it independently — a
-            // different invite, a direct re-grant, or an agent sponsorship —
-            // that op stands on its own merits and the seat holds.
             let seated_independently = authorized.iter().any(|h| {
-                !losing_hashes.contains(h)
+                !all_losing.contains(h)
                     && decoded[h].as_ref().is_some_and(|op| {
                         matches!(
                             &op.action,
@@ -994,5 +1002,61 @@ mod tests {
             st.is_member(g.a(4)) ^ st.is_member(g.a(5)),
             "a single nonce admits exactly one actor when neither has another seat"
         );
+    }
+
+    #[test]
+    fn losing_two_nonce_races_never_props_up_a_third() {
+        // Actor 4 spends TWO distinct single-use invites (nonces n, n2), against
+        // actor 2 and actor 3 respectively, and holds no other seat. Whichever
+        // way the deterministic tie-breaks fall, 4 is a member ONLY if it *won*
+        // at least one race — a losing op of one nonce must never vouch for the
+        // losing op of the other (the bug this closes: each pointing at the
+        // other let a double-loser survive and defeat single-use).
+        let f = fx(1, &[2, 3, 4]);
+        // Build actor 4's op vs a competitor for a given nonce fill byte.
+        let race = |rival: u8, fill: u8| {
+            let nonce = [fill; 16];
+            let rival_op = f.op_nonce(
+                1,
+                1,
+                AclAction::AddMember {
+                    actor: f.a(rival).clone(),
+                    grants: vec![Grant::Write],
+                },
+                nonce,
+                vec![],
+            );
+            let four_op = f.op_nonce(
+                1,
+                1,
+                AclAction::AddMember {
+                    actor: f.a(4).clone(),
+                    grants: vec![Grant::Write],
+                },
+                nonce,
+                vec![],
+            );
+            (rival_op, four_op)
+        };
+        // The tie-break is the lexicographically smallest op hash per nonce, so
+        // 4 loses when the rival's op sorts first. Scan for one nonce per rival
+        // where 4 loses — deterministic, and guaranteed to exist across 256 fills.
+        // Disjoint fill ranges per rival ⇒ the two nonces are distinct, so this
+        // is genuinely two single-use races, not one three-way race.
+        let find_loss = |rival: u8, fills: std::ops::RangeInclusive<u8>| {
+            fills
+                .map(|fill| race(rival, fill))
+                .find(|(rival_op, four_op)| rival_op.hash() < four_op.hash())
+                .expect("some fill makes actor 4 lose")
+        };
+        let (a2, a4n) = find_loss(2, 0..=127); // 4 loses to actor 2 on nonce A
+        let (a3, a4n2) = find_loss(3, 128..=255); // 4 loses to actor 3 on nonce B
+        let st = f.replay(&[a2, a4n, a3, a4n2]);
+        assert!(
+            !st.is_member(f.a(4)),
+            "an actor that lost every nonce race, with no independent seat, is evicted"
+        );
+        // Each race still seated its own winner.
+        assert!(st.is_member(f.a(2)) && st.is_member(f.a(3)));
     }
 }
