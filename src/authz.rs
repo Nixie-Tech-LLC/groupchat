@@ -371,9 +371,7 @@ mod tests {
         let add_agent = f.acl(
             2,
             2,
-            AclAction::AddAgent {
-                actor: f.actor(10),
-            },
+            AclAction::AddAgent { actor: f.actor(10) },
             vec![add_b.hash()],
         );
         let heads = vec![add_agent.hash()];
@@ -402,9 +400,7 @@ mod tests {
         let rm_b = f.acl(
             1,
             1,
-            AclAction::RemoveMember {
-                actor: f.actor(2),
-            },
+            AclAction::RemoveMember { actor: f.actor(2) },
             vec![add_b.hash()],
         );
         let d = doc();
@@ -489,20 +485,16 @@ mod tests {
             f.ws(),
         );
         let st = f.replay(&[], &[forged]);
-        assert!(!st.is_tombstoned(&d), "a device that is not the actor's is void");
+        assert!(
+            !st.is_tombstoned(&d),
+            "a device that is not the actor's is void"
+        );
     }
 
     #[test]
     fn cross_plane_signature_reuse_is_rejected() {
         let f = fx(1, &[2]);
-        let acl_node = f.acl(
-            1,
-            1,
-            AclAction::RemoveMember {
-                actor: f.actor(2),
-            },
-            vec![],
-        );
+        let acl_node = f.acl(1, 1, AclAction::RemoveMember { actor: f.actor(2) }, vec![]);
         assert!(acl_node.verify_sig(crate::acl::ACL_DOMAIN, f.ws().as_str()));
         assert!(
             !acl_node.verify_sig(AUTHZ_DOMAIN, f.ws().as_str()),

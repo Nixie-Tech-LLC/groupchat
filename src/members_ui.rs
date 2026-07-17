@@ -520,7 +520,13 @@ fn item_text(app: &App, i: usize) -> String {
                 format!("   {}", m.alias)
             };
             let you = if m.me { "   (you)" } else { "" };
-            format!("{:<6} {}{}{}", m.role, m.key.chars().take(12).collect::<String>(), name, you)
+            format!(
+                "{:<6} {}{}{}",
+                m.role,
+                m.key.chars().take(12).collect::<String>(),
+                name,
+                you
+            )
         }
     }
 }

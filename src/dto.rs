@@ -16,7 +16,11 @@ use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 
 /// Schema version gate (SCHEMA §9). Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: the actor-identity cutover (`lait/actor/1`) — members, assignees, and
+/// attribution are keyed by `ActorId` over a self-managed device set, replacing
+/// the `person ≡ key ≡ device` model.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Issue priority (SCHEMA §5). Stored inside the issue doc as a lowercase
 /// string leaf and projected here.

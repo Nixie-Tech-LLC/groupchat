@@ -117,8 +117,14 @@ fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::ids::UserId::from_key_string(key.public().to_string());
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, &key.to_bytes(), "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::tracker::found_workspace(
+        &store,
+        &me,
+        &key.to_bytes(),
+        "test",
+        &lait::ids::SystemUlidSource,
+    )
+    .expect("found workspace");
 }
 
 /// Bootstrap a joiner store from a ticket (the client half of `lait join`), so
@@ -327,9 +333,7 @@ fn approve_join_request_key_first_and_seed_list_is_structured() {
     // `members` — the trusted replacement for the spoofable wire nick.
     match req(&a.home, Request::Members) {
         Response::Members { members } => assert!(
-            members
-                .iter()
-                .any(|m| m.alias == "bob"),
+            members.iter().any(|m| m.alias == "bob"),
             "approved member should carry the local alias 'bob'"
         ),
         other => panic!("A: members returned {other:?}"),
@@ -463,9 +467,7 @@ fn self_asserted_nick_never_resolves_only_admin_chosen_alias_does() {
     // returns, so A's own view is immediately consistent — no wait needed.)
     match req(&a.home, Request::Members) {
         Response::Members { members } => assert!(
-            members
-                .iter()
-                .any(|m| m.alias == "eve"),
+            members.iter().any(|m| m.alias == "eve"),
             "approved member should carry the admin-chosen alias 'eve', not 'bob'"
         ),
         other => panic!("A: members returned {other:?}"),

@@ -471,7 +471,10 @@ pub fn replay_with_audit(
             ..
         }) = decoded[h].as_ref()
         {
-            by_nonce.entry(*n).or_default().push((h.clone(), actor.clone()));
+            by_nonce
+                .entry(*n)
+                .or_default()
+                .push((h.clone(), actor.clone()));
         }
     }
     for (_n, mut group) in by_nonce {
@@ -481,8 +484,32 @@ pub fn replay_with_audit(
         }
         group.sort_by(|a, b| a.0.cmp(&b.0));
         let winner = group[0].1.clone();
+        // Hashes of this nonce's losing AddMember ops.
+        let losing_hashes: BTreeSet<&String> = group
+            .iter()
+            .filter(|(_, a)| *a != winner)
+            .map(|(h, _)| h)
+            .collect();
         for (_, actor) in &group {
-            if *actor != winner {
+            if *actor == winner {
+                continue;
+            }
+            // Evict a loser only if the spent nonce is its *sole* claim to a
+            // seat. If any other authorized op seats it independently — a
+            // different invite, a direct re-grant, or an agent sponsorship —
+            // that op stands on its own merits and the seat holds.
+            let seated_independently = authorized.iter().any(|h| {
+                !losing_hashes.contains(h)
+                    && decoded[h].as_ref().is_some_and(|op| {
+                        matches!(
+                            &op.action,
+                            AclAction::AddMember { actor: a, .. }
+                            | AclAction::SetGrants { actor: a, .. }
+                            | AclAction::AddAgent { actor: a } if a == actor
+                        )
+                    })
+            });
+            if !seated_independently {
                 members.remove(actor);
                 agents.remove(actor);
             }
@@ -543,6 +570,27 @@ mod tests {
                     by: self.actors[&by].clone(),
                     actor_asof: asof,
                     nonce: None,
+                },
+                parents,
+                &self.genesis.workspace_id,
+            )
+        }
+        fn op_nonce(
+            &self,
+            author: u8,
+            by: u8,
+            action: AclAction,
+            nonce: [u8; 16],
+            parents: Vec<String>,
+        ) -> SignedOp {
+            let asof = vec![self.actors[&by].incept_hash().to_string()];
+            sign_op(
+                &seed(author),
+                &AclOp {
+                    action,
+                    by: self.actors[&by].clone(),
+                    actor_asof: asof,
+                    nonce: Some(nonce),
                 },
                 parents,
                 &self.genesis.workspace_id,
@@ -861,6 +909,90 @@ mod tests {
         assert!(
             !st.is_member(f.a(2)),
             "every device of a removed actor is powerless at once"
+        );
+    }
+
+    #[test]
+    fn spent_nonce_evicts_only_the_actor_with_no_other_seat() {
+        // A single invite nonce may be spent, on un-merged replicas, for two
+        // different actors. After merge exactly one wins the nonce — but a loser
+        // that ALSO holds an independent seat (a separate grant) keeps it.
+        let f = fx(1, &[2, 3]);
+        let n = [9u8; 16];
+        // Same nonce spent for actor 2 and actor 3 (concurrent, no parents).
+        let add2_n = f.op_nonce(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write],
+            },
+            n,
+            vec![],
+        );
+        let add3_n = f.op_nonce(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            n,
+            vec![],
+        );
+        // Independent (nonce-less) seats for BOTH — so whoever loses the nonce
+        // race still stands on this separate grant.
+        let add2_indep = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(2).clone(),
+                grants: vec![Grant::Write],
+            },
+            vec![],
+        );
+        let add3_indep = f.op(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: f.a(3).clone(),
+                grants: vec![Grant::Write],
+            },
+            vec![],
+        );
+        let st = f.replay(&[add2_n, add3_n, add2_indep, add3_indep]);
+        assert!(
+            st.is_member(f.a(2)) && st.is_member(f.a(3)),
+            "an independent grant survives losing the nonce race"
+        );
+
+        // Control: the same nonce race with NO independent seats evicts the loser.
+        let g = fx(1, &[4, 5]);
+        let m = [7u8; 16];
+        let add4 = g.op_nonce(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: g.a(4).clone(),
+                grants: vec![Grant::Write],
+            },
+            m,
+            vec![],
+        );
+        let add5 = g.op_nonce(
+            1,
+            1,
+            AclAction::AddMember {
+                actor: g.a(5).clone(),
+                grants: vec![Grant::Write],
+            },
+            m,
+            vec![],
+        );
+        let st = g.replay(&[add4, add5]);
+        assert!(
+            st.is_member(g.a(4)) ^ st.is_member(g.a(5)),
+            "a single nonce admits exactly one actor when neither has another seat"
         );
     }
 }

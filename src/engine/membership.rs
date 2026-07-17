@@ -27,9 +27,9 @@ const ROOT: &str = "membership";
 const K_WORKSPACE: &str = "workspaceId";
 const C_ACL: &str = "acl";
 const C_ACTORS: &str = "actors"; // the lait/actor/1 key-event log (flat, grow-only)
-// Content-addressed key epochs (grow-only). Concurrent rotations mint distinct
-// epoch ids instead of colliding on a shared counter slot, so their per-device
-// envelopes coexist and no replica ends up with an undecryptable epoch.
+                                 // Content-addressed key epochs (grow-only). Concurrent rotations mint distinct
+                                 // epoch ids instead of colliding on a shared counter slot, so their per-device
+                                 // envelopes coexist and no replica ends up with an undecryptable epoch.
 const C_EPOCHS: &str = "epochs"; // epoch_id(hex) -> { gen: i64, members: [actorId] }
 const C_KEYS: &str = "keys"; // epoch_id(hex) -> Map<device UserId, sealed bytes>
 const C_REDEEMED: &str = "redeemed"; // invite nonce(hex) -> redeemer UserId
@@ -50,7 +50,9 @@ fn epoch_hex(id: &[u8; 16]) -> String {
     data_encoding::HEXLOWER.encode(id)
 }
 fn epoch_from_hex(s: &str) -> Option<[u8; 16]> {
-    let v = data_encoding::HEXLOWER_PERMISSIVE.decode(s.as_bytes()).ok()?;
+    let v = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(s.as_bytes())
+        .ok()?;
     v.as_slice().try_into().ok()
 }
 
@@ -144,10 +146,7 @@ impl MembershipDoc {
     fn actors_list(&self, create: bool) -> Option<LoroList> {
         match self.root().get(C_ACTORS) {
             Some(ValueOrContainer::Container(Container::List(l))) => Some(l),
-            _ if create => self
-                .root()
-                .insert_container(C_ACTORS, LoroList::new())
-                .ok(),
+            _ if create => self.root().insert_container(C_ACTORS, LoroList::new()).ok(),
             _ => None,
         }
     }
@@ -307,7 +306,9 @@ impl MembershipDoc {
         };
         let mut out = Vec::new();
         for hx in lx::map_keys(&map) {
-            let Some(id) = epoch_from_hex(&hx) else { continue };
+            let Some(id) = epoch_from_hex(&hx) else {
+                continue;
+            };
             let Some(ValueOrContainer::Container(Container::Map(rec))) = map.get(&hx) else {
                 continue;
             };
@@ -398,7 +399,6 @@ impl MembershipDoc {
         m.insert(&key, redeemer.as_str())?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]

@@ -427,14 +427,23 @@ impl Tracker {
             .max_by(|a, b| a.gen.cmp(&b.gen).then_with(|| a.id.cmp(&b.id)))
     }
 
-    /// Encrypt a sync payload with the active-epoch key (id-tagged). If we hold
-    /// no key (a single-node P0 workspace), the payload passes through in clear.
+    /// Encrypt a sync payload with the active-epoch key (id-tagged).
+    ///
+    /// Two distinct "no key" cases, and only ONE may pass through in clear:
+    /// - **No epochs exist at all** — a genuine keyless single-node P0 workspace
+    ///   that holds no protected content: pass through.
+    /// - **An active epoch exists but we lack its key** — the mid-seal window
+    ///   (a freshly added or recovered device awaiting self-heal). We may hold
+    ///   *older* content decrypted locally, so we must **never** emit it in
+    ///   clear; serve nothing until we hold the active key.
     fn encrypt_payload(&self, plaintext: Vec<u8>) -> Vec<u8> {
-        match self
-            .active_epoch()
-            .and_then(|e| self.keyring.get(&e.id).map(|k| (e.id, *k)))
-        {
-            Some((id, key)) => epoch_prefix(&id, crypto::aead_encrypt(&key, &plaintext)),
+        match self.active_epoch() {
+            Some(e) => match self.keyring.get(&e.id) {
+                Some(key) => epoch_prefix(&e.id, crypto::aead_encrypt(key, &plaintext)),
+                // We can't encrypt under the active epoch — refuse to ship
+                // cleartext (E2EE). An empty payload decrypts to nothing.
+                None => Vec::new(),
+            },
             None => plaintext,
         }
     }
@@ -1758,12 +1767,7 @@ impl Tracker {
                     .map(|s| &r.status == s)
                     .unwrap_or(true)
             })
-            .filter(|r| {
-                !filter.mine
-                    || self
-                        .my_actor()
-                        .is_some_and(|a| r.assignees.contains(&a))
-            })
+            .filter(|r| !filter.mine || self.my_actor().is_some_and(|a| r.assignees.contains(&a)))
             .map(|r| self.project_row(&r))
             .collect();
         // label filter requires the issue doc's labels (not cached in the row);
@@ -2087,7 +2091,7 @@ impl Tracker {
         self.refresh_keyring();
         // Propagate any key we now hold to our own actor's other devices (SEAL-2
         // backstop for a device the rotating author hadn't seen).
-        self.heal_own_device_envelopes()?;
+        self.heal_member_device_envelopes()?;
         // Two admins removing different members concurrently can leave the active
         // epoch sealed to a since-removed actor after merge; re-seal to the true
         // current set (convergent, admin-only).
@@ -2150,10 +2154,12 @@ impl Tracker {
     }
     /// Whether this device's actor is a member / admin of the workspace.
     pub fn am_i_member(&self) -> bool {
-        self.my_actor().is_some_and(|a| self.acl_state().is_member(&a))
+        self.my_actor()
+            .is_some_and(|a| self.acl_state().is_member(&a))
     }
     pub fn am_i_admin(&self) -> bool {
-        self.my_actor().is_some_and(|a| self.acl_state().is_admin(&a))
+        self.my_actor()
+            .is_some_and(|a| self.acl_state().is_admin(&a))
     }
     /// Every device key belonging to a current member actor — the resolvable
     /// identities for the local user directory.
@@ -2220,7 +2226,8 @@ impl Tracker {
     /// be present (callers import it first).
     fn seal_epochs_to_actor(t: &mut Self, actor: &ActorId) -> Result<()> {
         let devices = t.actor_plane().devices_of(actor);
-        let epochs: Vec<([u8; 16], WorkspaceKey)> = t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        let epochs: Vec<([u8; 16], WorkspaceKey)> =
+            t.keyring.iter().map(|(e, k)| (*e, *k)).collect();
         for (epoch, key) in epochs {
             for d in &devices {
                 if let Some(sealed) = crypto::seal_to(d, &key) {
@@ -2234,7 +2241,11 @@ impl Tracker {
     /// Add (or re-grant) a member by actor and seal them the workspace key
     /// (S§6, A§11). Admin-only. The target actor's inception must already be
     /// known locally (the enrollment path imports it first via `redeem_invite`).
-    pub fn member_add(&mut self, actor: &ActorId, grants: Vec<Grant>) -> (Response, Option<DirtySet>) {
+    pub fn member_add(
+        &mut self,
+        actor: &ActorId,
+        grants: Vec<Grant>,
+    ) -> (Response, Option<DirtySet>) {
         let acl = self.acl_state();
         match self.my_actor() {
             Some(me) if acl.is_admin(&me) => {}
@@ -2257,9 +2268,9 @@ impl Tracker {
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
         let target = actor.clone();
-        if let Err(e) = self.member_apply(op, "member_add", |t| {
-            Self::seal_epochs_to_actor(t, &target)
-        }) {
+        if let Err(e) =
+            self.member_apply(op, "member_add", |t| Self::seal_epochs_to_actor(t, &target))
+        {
             return (Response::err(format!("{e:#}")), None);
         }
         self.push_activity(None, &actor.short(), "member_added", vec![], &actor.short());
@@ -2471,7 +2482,13 @@ impl Tracker {
         if let Err(e) = self.member_apply(op, "member_remove", |t| t.rotate_key()) {
             return (Response::err(format!("{e:#}")), None);
         }
-        self.push_activity(None, &actor.short(), "member_removed", vec![], &actor.short());
+        self.push_activity(
+            None,
+            &actor.short(),
+            "member_removed",
+            vec![],
+            &actor.short(),
+        );
         (
             Response::Ok {
                 message: Some(format!(
@@ -2512,7 +2529,10 @@ impl Tracker {
     /// device key / `@me` mapped through the actor plane to its owning actor.
     fn resolve_actor(&self, who: &str) -> Option<ActorId> {
         if let Some(a) = ActorId::parse(who) {
-            return Some(a);
+            // A well-formed id resolves only if the actor is actually known to
+            // this space — otherwise a typo'd/forged `act_…` would seat or
+            // assign a phantom that no inception backs.
+            return self.actor_plane().exists(&a).then_some(a);
         }
         let dev = index::resolve_user(who, &self.me)?;
         self.actor_plane().actor_of_device(&dev).cloned()
@@ -2675,9 +2695,9 @@ impl Tracker {
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
         let target = agent_actor.clone();
-        if let Err(e) = self.member_apply(op, "agent_add", |t| {
-            Self::seal_epochs_to_actor(t, &target)
-        }) {
+        if let Err(e) =
+            self.member_apply(op, "agent_add", |t| Self::seal_epochs_to_actor(t, &target))
+        {
             return (Response::err(format!("{e:#}")), None);
         }
         self.push_activity(
@@ -2867,9 +2887,23 @@ impl Tracker {
                 None,
             );
         };
-        let Some(actor) = self.my_actor() else {
+        // Resolve the target actor by its pre-rotation commitment — NOT by the
+        // current device set (a genuine recovery runs from a fresh device that is
+        // not in the set). The actor whose standing commitment matches our
+        // recovery key is the one we can recover.
+        let recovery_pub = {
+            let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+            UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        };
+        let commit = actor::recovery_commitment(&recovery_pub);
+        let plane = self.actor_plane();
+        let Some(actor) = plane
+            .actors()
+            .find(|(_, st)| commit.is_some() && st.recovery_commit == commit)
+            .map(|(id, _)| id.clone())
+        else {
             return (
-                Response::err("cannot resolve which actor to recover from this device"),
+                Response::err("no actor in this space matches this recovery key"),
                 None,
             );
         };
@@ -2968,22 +3002,34 @@ impl Tracker {
         Ok(())
     }
 
-    /// Self-heal (SEAL-2): seal every epoch key we hold to any sibling device of
-    /// our own actor that still lacks an envelope. Admin-ungated and safe — we
-    /// only ever re-seal keys we already hold, and only to our own actor's
-    /// devices. This is the backstop that lets an actor propagate a key to a
-    /// device added (or reinstated) after a rotation whose author didn't yet see
-    /// that device, so `seal to ≥1 device` suffices (SEAL-1).
-    fn heal_own_device_envelopes(&mut self) -> Result<()> {
-        let Some(me_actor) = self.my_actor() else {
-            return Ok(());
-        };
-        let siblings = self.actor_plane().devices_of(&me_actor);
+    /// Self-heal (SEAL-2), generalized across the whole membership: seal every
+    /// epoch key we hold to any device of any *current member actor* that still
+    /// lacks an envelope. Admin-ungated and safe — we only ever re-seal keys we
+    /// already hold, and only to devices of actors who are entitled to the
+    /// workspace key (present in the ACL). A removed actor is not in the member
+    /// set, so lazy revocation is preserved.
+    ///
+    /// This is the backstop that lets any key-holding peer re-provision:
+    /// - a *sibling* device added or reinstated after a rotation whose author
+    ///   didn't yet see it (`seal to ≥1 device` suffices — SEAL-1), and
+    /// - a *fresh recovery device* that reset an actor's key set and therefore
+    ///   holds no key of its own; the first synced key-holder re-seals to it.
+    fn heal_member_device_envelopes(&mut self) -> Result<()> {
         let held: Vec<([u8; 16], WorkspaceKey)> =
             self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
+        if held.is_empty() {
+            return Ok(());
+        }
+        let plane = self.actor_plane();
+        let member_devices: Vec<UserId> = self
+            .acl_state()
+            .members()
+            .into_iter()
+            .flat_map(|(actor, _)| plane.devices_of(&actor))
+            .collect();
         let mut sealed_any = false;
         for (id, key) in held {
-            for dev in &siblings {
+            for dev in &member_devices {
                 if self.membership.get_sealed(&id, dev).is_none() {
                     if let Some(sealed) = crypto::seal_to(dev, &key) {
                         self.membership.put_sealed(&id, dev, &sealed)?;
@@ -3127,15 +3173,10 @@ impl Tracker {
         // Viewer-relative pre-import state for the inbox's assigned/status
         // entries (S§8.1): "addressed to you" is a state transition, never
         // trusted attribution. `None` ⇒ the doc is new to this node.
-        let prior = self
-            .issues
-            .get(&id)
-            .map(|i| {
-                let mine = self
-                    .my_actor()
-                    .is_some_and(|a| i.assignees().contains(&a));
-                (mine, i.status())
-            });
+        let prior = self.issues.get(&id).map(|i| {
+            let mine = self.my_actor().is_some_and(|a| i.assignees().contains(&a));
+            (mine, i.status())
+        });
         let mark = self.issues.get(&id).map(|i| i.import_mark());
         // ensure a doc exists to import into (new docs arrive as a snapshot).
         if !self.issues.contains_key(&id) {
@@ -3819,6 +3860,71 @@ mod tests {
     }
 
     #[test]
+    fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
+        // The real recovery scenario: a brand-new device that was NEVER enrolled
+        // restores the offline recovery key, recovers the founder actor (resolved
+        // by its pre-rotation commitment, not by any device it holds), and — after
+        // a key-holding peer syncs and re-seals — decrypts the existing content.
+        let mut a = new_node(); // founder dA, recovery.key beside its store
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "secret");
+        let x = a.tracker.my_actor().unwrap();
+        let a_ws = a.tracker.workspace_str();
+
+        // A fresh device dC bootstraps on X's workspace from a ticket. It is not a
+        // device of any actor and holds no key.
+        let c_seed = [70u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &x.to_string());
+
+        // dC learns the actor plane (X's inception + recovery commitment) and the
+        // encrypted catalog, but cannot read it — no key, no membership.
+        sync_all(&mut a.tracker, &mut c.tracker);
+        assert_eq!(c.tracker.my_actor(), None, "dC is not yet any actor");
+        assert!(
+            !titles(&mut c.tracker).contains(&"secret".to_string()),
+            "a keyless fresh device cannot read the workspace"
+        );
+
+        // A keyless device with an active epoch must NEVER serve cleartext.
+        let empty_vv = c.tracker.catalog_vv_bytes();
+        // (self-export from an empty vv would be the whole catalog, in clear, if
+        // the leak were present)
+        assert!(
+            c.tracker.export_catalog_from(&empty_vv).unwrap().is_empty(),
+            "a device that cannot encrypt under the active epoch serves nothing"
+        );
+
+        // Restore the offline recovery key beside dC's store and recover.
+        let key = std::fs::read(a.home.join("recovery.key")).unwrap();
+        std::fs::write(c.home.join("recovery.key"), key).unwrap();
+        let (resp, _) = c.tracker.recover();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert_eq!(
+            c.tracker.actor_plane().devices_of(&x),
+            vec![c_user.clone()],
+            "recovery reset X's device set to the fresh device"
+        );
+        assert_eq!(
+            c.tracker.my_actor(),
+            Some(x.clone()),
+            "dC now resolves to the recovered actor X"
+        );
+        // Still no key — recovery reset the identity, not the content access.
+        assert!(!titles(&mut c.tracker).contains(&"secret".to_string()));
+
+        // dC pushes its recovery to A; A (still holding the key) re-seals the
+        // active epoch to dC as part of importing the Recover.
+        sync_all(&mut c.tracker, &mut a.tracker);
+        // A pushes the freshly sealed envelope + catalog back to dC.
+        sync_all(&mut a.tracker, &mut c.tracker);
+        assert!(
+            titles(&mut c.tracker).contains(&"secret".to_string()),
+            "recovered fresh device decrypts once a peer re-seals the epoch"
+        );
+    }
+
+    #[test]
     fn second_device_decrypts_then_revocation_fences_it() {
         // Multi-device end to end: A adds a second device dB to its actor (seal-
         // on-add), dB decrypts the workspace; A then revokes dB and rotates, and
@@ -3852,7 +3958,11 @@ mod tests {
         // actor (the founder), so it unseals the key and decrypts.
         let mut b = new_joiner_node_as(db_user.clone(), db_seed, &a_ws, &x.to_string());
         sync_all(&mut a.tracker, &mut b.tracker);
-        assert_eq!(b.tracker.my_actor(), Some(x.clone()), "dB resolves to actor X");
+        assert_eq!(
+            b.tracker.my_actor(),
+            Some(x.clone()),
+            "dB resolves to actor X"
+        );
         assert!(
             titles(&mut b.tracker).contains(&"secret".to_string()),
             "second device decrypts the workspace (seal-on-add)"
@@ -4049,7 +4159,10 @@ mod tests {
             dirty.is_some(),
             "a successful admit dirties the catalog/ACL"
         );
-        assert!(a.tracker.is_member_actor(&j_actor), "joiner is now a member");
+        assert!(
+            a.tracker.is_member_actor(&j_actor),
+            "joiner is now a member"
+        );
         assert!(
             a.tracker.membership.is_redeemed(&nonce),
             "single-use nonce is burned in the same commit"
@@ -4075,7 +4188,9 @@ mod tests {
         let issuer = user_from_seed([5u8; 32]); // never added to the ACL
         let j_incept = incept_for([8u8; 32], &a.tracker);
 
-        let (resp, dirty) = a.tracker.redeem_invite(&issuer, &j_incept, &[2u8; 16], true);
+        let (resp, dirty) = a
+            .tracker
+            .redeem_invite(&issuer, &j_incept, &[2u8; 16], true);
         assert!(
             matches!(resp, Response::Error { .. }),
             "a pass signed by a non-admin is not honored: {resp:?}"
@@ -4111,8 +4226,7 @@ mod tests {
         let (r2, _) = a.tracker.redeem_invite(&me(), &j2, &nonce, false);
         assert!(matches!(r1, Response::Ok { .. }) && matches!(r2, Response::Ok { .. }));
         assert!(
-            a.tracker.is_member_actor(&actor_of(&j1))
-                && a.tracker.is_member_actor(&actor_of(&j2))
+            a.tracker.is_member_actor(&actor_of(&j1)) && a.tracker.is_member_actor(&actor_of(&j2))
         );
         assert!(
             !a.tracker.membership.is_redeemed(&nonce),
@@ -4210,7 +4324,8 @@ mod tests {
     fn founding_twice_errors() {
         let n = new_node();
         let store = Store::open(&n.home).unwrap();
-        let err = found_workspace(&store, &me(), &[1u8; 32], "Again", &FakeClock::new(1)).unwrap_err();
+        let err =
+            found_workspace(&store, &me(), &[1u8; 32], "Again", &FakeClock::new(1)).unwrap_err();
         assert!(
             format!("{err:#}").contains("already initialized"),
             "{err:#}"
@@ -4361,7 +4476,10 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(v.status, "backlog", "first Backlog-category state");
-        assert!(!v.assignees.contains(&me_actor), "stop unassigns the caller");
+        assert!(
+            !v.assignees.contains(&me_actor),
+            "stop unassigns the caller"
+        );
     }
 
     #[test]

@@ -729,7 +729,12 @@ mod tests {
 
     /// A member-consent binding for seed `s` into `actor`, nonce `bn`.
     fn member_binding(s: u8, bn: u8, actor: &ActorId, w: &WorkspaceId) -> DeviceBinding {
-        consent_sign(&seed(s), w.as_str(), [bn; 16], &ConsentCtx::Member { actor })
+        consent_sign(
+            &seed(s),
+            w.as_str(),
+            [bn; 16],
+            &ConsentCtx::Member { actor },
+        )
     }
 
     fn recovery_commit(r: u8) -> [u8; 32] {

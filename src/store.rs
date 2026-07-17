@@ -468,8 +468,13 @@ mod tests {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
         let ws = WorkspaceId::mint(&SystemUlidSource);
-        let cat = CatalogDoc::create(&ws, "test", None, &crate::ids::UserId::from_key_string("a".repeat(64)))
-            .unwrap();
+        let cat = CatalogDoc::create(
+            &ws,
+            "test",
+            None,
+            &crate::ids::UserId::from_key_string("a".repeat(64)),
+        )
+        .unwrap();
         store.save_catalog(&cat).unwrap();
         assert!(!store.repo.join("catalog.tmp").exists());
         assert!(store.repo.join("catalog.loro").exists());

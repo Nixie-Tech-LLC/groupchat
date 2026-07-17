@@ -112,8 +112,14 @@ fn found_home(home: &Path) {
     let key = lait::config::load_or_create_identity(home).expect("identity");
     let me = lait::ids::UserId::from_key_string(key.public().to_string());
     let store = lait::store::Store::open(home).expect("store");
-    lait::tracker::found_workspace(&store, &me, &key.to_bytes(), "test", &lait::ids::SystemUlidSource)
-        .expect("found workspace");
+    lait::tracker::found_workspace(
+        &store,
+        &me,
+        &key.to_bytes(),
+        "test",
+        &lait::ids::SystemUlidSource,
+    )
+    .expect("found workspace");
 }
 
 /// Seed a project + one issue and return the issue's canonical ref (e.g.

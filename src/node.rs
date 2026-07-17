@@ -1473,7 +1473,8 @@ impl Node {
                         // Import the joiner's stashed inception (from its join
                         // request) so the tracker can resolve its actor — admin-
                         // gated persistence, only on this explicit approve.
-                        if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned() {
+                        if let Some(incept) = self.pending_incepts.lock().unwrap().get(&u).cloned()
+                        {
                             let _ = self.tracker.lock().unwrap().import_inception(&incept);
                         }
                         let (resp, changed) = self.dispatch_tracker(Request::MemberAdd {
