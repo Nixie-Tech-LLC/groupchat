@@ -2231,6 +2231,14 @@ impl Tracker {
     pub fn my_actor(&self) -> Option<ActorId> {
         self.actor_plane().actor_of_device(&self.me).cloned()
     }
+    /// The workspace's founding actor — the genesis trust root every replica
+    /// must share. An invite ticket MUST carry THIS (not the inviter's own
+    /// actor): a joiner roots `acl::replay` on the ticket's founder, so anchoring
+    /// on anyone but the true founder forks the joiner onto a genesis where the
+    /// real founder — and the founding key-epoch — hold no authority.
+    pub fn founding_actor(&self) -> Option<ActorId> {
+        self.genesis.founding_actors.first().cloned()
+    }
     pub fn is_member_actor(&self, actor: &ActorId) -> bool {
         self.acl_state().is_member(actor)
     }
@@ -4531,6 +4539,81 @@ mod tests {
             b.tracker.active_epoch().map(|e| e.gen),
             gen_before,
             "a non-admin cannot rotate the key"
+        );
+    }
+
+    #[test]
+    fn a_non_founder_invite_roots_the_joiner_on_the_true_founder() {
+        // Fork guard: a ticket must anchor on the workspace's founding actor, not
+        // the inviter. A joiner roots acl::replay on the ticket's founder, so an
+        // inviter-anchored ticket would fork the joiner onto a genesis where the
+        // real founder — and the founding key-epoch — carry no authority.
+        let mut a = new_node(); // founder A
+        with_project(&mut a.tracker);
+        new_issue(&mut a.tracker, "founders-secret");
+        let a_actor = a.tracker.my_actor().unwrap();
+        let a_ws = a.tracker.workspace_str();
+
+        // B joins rooted on A (as A's ticket would), admitted admin, and syncs.
+        let b_seed = [51u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user, b_seed, &a_ws, &a_actor.to_string());
+        let b_incept = b.tracker.self_inception().unwrap();
+        let b_actor = actor_of(&b_incept);
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        assert!(b.tracker.am_i_member());
+        // The fix: B (a non-founder) anchors an invite on the FOUNDER, not itself.
+        assert_eq!(
+            b.tracker.founding_actor(),
+            Some(a_actor.clone()),
+            "a joiner anchors on the true founder"
+        );
+        assert_ne!(
+            b.tracker.founding_actor(),
+            Some(b_actor.clone()),
+            "never on the inviter"
+        );
+
+        // C joins on the anchor B would ship, is admitted by B, and syncs through
+        // B. Rooted on A, C converges — sees the founder's authority AND adopts
+        // the founder's key-epoch to read founder content.
+        let anchor = b.tracker.founding_actor().unwrap().to_string();
+        let c_seed = [52u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user, c_seed, &a_ws, &anchor);
+        let c_incept = c.tracker.self_inception().unwrap();
+        b.tracker.admit_member(&c_incept, vec![Grant::Write]);
+        sync_all(&mut b.tracker, &mut c.tracker);
+        assert!(c.tracker.am_i_member(), "C is a member");
+        assert!(
+            c.tracker.acl_state().is_admin(&a_actor),
+            "C sees the true founder as admin (not forked away from it)"
+        );
+        assert!(
+            titles(&mut c.tracker).contains(&"founders-secret".to_string()),
+            "C adopts the founder's key-epoch and reads founder content"
+        );
+
+        // Negative control — the fork the fix prevents. A node rooted on the
+        // INVITER (B), as the old inviter-anchored ticket would produce, is
+        // admitted by B but forks: the founder's authority and key-epoch are
+        // unauthorized under a genesis rooted on B, so it can never read founder
+        // content.
+        let d_seed = [53u8; 32];
+        let d_user = user_from_seed(d_seed);
+        let mut d = new_joiner_node_as(d_user, d_seed, &a_ws, &b_actor.to_string());
+        let d_incept = d.tracker.self_inception().unwrap();
+        b.tracker.admit_member(&d_incept, vec![Grant::Write]);
+        sync_all(&mut b.tracker, &mut d.tracker);
+        assert!(
+            !d.tracker.acl_state().is_admin(&a_actor),
+            "rooted on the inviter, the true founder holds no authority (the fork)"
+        );
+        assert!(
+            !titles(&mut d.tracker).contains(&"founders-secret".to_string()),
+            "the forked node never adopts the founder's key-epoch"
         );
     }
 

@@ -1608,13 +1608,16 @@ impl Node {
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key, &grant).ok()
                 };
-                // Refuse to mint a ticket with no founder anchor — a joiner
-                // rooted on an empty founder actor can never resolve membership.
-                let founder_actor = match self.tracker.lock().unwrap().my_actor() {
+                // Anchor the ticket on the workspace's TRUE founding actor (the
+                // genesis trust root), NOT the inviter's own actor — otherwise a
+                // non-founder's invite roots the joiner on a forked genesis where
+                // the real founder and the founding key-epoch carry no authority.
+                // Every correctly-joined node shares this same root.
+                let founder_actor = match self.tracker.lock().unwrap().founding_actor() {
                     Some(a) => a.to_string(),
                     None => {
                         return Ok(Response::err(
-                            "this node has no actor identity yet — cannot mint an invite",
+                            "this workspace has no founding actor — cannot mint an invite",
                         ))
                     }
                 };
