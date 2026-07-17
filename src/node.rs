@@ -1393,6 +1393,7 @@ impl Node {
             | Request::DeviceList
             | Request::Recover
             | Request::SpaceElevate { .. }
+            | Request::SpaceRecoverApprove { .. }
             | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {

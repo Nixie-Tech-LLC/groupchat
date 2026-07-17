@@ -312,6 +312,12 @@ pub enum Request {
         cofounders: Vec<String>,
         k: u16,
     },
+    /// Co-sign a pending break-glass recovery request as a holder of the current
+    /// K-of-N group recovery key. Explicit per-request consent: the holder has
+    /// checked out-of-band that `session` re-roots to the agreed party.
+    SpaceRecoverApprove {
+        session: String,
+    },
     /// Recover our actor with the offline recovery key: reset the device set to
     /// this device (identity is restored; content-key access is re-sealed lazily
     /// by an admin/peer).

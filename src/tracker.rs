@@ -743,6 +743,7 @@ impl Tracker {
             Request::Recover => Ok(self.recover()),
             Request::SpaceRecover => Ok(self.space_recover_cmd()),
             Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
+            Request::SpaceRecoverApprove { session } => Ok(self.space_recover_approve_cmd(session)),
             Request::Members => Ok((self.members_response(), None)),
             Request::MemberLog => Ok((self.member_log_response(), None)),
             other => Err(anyhow!("not a tracker request: {other:?}")),
@@ -2246,8 +2247,11 @@ impl Tracker {
         // a readable, fenced content key.
         self.bootstrap_root_epoch_if_needed()?;
         // Advance any FROST recovery-elevation ceremony this device is part of as
-        // the peers' round packages arrive.
-        self.dkg_advance()?;
+        // the peers' round packages arrive. Never fatal to import: ceremony work is
+        // driven off peer-controlled data, so a bad package is logged and skipped.
+        if let Err(e) = self.dkg_advance() {
+            tracing::warn!("ceremony advance during import failed (skipped): {e:#}");
+        }
         Ok(())
     }
 
@@ -2869,7 +2873,9 @@ impl Tracker {
             Ok(b) => b,
             Err(e) => return (Response::err(format!("encode recover op: {e}")), None),
         };
-        // Reuse an open request for this exact Recover; else open one.
+        // Reuse an open request for this exact Recover; else open one. Either way,
+        // record LOCAL intent for this session's op so our node co-signs this
+        // recovery (the consent gate in `sign_advance_session`).
         let existing = self
             .membership
             .ceremony_events()
@@ -2881,11 +2887,14 @@ impl Tracker {
                 }
                 _ => None,
             });
+        let session = existing.unwrap_or_else(rand16);
+        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
+            return (Response::err(format!("{e:#}")), None);
+        }
         if existing.is_none() {
-            let session = rand16();
             if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::SignRequest {
                 session,
-                op: op_bytes,
+                op: op_bytes.clone(),
             }) {
                 return (Response::err(format!("{e:#}")), None);
             }
@@ -2905,11 +2914,100 @@ impl Tracker {
                 me_actor.short()
             )
         } else {
-            "group recovery signing ceremony under way — run `space recover` on the other holders until the threshold co-signs".to_string()
+            format!(
+                "group recovery under way (session {}) — each other holder must approve it with `space recover-approve {}` until the threshold co-signs",
+                data_encoding::HEXLOWER.encode(&session),
+                data_encoding::HEXLOWER.encode(&session),
+            )
         };
         (
             Response::Ok {
                 message: Some(message),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
+    /// Co-sign a pending break-glass recovery request as a holder of the current
+    /// group key. This is the explicit consent that `sign_advance_session` demands:
+    /// the holder has verified out-of-band that `session` re-roots the workspace to
+    /// the agreed party, and records local intent so their share is contributed to
+    /// exactly that op (and no other request on the board).
+    pub fn space_recover_approve_cmd(
+        &mut self,
+        session_hex: String,
+    ) -> (Response, Option<DirtySet>) {
+        let Some(session) = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(session_hex.trim().as_bytes())
+            .ok()
+            .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+        else {
+            return (
+                Response::err("not a valid recovery session id (32 hex chars)"),
+                None,
+            );
+        };
+        if self.active_dkg_session().is_none() {
+            return (
+                Response::err("this device holds no share of the current group recovery key — nothing to co-sign"),
+                None,
+            );
+        }
+        // The exact op the request asks the group to sign.
+        let Some(op_bytes) = self
+            .membership
+            .ceremony_events()
+            .iter()
+            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
+            .find_map(|op| match op {
+                crate::dkg::CeremonyOp::SignRequest { session: s, op } if s == session => Some(op),
+                _ => None,
+            })
+        else {
+            return (
+                Response::err(
+                    "no pending recovery request for that session (sync from the initiator first)",
+                ),
+                None,
+            );
+        };
+        // It must be a Recover for the next generation — refuse to co-sign anything else.
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let target = match postcard::from_bytes::<crate::space::SpaceOp>(&op_bytes) {
+            Ok(crate::space::SpaceOp::Recover { new_root, gen })
+                if gen == cur.gen + 1 && !new_root.is_empty() =>
+            {
+                new_root
+            }
+            _ => {
+                return (
+                    Response::err(
+                        "that request is not a current-generation Recover — refusing to co-sign",
+                    ),
+                    None,
+                );
+            }
+        };
+        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        if let Err(e) = self.dkg_advance() {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        let roots = target
+            .iter()
+            .map(|a| a.short())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "co-signed the recovery re-rooting the workspace to {roots} — it installs once the threshold has co-signed"
+                )),
             },
             Some(DirtySet::catalog(CatalogScope::Acl)),
         )
@@ -3007,6 +3105,11 @@ impl Tracker {
             k,
             participants,
         };
+        // Record local intent BEFORE posting: only this initiator (which also holds
+        // the current recovery key) installs the resulting Rotate — see step 4.
+        if let Err(e) = self.dkg_write(&session, "intent", b"elevate") {
+            return (Response::err(format!("{e:#}")), None);
+        }
         let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
         if let Err(e) = self
             .membership
@@ -3060,9 +3163,16 @@ impl Tracker {
                 _ => None,
             })
             .collect();
+        // Per-session advancement is best-effort: a malformed, signature-valid
+        // package from one participant must never fail the whole import (which
+        // would wedge membership sync permanently on the persisted event). Isolate
+        // and log each session's error instead of propagating it.
         let mut progressed = false;
         for session in sessions {
-            progressed |= self.dkg_advance_session(&session, &events)?;
+            match self.dkg_advance_session(&session, &events) {
+                Ok(p) => progressed |= p,
+                Err(e) => tracing::warn!("dkg ceremony advance failed (skipped): {e:#}"),
+            }
         }
         // Threshold-signing sessions (break-glass group recovery) I can co-sign.
         let sign_sessions: Vec<[u8; 16]> = {
@@ -3078,7 +3188,10 @@ impl Tracker {
                 .collect()
         };
         for session in sign_sessions {
-            progressed |= self.sign_advance_session(&session, &events)?;
+            match self.sign_advance_session(&session, &events) {
+                Ok(p) => progressed |= p,
+                Err(e) => tracing::warn!("recovery signing advance failed (skipped): {e:#}"),
+            }
         }
         Ok(progressed)
     }
@@ -3170,6 +3283,19 @@ impl Tracker {
         }) else {
             return Ok(false);
         };
+        // SECURITY (break-glass consent): only contribute a signature share to — or
+        // install — a recovery this device has LOCALLY authorized, via `space
+        // recover` (initiate) or `space recover-approve <session>` (co-sign a
+        // specific request). Both write an `intent` file pinning the exact op bytes.
+        // A holder auto-driving ceremonies on passive import must NEVER co-sign an
+        // unsolicited `SignRequest` that merely appeared, signature-valid, on the
+        // synced board: authenticating the requester is not the co-signer consenting
+        // to hand the workspace to `new_root`. Without this gate any member could
+        // post a Recover-to-me request and let honest holders' shares re-root the
+        // workspace to them — a full takeover with no threshold of secrets held.
+        if self.dkg_read(sign_session, "intent").as_deref() != Some(op_bytes.as_slice()) {
+            return Ok(false);
+        }
         // The exact 32-byte message `verify_sig` will check for a group-authored node.
         let message = crate::sigdag::payload_to_sign(
             crate::space::SPACE_EVENT_DOMAIN,
@@ -3369,7 +3495,12 @@ impl Tracker {
         }
 
         // Step 4 — the recovery-key holder installs the group key with a Rotate.
-        if self.dkg_has(session, "group") {
+        // SECURITY: gated on local `intent`, written only by `space_elevate_cmd` on
+        // the node that started this elevation. A rogue Propose can make honest
+        // devices compute DKG rounds, but only a device that BOTH holds the current
+        // recovery key AND initiated this session installs the rotation — so an
+        // unsolicited proposal can never coerce a change of recovery authority.
+        if self.dkg_has(session, "group") && self.dkg_has(session, "intent") {
             let group_key = String::from_utf8(self.dkg_read(session, "group").unwrap())
                 .ok()
                 .map(UserId::from_key_string);
@@ -5609,10 +5740,33 @@ mod tests {
         );
         assert!(!elevated.recovered);
 
-        // B triggers break-glass recovery. B alone cannot meet 2-of-2 yet.
+        // B triggers break-glass recovery, re-rooting to itself.
         let (resp, _) = b.tracker.space_recover_cmd();
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         let b_actor = b.tracker.my_actor().unwrap();
+        // The session id B posted its request under.
+        let session_hex = b
+            .tracker
+            .membership
+            .ceremony_events()
+            .iter()
+            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
+            .find_map(|op| match op {
+                crate::dkg::CeremonyOp::SignRequest { session, .. } => {
+                    Some(data_encoding::HEXLOWER.encode(&session))
+                }
+                _ => None,
+            })
+            .expect("B posted a recovery request");
+
+        // SECURITY (C1): A auto-drives ceremonies on every import — but it must NOT
+        // co-sign B's UNSOLICITED request. Sync the request to A and spin the
+        // ceremony; nothing recovers, because A has given no local consent. Were
+        // this to auto-sign, any member could re-root the workspace to itself.
+        for _ in 0..6 {
+            sync_all(&mut b.tracker, &mut a.tracker);
+            sync_all(&mut a.tracker, &mut b.tracker);
+        }
         assert!(
             !crate::space::replay(
                 &b.tracker.genesis,
@@ -5620,13 +5774,17 @@ mod tests {
                 &b.tracker.membership.space_events(),
             )
             .recovered,
-            "the request alone does not recover — the threshold must co-sign"
+            "passive sync must not auto-co-sign a recovery no other holder consented to"
         );
 
-        // A co-signs as the rounds sync; the group signature aggregates and installs.
+        // A explicitly co-signs, having verified out-of-band that it re-roots to B.
+        let (resp, _) = a.tracker.space_recover_approve_cmd(session_hex);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+
+        // Now the threshold consents; the group signature aggregates and installs.
         for _ in 0..6 {
-            sync_all(&mut b.tracker, &mut a.tracker);
             sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
         }
 
         // The workspace is re-rooted to B, evicting A, convergently on both.
