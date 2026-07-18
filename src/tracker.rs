@@ -30,11 +30,12 @@ use crate::dto::{
 };
 use crate::engine::history;
 use crate::engine::op::OpCtx;
+use crate::genesis::Genesis;
 use crate::ids::{ActorId, DocId, LabelId, ProjectId, UlidSource, UserId, WorkspaceId};
 use crate::index::{self, AliasTable, RefResolution};
 use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
-use crate::store::{Genesis, Store};
+use crate::store::Store;
 
 /// Issue-link kinds the Layer-B façade accepts (contract §3.2). `relates` is
 /// symmetric and canonicalized (sorted endpoints) so one edge represents it.

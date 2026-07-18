@@ -36,9 +36,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::{self, ActorPlane, SignedEvent};
+use crate::genesis::Genesis;
 use crate::ids::{ActorId, UserId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
-use crate::store::Genesis;
 
 pub const ACL_DOMAIN: &[u8] = b"lait/aclop/1";
 

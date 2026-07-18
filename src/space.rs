@@ -41,9 +41,9 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::{self, SignedEvent};
+use crate::genesis::Genesis;
 use crate::ids::{ActorId, UserId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
-use crate::store::Genesis;
 
 /// Domain separator for the workspace-id derivation.
 const SPACE_DOMAIN: &[u8] = b"lait/space/1";

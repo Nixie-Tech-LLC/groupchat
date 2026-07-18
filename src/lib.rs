@@ -35,6 +35,7 @@ pub mod diagnose;
 pub mod dkg;
 pub mod dto;
 pub mod engine;
+pub mod genesis;
 pub mod ids;
 pub mod inbox;
 pub mod index;

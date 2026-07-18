@@ -51,9 +51,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::acl::{self, SignedOp};
+use crate::genesis::Genesis;
 use crate::ids::{DocId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
-use crate::store::Genesis;
 
 /// The signing domain for content-authority ops (see [`crate::sigdag`]).
 pub const AUTHZ_DOMAIN: &[u8] = b"lait/authz/1";
