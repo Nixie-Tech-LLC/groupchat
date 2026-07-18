@@ -2081,6 +2081,17 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // lait states its network requirement; iroh executes it (crate::net is the
     // sole place relay/discovery vocabulary lives). Defaults to Public.
     let network = crate::net::Network::from_env()?;
+    // Only Public has peer-connectivity wired today (bare-id dials need
+    // discovery, which only Public supplies). A non-Public daemon starts but
+    // will not converge until the dial paths attach addresses — say so loudly
+    // rather than fail silently.
+    if !matches!(network, crate::net::Network::Public) {
+        tracing::warn!(
+            "LAIT_NETWORK is not 'public': the endpoint is configured, but peer \
+             resolution is not yet wired for this policy — this daemon may bind \
+             without ever connecting to peers"
+        );
+    }
     let endpoint = crate::net::build_endpoint(&secret_key, &network).await?;
     let my_id = endpoint.id();
 
@@ -2105,8 +2116,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         .spawn();
 
     // Waiting for a home relay only makes sense when the policy provides one.
-    if network.uses_relay() {
-        endpoint.online().await;
+    // Bound so a valid-URL-but-unreachable relay can't hang startup forever
+    // (iroh's `online()` never times out on its own).
+    if network.uses_relay()
+        && tokio::time::timeout(Duration::from_secs(30), endpoint.online())
+            .await
+            .is_err()
+    {
+        tracing::warn!("no home relay after 30s — continuing; peers may be unreachable");
     }
 
     // The topic is a pure function of the workspace id — no user-settable

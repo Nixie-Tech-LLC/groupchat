@@ -7,10 +7,19 @@
 //! [`build_endpoint`] the rest of the daemon knows only [`Network`]; there is no
 //! "iroh default" anymore, only lait's `Public` policy that iroh executes.
 //!
-//! The point is ownership of *behaviour*: with this seam lait chooses its relay
-//! and discovery (self-hosted, or a test harness's in-process servers) instead
-//! of inheriting n0's — which is what makes hermetic, offline, deterministic
-//! multi-node testing possible.
+//! The point is ownership of *behaviour*: lait chooses its transport
+//! environment instead of inheriting n0's. This seam establishes that ownership
+//! and the single contractor boundary.
+//!
+//! **Status.** Only [`Network::Public`] is wired end-to-end for the daemon. Every
+//! peer dial in `node.rs` is a bare `EndpointId` resolved via discovery (the
+//! address-free design in `crate::proto`); `Public` gets that from n0. `Local`
+//! and `Isolated` configure the endpoint but supply no discovery and attach no
+//! address, so a bare id resolves to nothing — the daemon will start but not
+//! converge until the dial paths attach `{id, relay}` addresses (via a
+//! `MemoryLookup` the daemon populates, or self-hosted pkarr/DNS). The daemon
+//! warns loudly on any non-`Public` policy for exactly this reason. Wiring that
+//! is the next step; this commit lands the seam, not a working `Local` daemon.
 
 use anyhow::{Context, Result};
 use iroh::{
@@ -22,22 +31,27 @@ use iroh::{
 #[derive(Debug, Clone)]
 pub enum Network {
     /// The public relay mesh + public discovery (n0). The default — unchanged
-    /// behaviour, now stated rather than inherited.
+    /// behaviour, now stated rather than inherited. The **only** policy whose
+    /// daemon peer-connectivity is wired today (n0 discovery resolves the bare
+    /// `EndpointId`s that every dial in `node.rs` uses).
     Public,
-    /// A relay + discovery service lait supplies — a self-hosted deployment or a
-    /// test harness's in-process servers. Hermetic: no public internet.
+    /// A single relay lait supplies (self-hosted, or a test harness's in-process
+    /// relay). The endpoint is configured for it, but **daemon connectivity is
+    /// not yet wired**: lait dials peers by bare `EndpointId` and relies on
+    /// discovery to resolve them (`crate::proto` §"address-free"), and `Local`
+    /// provides no discovery — so a peer id resolves to nothing until the dial
+    /// paths attach `{id, relay}` addresses (the follow-up). See the crate docs.
     Local(LocalNet),
-    /// No relay, no discovery — direct reach only. Peers must carry addresses
-    /// (a separate slice, reversing the address-free ticket design); endpoint
-    /// construction is defined here, but address-free connectivity is not yet
-    /// wired, so this is not usable for the daemon's join flow today.
+    /// No relay, no discovery — direct reach only. Same wiring gap as `Local`,
+    /// plus it would need addresses to travel in tickets. Endpoint construction
+    /// is defined; daemon connectivity is not.
     Isolated,
 }
 
-/// A self-hosted or test network lait reaches peers through. With a single known
-/// relay, reachability is relay-based (a peer is `{its id, this relay}`) — no
-/// public discovery needed, which is exactly what makes it hermetic. lait names
-/// the relay in a plain URL; iroh is the contractor.
+/// A single relay lait supplies. Once the dial paths attach `{id, relay}`
+/// addresses (see the crate-level status note), reachability is relay-based — a
+/// peer is `{its id, this relay}`, needing no public discovery, which is what
+/// makes it hermetic. lait names the relay in a plain URL; iroh is the contractor.
 #[derive(Debug, Clone)]
 pub struct LocalNet {
     /// The relay URL peers rendezvous through (`https://…` / `http://…`). A
@@ -50,18 +64,19 @@ pub struct LocalNet {
 impl Network {
     /// Resolve the requirement from the environment, defaulting to [`Public`] so
     /// existing deployments are unchanged. `LAIT_NETWORK` = `public` (default) |
-    /// `local` | `isolated`; `local` additionally reads `LAIT_RELAY`,
-    /// `LAIT_PKARR`, `LAIT_DNS` (host:port) and optional `LAIT_NET_ORIGIN`.
+    /// `local` | `isolated` (trimmed, case-insensitive); `local` reads
+    /// `LAIT_RELAY`. An unknown value is an error, never a silent default.
     ///
     /// [`Public`]: Network::Public
     pub fn from_env() -> Result<Self> {
-        match std::env::var("LAIT_NETWORK").ok().as_deref() {
-            None | Some("") | Some("public") => Ok(Network::Public),
-            Some("isolated") => Ok(Network::Isolated),
-            Some("local") => Ok(Network::Local(LocalNet {
+        let raw = std::env::var("LAIT_NETWORK").unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "public" => Ok(Network::Public),
+            "isolated" => Ok(Network::Isolated),
+            "local" => Ok(Network::Local(LocalNet {
                 relay: env_req("LAIT_RELAY")?,
             })),
-            Some(other) => {
+            other => {
                 anyhow::bail!("unknown LAIT_NETWORK '{other}' (expected public|local|isolated)")
             }
         }

@@ -1,14 +1,19 @@
-//! Proof of the network-policy seam (`lait::net`): lait owns its transport
-//! environment, so it can run **hermetically** — on an in-process relay, with no
-//! public internet and no n0 infrastructure. This is the operational ownership
-//! the seam buys, and the foundation for making the two-node daemon tests (and
-//! CI) deterministic instead of hostage to the public relay.
+//! Tests for the network-policy seam (`lait::net`).
 //!
-//! It asserts two things:
-//!  1. `build_endpoint` maps every policy to a bindable endpoint (Public, Local,
-//!     Isolated) — the production function, exercised directly.
-//!  2. Two endpoints configured exactly as lait's `Local` policy configures them
-//!     converge over an in-process relay and exchange bytes — offline.
+//! What these DO prove:
+//!  1. `build_endpoint` maps every policy to a bindable endpoint (Isolated,
+//!     Local) — the production function, exercised directly.
+//!  2. The iroh config `Local` produces (`presets::Minimal` + a custom relay)
+//!     can carry a connection over an in-process relay — offline, no n0 — WHEN
+//!     the dialer is handed a relay-bearing `EndpointAddr`.
+//!
+//! What they DELIBERATELY do NOT prove: that lait's *daemon* converges under
+//! `Local`. The daemon dials peers by bare `EndpointId` and relies on discovery
+//! to resolve them; `Local` supplies none and does not yet attach `{id, relay}`
+//! addresses, so the daemon join/sync flow does not work under `Local` today
+//! (see the `crate::net` status note). Test 2 hand-builds the relay address to
+//! isolate the *relay mechanism* from that unwired dial path — it certifies the
+//! endpoint config, not the daemon.
 //!
 //! The self-signed in-process relay needs cert-verification skipped, which iroh
 //! gates to test builds; that lives here (a dev-dependency), never in the
@@ -57,8 +62,12 @@ async fn build_endpoint_binds_every_policy() {
     assert!(matches!(Network::from_env(), Ok(Network::Public)));
 }
 
+/// Certifies the RELAY MECHANISM of the `Local` endpoint config, not the daemon
+/// path: given a relay-bearing address (which the daemon does not yet build —
+/// see the module header), two `Local`-configured endpoints connect over an
+/// in-process relay, offline.
 #[tokio::test]
-async fn two_local_endpoints_converge_over_an_in_process_relay() {
+async fn local_config_carries_a_connection_over_an_in_process_relay() {
     // Stand up a relay entirely in this process — no public internet.
     let (relay_map, relay_url, _relay_guard): (RelayMap, RelayUrl, _) =
         iroh::test_utils::run_relay_server()
