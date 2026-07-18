@@ -165,12 +165,6 @@ fn box_key(shared: &[u8], eph_pub: &[u8], recip_pub: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-
-    fn user_from_seed(seed: &[u8; 32]) -> UserId {
-        let pk = SigningKey::from_bytes(seed).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
-    }
 
     #[test]
     fn aead_roundtrip_and_wrong_key_fails() {
@@ -186,25 +180,19 @@ mod tests {
     }
 
     #[test]
-    fn iroh_key_seals_and_opens() {
-        // The daemon uses iroh's SecretKey: seed = to_bytes(), UserId =
-        // public().to_string(). The ed25519↔x25519 conversion must hold for it.
-        let sk = iroh::SecretKey::from_bytes(&[5u8; 32]);
-        let seed = sk.to_bytes();
-        let uid = UserId::from_key_string(sk.public().to_string());
-        // sanity: iroh's pubkey equals the ed25519-dalek verifying key of the seed.
-        let vk = SigningKey::from_bytes(&seed).verifying_key();
-        assert_eq!(
-            uid.as_str(),
-            data_encoding::HEXLOWER.encode(vk.as_bytes()),
-            "iroh seed/pubkey must be a standard ed25519 pair"
-        );
+    fn seals_to_a_seed_derived_user_and_opens() {
+        // A member is addressed by their seed-derived UserId; the ed25519↔x25519
+        // conversion must let a box sealed to it open with the seed. (The
+        // agreement that the transport's key IS this ed25519 pair lives at the
+        // net seam — see tests/identity_interop.rs.)
+        let seed = [5u8; 32];
+        let uid = user_from_seed(&seed);
         let key = random_key();
-        let sealed = seal_to(&uid, &key).expect("seal to iroh key");
+        let sealed = seal_to(&uid, &key).expect("seal to seed-derived key");
         assert_eq!(
             open_sealed(&seed, &uid, &sealed).as_deref(),
             Some(&key[..]),
-            "iroh-keyed sealed box must round-trip"
+            "seed-keyed sealed box must round-trip"
         );
     }
 

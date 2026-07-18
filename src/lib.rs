@@ -21,22 +21,15 @@
 //!   * **Layer C — wire/sync** ([`proto`], and P1 `sync`): opaque Loro bytes plus
 //!     the minimum framing to route them over iroh.
 
-pub mod acl;
-pub mod actor;
 pub mod app;
-pub mod authz;
 pub mod cli;
 pub mod cmdspec;
 pub mod config;
 pub mod control;
-pub mod crypto;
 pub mod daemon_spawn;
 pub mod diagnose;
-pub mod dkg;
 pub mod dto;
 pub mod engine;
-pub mod genesis;
-pub mod ids;
 pub mod inbox;
 pub mod index;
 pub mod install;
@@ -48,12 +41,18 @@ pub mod presence;
 pub mod proto;
 pub mod registry;
 pub mod serve;
-pub mod sigdag;
-pub mod space;
 pub mod store;
 pub mod sync;
 pub mod tracker;
 pub mod workspaces;
+
+// The **kernel** (`lait-kernel`) holds lait's roots — identity, the trust
+// planes, derivation rules — in a crate that lists no scaffold, so a `loro::`
+// or `iroh::` reference there cannot compile. Re-exported here so the app layer
+// keeps reaching them by their historical crate-root paths (`crate::acl`,
+// `lait::ids`, …); the boundary is enforced by the kernel crate's manifest, not
+// by these aliases.
+pub use lait_kernel::{acl, actor, authz, crypto, dkg, genesis, ids, sigdag, space};
 
 // Path compatibility: the engine wrappers keep their historical crate-root
 // paths (`crate::issue::IssueDoc`, …) while living behind the sealed

@@ -27,7 +27,7 @@
 //! pre-removal `asof`.
 //!
 //! Our fence is the **E2EE epoch**, which Matrix (unencrypted) does not have.
-//! Removal always rotates the workspace key ([`crate::tracker`] `member_remove`
+//! Removal always rotates the workspace key (the app layer's `tracker::member_remove`
 //! → `rotate_key`); post-rotation a removed member cannot produce a payload any
 //! member will decrypt, so their forged tombstone never enters any member's
 //! catalog. The epoch plane is the recency anchor for the authority plane

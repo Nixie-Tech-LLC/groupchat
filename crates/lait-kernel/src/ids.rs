@@ -149,7 +149,7 @@ prefixed_id!(
     /// `Catalog.docs`, the filename in git, and the routing key on the wire.
     ///
     /// ```
-    /// use lait::ids::{DocId, SystemUlidSource};
+    /// use lait_kernel::ids::{DocId, SystemUlidSource};
     /// let id = DocId::mint(&SystemUlidSource);
     /// assert!(id.as_str().starts_with("iss_"));
     /// // a short, git-style handle is a genuine prefix of the full id

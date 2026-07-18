@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/lait-kernel"]
+
 [package]
 name = "lait"
 version = "0.5.2"
@@ -58,6 +61,10 @@ name = "lait"
 path = "src/main.rs"
 
 [dependencies]
+# lait's roots — identity, trust regimes, derivation rules. Depends on no
+# scaffold; re-exported at this crate's root so the app layer reaches it by its
+# historical paths (`crate::acl`, `lait::ids`, …).
+lait-kernel = { path = "crates/lait-kernel" }
 # Loro CRDT — the storage/truth layer (Layer A). Issue docs + the catalog doc.
 loro = "=1.13.6"
 # randomness for ULID minting (app-minted DocId/ProjectId/… ids).
