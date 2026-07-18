@@ -469,6 +469,10 @@ pub struct Node {
     gossip: Gossip,
     sender: Mutex<GossipSender>,
     secret_key: SecretKey,
+    /// How to reach peers under lait's network policy (see `crate::net`). Every
+    /// newly-seen peer id is registered here so the endpoint's bare-id dials
+    /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
+    peers: crate::net::PeerBook,
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
@@ -494,6 +498,8 @@ pub struct Node {
 
 impl Node {
     fn touch(&self, id: EndpointId, nick: Option<String>) -> String {
+        // A newly-seen peer must be reachable before we dial it back (Local).
+        self.peers.learn(id);
         let now = Instant::now();
         let came_online = {
             let mut p = self.shared.presence.lock().unwrap();
@@ -724,6 +730,8 @@ impl Node {
         if peer == self.shared.my_id {
             return;
         }
+        // Ensure the sync dial can resolve the peer under Local.
+        self.peers.learn(peer);
         tokio::spawn(async move {
             if !self.syncing.lock().unwrap().insert(peer) {
                 return; // already syncing this peer
@@ -808,6 +816,11 @@ impl Node {
     }
 
     async fn join_topic(self: &Arc<Self>, topic: TopicId, peers: Vec<EndpointId>) -> Result<()> {
+        // Register the bootstrap peers (e.g. a ticket's host) before gossip dials
+        // them, so bare-id resolution succeeds under Local.
+        for id in &peers {
+            self.peers.learn(*id);
+        }
         let gtopic = tokio::time::timeout(
             Duration::from_secs(15),
             self.gossip.subscribe_and_join(topic, peers),
@@ -2081,18 +2094,16 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // lait states its network requirement; iroh executes it (crate::net is the
     // sole place relay/discovery vocabulary lives). Defaults to Public.
     let network = crate::net::Network::from_env()?;
-    // Only Public has peer-connectivity wired today (bare-id dials need
-    // discovery, which only Public supplies). A non-Public daemon starts but
-    // will not converge until the dial paths attach addresses — say so loudly
-    // rather than fail silently.
-    if !matches!(network, crate::net::Network::Public) {
+    // Public and Local are both wired: Public resolves bare ids via n0 discovery,
+    // Local via the PeerBook we populate below. Isolated has no relay and needs
+    // addresses to travel in tickets (not yet) — warn rather than fail silently.
+    if matches!(network, crate::net::Network::Isolated) {
         tracing::warn!(
-            "LAIT_NETWORK is not 'public': the endpoint is configured, but peer \
-             resolution is not yet wired for this policy — this daemon may bind \
-             without ever connecting to peers"
+            "LAIT_NETWORK=isolated: no relay and no carried addresses yet — this \
+             daemon binds but cannot resolve peers, so it will not converge"
         );
     }
-    let endpoint = crate::net::build_endpoint(&secret_key, &network).await?;
+    let (endpoint, peers) = crate::net::build_endpoint(&secret_key, &network).await?;
     let my_id = endpoint.id();
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
@@ -2140,6 +2151,11 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
             bootstrap.push(*id);
         }
     }
+    // Teach the endpoint how to reach each bootstrap peer before dialing them
+    // (under Local this registers `{id, relay}`; under Public it is a no-op).
+    for id in &bootstrap {
+        peers.learn(*id);
+    }
     let gtopic = gossip
         .subscribe(topic, bootstrap)
         .await
@@ -2163,6 +2179,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         gossip,
         sender: Mutex::new(sender),
         secret_key,
+        peers,
         router,
         shared,
         shutdown: Arc::new(Notify::new()),

@@ -1,19 +1,13 @@
-//! Tests for the network-policy seam (`lait::net`).
+//! Tests for the network-policy seam (`lait::net`), driven through lait's REAL
+//! reachability path.
 //!
-//! What these DO prove:
-//!  1. `build_endpoint` maps every policy to a bindable endpoint (Isolated,
-//!     Local) — the production function, exercised directly.
-//!  2. The iroh config `Local` produces (`presets::Minimal` + a custom relay)
-//!     can carry a connection over an in-process relay — offline, no n0 — WHEN
-//!     the dialer is handed a relay-bearing `EndpointAddr`.
-//!
-//! What they DELIBERATELY do NOT prove: that lait's *daemon* converges under
-//! `Local`. The daemon dials peers by bare `EndpointId` and relies on discovery
-//! to resolve them; `Local` supplies none and does not yet attach `{id, relay}`
-//! addresses, so the daemon join/sync flow does not work under `Local` today
-//! (see the `crate::net` status note). Test 2 hand-builds the relay address to
-//! isolate the *relay mechanism* from that unwired dial path — it certifies the
-//! endpoint config, not the daemon.
+//! Under `Local`, lait dials peers by **bare `EndpointId`** (its address-free
+//! design) and resolves them through a `MemoryLookup` it populates with
+//! `{id, relay}` — the address lait already knows because it configured the
+//! relay. No discovery service, plaintext or otherwise, exists to fake. These
+//! tests use exactly that construction (`lait::net::relay_addr` + a
+//! `MemoryLookup`, then `connect(bare_id)`), so a green result reflects the
+//! daemon's actual mechanism, not an iroh feature.
 //!
 //! The self-signed in-process relay needs cert-verification skipped, which iroh
 //! gates to test builds; that lives here (a dev-dependency), never in the
@@ -21,32 +15,40 @@
 
 use std::time::Duration;
 
-use iroh::{endpoint::presets, Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{
+    address_lookup::MemoryLookup, endpoint::presets, Endpoint, RelayMap, RelayMode, RelayUrl,
+    SecretKey,
+};
 use iroh_relay::tls::CaRootsConfig;
-use lait::net::{build_endpoint, LocalNet, Network};
+use lait::net::{build_endpoint, relay_addr, LocalNet, Network};
 
 const TEST_ALPN: &[u8] = b"lait/hermetic-test/1";
 
-/// A `Local`-policy endpoint for the test: the SAME iroh config `build_endpoint`
-/// produces for `Network::Local` (Minimal preset + a custom relay map), plus the
-/// two things a raw test needs that the daemon supplies elsewhere — the test
-/// ALPN, and cert-skip for the in-process relay's self-signed certificate.
-async fn local_test_endpoint(seed: [u8; 32], relay: RelayMap) -> Endpoint {
-    Endpoint::builder(presets::Minimal)
+/// A `Local`-policy endpoint for the test: the SAME shape `build_endpoint`
+/// produces for `Network::Local` — `presets::Minimal` + a custom relay + a
+/// `MemoryLookup` for bare-id resolution — plus the two things a raw test needs
+/// that the daemon supplies elsewhere: the test ALPN, and cert-skip for the
+/// in-process relay's self-signed certificate. Returns the lookup so the test
+/// can register peers exactly as the daemon's `PeerBook` does.
+async fn local_test_endpoint(seed: [u8; 32], relay: RelayMap) -> (Endpoint, MemoryLookup) {
+    let lookup = MemoryLookup::new();
+    let ep = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Custom(relay))
+        .address_lookup(lookup.clone())
         .ca_roots_config(CaRootsConfig::insecure_skip_verify())
         .alpns(vec![TEST_ALPN.to_vec()])
         .secret_key(SecretKey::from_bytes(&seed))
         .bind()
         .await
-        .expect("bind local test endpoint")
+        .expect("bind local test endpoint");
+    (ep, lookup)
 }
 
 #[tokio::test]
 async fn build_endpoint_binds_every_policy() {
     // Isolated: no relay, no discovery — must bind with zero infrastructure.
     let iso = build_endpoint(&SecretKey::from_bytes(&[1u8; 32]), &Network::Isolated).await;
-    assert!(iso.is_ok(), "Isolated must bind offline: {iso:?}");
+    assert!(iso.is_ok(), "Isolated must bind offline: {:?}", iso.err());
 
     // Local: a custom relay. Binding does not contact the relay, so any URL binds.
     let local = build_endpoint(
@@ -56,27 +58,26 @@ async fn build_endpoint_binds_every_policy() {
         }),
     )
     .await;
-    assert!(local.is_ok(), "Local must bind: {local:?}");
+    assert!(local.is_ok(), "Local must bind: {:?}", local.err());
 
     // from_env default is Public and must not error to construct.
     assert!(matches!(Network::from_env(), Ok(Network::Public)));
 }
 
-/// Certifies the RELAY MECHANISM of the `Local` endpoint config, not the daemon
-/// path: given a relay-bearing address (which the daemon does not yet build —
-/// see the module header), two `Local`-configured endpoints connect over an
-/// in-process relay, offline.
+/// The real thing: two `Local` endpoints converge by **bare-id dial** over an
+/// in-process relay — no public internet, no discovery service — because each
+/// registers the other as `{id, relay}` via lait's own `relay_addr`, exactly as
+/// the daemon's `PeerBook` does on every peer it learns.
 #[tokio::test]
-async fn local_config_carries_a_connection_over_an_in_process_relay() {
+async fn local_endpoints_converge_by_bare_id_over_an_in_process_relay() {
     // Stand up a relay entirely in this process — no public internet.
     let (relay_map, relay_url, _relay_guard): (RelayMap, RelayUrl, _) =
         iroh::test_utils::run_relay_server()
             .await
             .expect("run in-process relay");
 
-    let server = local_test_endpoint([11u8; 32], relay_map.clone()).await;
-    let client = local_test_endpoint([22u8; 32], relay_map).await;
-    // Both must have a working relay path before they can be reached by id.
+    let (server, _server_lookup) = local_test_endpoint([11u8; 32], relay_map.clone()).await;
+    let (client, client_lookup) = local_test_endpoint([22u8; 32], relay_map).await;
     server.online().await;
     client.online().await;
     let server_id = server.id();
@@ -94,11 +95,13 @@ async fn local_config_carries_a_connection_over_an_in_process_relay() {
         conn.closed().await;
     });
 
-    // Client: reach the server by id, via the relay (address-free — the relay
-    // provides reachability, exactly as lait's Local policy intends).
-    let addr = EndpointAddr::new(server_id).with_relay_url(relay_url);
+    // Teach the client how to reach the server the way the daemon does: register
+    // `{server_id, relay}` via lait's own address construction …
+    client_lookup.add_endpoint_info(relay_addr(&relay_url, server_id));
+    // … then dial by BARE ID — the production path. Resolution goes through the
+    // MemoryLookup we just populated; no address is hand-carried into `connect`.
     let result = tokio::time::timeout(Duration::from_secs(20), async move {
-        let conn = client.connect(addr, TEST_ALPN).await.expect("connect");
+        let conn = client.connect(server_id, TEST_ALPN).await.expect("connect");
         let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
         send.write_all(b"ping").await.expect("write ping");
         send.finish().expect("finish");
@@ -111,7 +114,7 @@ async fn local_config_carries_a_connection_over_an_in_process_relay() {
 
     assert_eq!(
         &result, b"pong",
-        "the two endpoints converged over the local relay"
+        "two Local endpoints converged by bare-id dial over the local relay"
     );
     server_task.await.expect("server task");
 }
