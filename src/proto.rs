@@ -1,24 +1,41 @@
 //! Wire protocol: signed gossip messages, the workspace ticket, and topic derivation.
 //!
 //! Messages broadcast on the gossip topic are postcard-encoded `SignedMessage`s
-//! carrying an ed25519 signature over a `Payload`. This mirrors the canonical
-//! iroh-gossip `chat.rs` example.
+//! carrying a **lait** ed25519 signature over a `Payload` — authored, signed, and
+//! verified by [`crate::sigdag`], lait's own signing plane. (This once mirrored
+//! iroh-gossip's `chat.rs` example and signed with the transport's key type; the
+//! authenticity is now lait's, so a message's author is a lait [`UserId`], not an
+//! iroh key, and the primitive is the same one the trust planes use.)
 //!
-//! This is the transport skeleton kept from the chat app: signed announce +
-//! presence over gossip. The issue-tracker data model (Loro docs, the catalog,
-//! per-doc sync) is layered on top of it — see `docs/ARCHITECTURE.md`.
+//! iroh's own types appear here only where they *are* the transport: the gossip
+//! `TopicId` and the host `EndpointId` in a ticket. Identity and authenticity are
+//! lait's.
 
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use iroh::{EndpointId, PublicKey, SecretKey};
+use iroh::EndpointId;
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use serde_byte_array::ByteArray;
 
-const SIGNATURE_LENGTH: usize = iroh::Signature::LENGTH;
+use crate::ids::UserId;
+
+/// An ed25519 signature is 64 bytes.
+const SIGNATURE_LENGTH: usize = 64;
 type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
+
+/// The `EndpointId` (transport id) of a lait `UserId` — the same 32 bytes, so a
+/// gossip message's lait-signed author resolves to the peer to dial back.
+fn endpoint_of(user: &UserId) -> Result<EndpointId> {
+    let raw = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(user.as_str().as_bytes())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .context("author is not a 32-byte key")?;
+    EndpointId::from_bytes(&raw).context("author is not a valid endpoint id")
+}
 
 /// Derive the gossip topic id from the workspace id. The topic is a pure
 /// function of the genesis identity — there is no user-settable network name,
@@ -84,33 +101,34 @@ impl InviteGrant {
 /// *single-use* checks are enforced by the redeeming node against live state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedInvite {
-    issuer: PublicKey,
+    issuer: UserId,
     grant: Bytes,
     signature: SignatureBytes,
 }
 
 impl SignedInvite {
-    /// Sign `grant` with the issuer's secret key.
-    pub fn sign(secret_key: &SecretKey, grant: &InviteGrant) -> Result<Self> {
+    /// Sign `grant` with the issuer's identity seed (lait's own signing plane).
+    pub fn sign(seed: &[u8; 32], grant: &InviteGrant) -> Result<Self> {
         let data: Bytes = postcard::to_stdvec(grant)
             .context("encode invite grant")?
             .into();
-        let signature = secret_key.sign(&data);
+        let (issuer, sig) = crate::sigdag::sign_message(seed, &data);
         Ok(Self {
-            issuer: secret_key.public(),
+            issuer,
             grant: data,
-            signature: ByteArray::new(signature.to_bytes()),
+            signature: ByteArray::new(sig),
         })
     }
 
-    /// Verify the issuer signature and decode the grant.
-    pub fn verify(&self) -> Result<(PublicKey, InviteGrant)> {
-        self.issuer
-            .verify(&self.grant, &iroh::Signature::from_bytes(&self.signature))
-            .map_err(|e| anyhow::anyhow!("invalid invite signature: {e}"))?;
+    /// Verify the issuer signature and decode the grant. Returns the issuer's
+    /// lait `UserId` (what membership is keyed on).
+    pub fn verify(&self) -> Result<(UserId, InviteGrant)> {
+        if !crate::sigdag::verify_message(&self.issuer, &self.grant, &self.signature) {
+            anyhow::bail!("invalid invite signature");
+        }
         let grant: InviteGrant =
             postcard::from_bytes(&self.grant).context("decode invite grant")?;
-        Ok((self.issuer, grant))
+        Ok((self.issuer.clone(), grant))
     }
 }
 
@@ -179,38 +197,39 @@ pub enum PresenceState {
     Away,
 }
 
-/// A signed, postcard-encoded envelope broadcast over gossip.
+/// A signed, postcard-encoded envelope broadcast over gossip. The author is a
+/// lait [`UserId`], signed by [`crate::sigdag`] — the transport never sees a
+/// key type of its own here.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignedMessage {
-    from: PublicKey,
+    from: UserId,
     data: Bytes,
     signature: SignatureBytes,
 }
 
 impl SignedMessage {
-    /// Verify the signature and decode the inner payload.
-    pub fn verify_and_decode(bytes: &[u8]) -> Result<(PublicKey, Payload)> {
+    /// Verify the signature and decode the inner payload. Returns the sender's
+    /// transport id (the same 32 bytes as its lait author) so the caller can dial
+    /// it back over gossip.
+    pub fn verify_and_decode(bytes: &[u8]) -> Result<(EndpointId, Payload)> {
         let signed: Self = postcard::from_bytes(bytes).context("decode signed message")?;
-        let key = signed.from;
-        key.verify(
-            &signed.data,
-            &iroh::Signature::from_bytes(&signed.signature),
-        )
-        .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
+        if !crate::sigdag::verify_message(&signed.from, &signed.data, &signed.signature) {
+            anyhow::bail!("invalid signature");
+        }
         let payload: Payload = postcard::from_bytes(&signed.data).context("decode payload")?;
-        Ok((signed.from, payload))
+        Ok((endpoint_of(&signed.from)?, payload))
     }
 
-    /// Sign and encode a payload for broadcast.
-    pub fn sign_and_encode(secret_key: &SecretKey, payload: &Payload) -> Result<Bytes> {
+    /// Sign and encode a payload for broadcast, using the sender's identity seed.
+    pub fn sign_and_encode(seed: &[u8; 32], payload: &Payload) -> Result<Bytes> {
         let data: Bytes = postcard::to_stdvec(payload)
             .context("encode payload")?
             .into();
-        let signature = secret_key.sign(&data);
+        let (from, sig) = crate::sigdag::sign_message(seed, &data);
         let signed = Self {
-            from: secret_key.public(),
+            from,
             data,
-            signature: ByteArray::new(signature.to_bytes()),
+            signature: ByteArray::new(sig),
         };
         let encoded = postcard::to_stdvec(&signed).context("encode signed message")?;
         Ok(encoded.into())
@@ -339,7 +358,7 @@ mod tests {
     use super::*;
 
     fn host_key() -> EndpointId {
-        SecretKey::from_bytes(&[7u8; 32]).public()
+        endpoint_of(&crate::crypto::user_from_seed(&[7u8; 32])).unwrap()
     }
 
     /// A bad invite is the most likely thing to go wrong on a new joiner's very
@@ -463,11 +482,11 @@ mod tests {
 
     #[test]
     fn signed_invite_roundtrips_and_detects_tampering() {
-        let sk = SecretKey::from_bytes(&[9u8; 32]);
+        let seed = [9u8; 32];
         let grant = InviteGrant::mint("ws_1".into(), 1_000, 3_600, true);
-        let signed = SignedInvite::sign(&sk, &grant).unwrap();
+        let signed = SignedInvite::sign(&seed, &grant).unwrap();
         let (issuer, back) = signed.verify().expect("valid signature verifies");
-        assert_eq!(issuer, sk.public());
+        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
         assert_eq!(back, grant);
         assert!(!back.is_expired(4_599) && back.is_expired(4_600));
         // Flip a byte of the signed grant ⇒ verification must fail.
@@ -480,17 +499,17 @@ mod tests {
 
     #[test]
     fn ticket_carries_an_invite_through_base32() {
-        let sk = SecretKey::from_bytes(&[3u8; 32]);
+        let seed = [3u8; 32];
         let grant = InviteGrant::mint("ws_00000000000000000000000000".into(), 0, 604_800, true);
         let mut t = sample();
-        t.invite = Some(SignedInvite::sign(&sk, &grant).unwrap());
+        t.invite = Some(SignedInvite::sign(&seed, &grant).unwrap());
         let back: WorkspaceTicket = t.to_string().parse().unwrap();
         let (issuer, g) = back
             .invite
             .expect("invite survives roundtrip")
             .verify()
             .unwrap();
-        assert_eq!(issuer, sk.public());
+        assert_eq!(issuer, crate::crypto::user_from_seed(&seed));
         assert_eq!(g, grant);
     }
 }

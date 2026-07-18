@@ -137,6 +137,29 @@ pub fn sign_node(
     }
 }
 
+/// Sign arbitrary bytes with an ed25519 seed — a **detached** signature for the
+/// transport-authenticity plane (signed gossip: announce/presence, and invite
+/// grants) that does not ride the hash-DAG. Returns the seed's `author` and the
+/// 64-byte signature. lait's own primitive — no scaffold signing type involved.
+pub fn sign_message(seed: &[u8; 32], msg: &[u8]) -> (UserId, [u8; 64]) {
+    let sk = SigningKey::from_bytes(seed);
+    let author =
+        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+    (author, sk.sign(msg).to_bytes())
+}
+
+/// Verify a [`sign_message`] detached signature: `sig` covers `msg` under
+/// `author`. Rejects a malformed author or signature without panicking.
+pub fn verify_message(author: &UserId, msg: &[u8], sig: &[u8; 64]) -> bool {
+    let Some(pk) = hex32(author.as_str()) else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    vk.verify(msg, &Signature::from_bytes(sig)).is_ok()
+}
+
 /// Transitive causal ancestors of each node, over present parents only.
 pub fn compute_ancestors(
     nodes: &std::collections::HashMap<String, &SignedNode>,
@@ -254,6 +277,19 @@ mod tests {
             "ws_x",
         );
         assert!(node.verify_sig(b"lait/aclop/1", "ws_x"));
+    }
+
+    #[test]
+    fn detached_message_signing_roundtrips_and_detects_tampering() {
+        let (author, sig) = sign_message(&seed(5), b"announce: head moved");
+        assert!(verify_message(&author, b"announce: head moved", &sig));
+        // Wrong message, wrong author, and a flipped signature byte all fail.
+        assert!(!verify_message(&author, b"a different message", &sig));
+        let (other, _) = sign_message(&seed(6), b"announce: head moved");
+        assert!(!verify_message(&other, b"announce: head moved", &sig));
+        let mut bad = sig;
+        bad[0] ^= 0xff;
+        assert!(!verify_message(&author, b"announce: head moved", &bad));
     }
 
     #[test]

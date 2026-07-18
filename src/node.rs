@@ -806,7 +806,7 @@ impl Node {
     }
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
-        let bytes = SignedMessage::sign_and_encode(&self.secret_key, &payload)?;
+        let bytes = SignedMessage::sign_and_encode(&self.secret_key.to_bytes(), &payload)?;
         let sender = self.sender.lock().unwrap().clone();
         sender
             .broadcast(bytes)
@@ -1151,7 +1151,7 @@ impl Node {
         else {
             return;
         };
-        let (issuer_pk, grant) = match invite.verify() {
+        let (issuer, grant) = match invite.verify() {
             Ok(v) => v,
             Err(_) => return,
         };
@@ -1159,7 +1159,6 @@ impl Node {
         if grant.is_expired(now) {
             return;
         }
-        let issuer = UserId::from_key_string(issuer_pk.to_string());
         let (changed, dirty) = {
             let mut t = self.tracker.lock().unwrap();
             // Bind the grant to *our* workspace before doing anything.
@@ -1690,7 +1689,7 @@ impl Node {
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
                     let grant =
                         InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
-                    SignedInvite::sign(&self.secret_key, &grant).ok()
+                    SignedInvite::sign(&self.secret_key.to_bytes(), &grant).ok()
                 };
                 // Carry the verifiable founding proof (salt + founder inception),
                 // NOT a bare anchor string. The joiner checks the workspace id
@@ -2301,7 +2300,7 @@ mod tests {
 
         // An admin mints + signs an invite; the joiner seals it bound to itself.
         let grant = InviteGrant::mint(ws.to_string(), 0, 3600, true);
-        let invite = SignedInvite::sign(&host_sk, &grant).unwrap();
+        let invite = SignedInvite::sign(&host_seed, &grant).unwrap();
         let sealed = seal_bound_invite(&host, &invite, &j_actor).unwrap();
 
         // The host opens it for the bound joiner.
