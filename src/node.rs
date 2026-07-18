@@ -473,6 +473,9 @@ pub struct Node {
     /// newly-seen peer id is registered here so the endpoint's bare-id dials
     /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
     peers: crate::net::PeerBook,
+    /// This daemon's workspace id (constant). Bound into every signed gossip
+    /// message so a message cannot be replayed onto another workspace's topic.
+    workspace: String,
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
@@ -806,7 +809,8 @@ impl Node {
     }
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
-        let bytes = SignedMessage::sign_and_encode(&self.secret_key.to_bytes(), &payload)?;
+        let bytes =
+            SignedMessage::sign_and_encode(&self.workspace, &self.secret_key.to_bytes(), &payload)?;
         let sender = self.sender.lock().unwrap().clone();
         sender
             .broadcast(bytes)
@@ -984,7 +988,7 @@ impl Node {
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
-                        match SignedMessage::verify_and_decode(&msg.content) {
+                        match SignedMessage::verify_and_decode(&self.workspace, &msg.content) {
                             Ok((from, payload)) => self.handle_payload(from, payload).await,
                             // A decode failure here is almost always a version-skewed
                             // peer: postcard is not self-describing, so a payload whose
@@ -2173,12 +2177,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         tracing::info!("running as an always-on seed — idle-shutdown disabled");
     }
 
+    let workspace = tracker.lock().unwrap().workspace_str();
     let node = Arc::new(Node {
         endpoint,
         gossip,
         sender: Mutex::new(sender),
         secret_key,
         peers,
+        workspace,
         router,
         shared,
         shutdown: Arc::new(Notify::new()),

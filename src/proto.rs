@@ -26,6 +26,12 @@ use crate::ids::UserId;
 const SIGNATURE_LENGTH: usize = 64;
 type SignatureBytes = ByteArray<SIGNATURE_LENGTH>;
 
+/// Signing domains (see [`crate::sigdag::sign_message`]). Distinct per use-site so
+/// a signature from one context can never verify in another — a gossip message is
+/// not liftable into an invite, and vice-versa.
+const GOSSIP_DOMAIN: &[u8] = b"lait/gossip/1";
+const INVITE_DOMAIN: &[u8] = b"lait/invite/1";
+
 /// The `EndpointId` (transport id) of a lait `UserId` — the same 32 bytes, so a
 /// gossip message's lait-signed author resolves to the peer to dial back.
 fn endpoint_of(user: &UserId) -> Result<EndpointId> {
@@ -48,7 +54,7 @@ fn endpoint_of(user: &UserId) -> Result<EndpointId> {
 /// self-describing; that drop is also logged in node.rs).
 pub fn topic_for_workspace(workspace: &str) -> TopicId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lait/topic/v1");
+    hasher.update(b"lait/topic/v2");
     hasher.update(workspace.as_bytes());
     TopicId::from_bytes(*hasher.finalize().as_bytes())
 }
@@ -108,11 +114,13 @@ pub struct SignedInvite {
 
 impl SignedInvite {
     /// Sign `grant` with the issuer's identity seed (lait's own signing plane).
+    /// Bound to the invite domain and the grant's own workspace.
     pub fn sign(seed: &[u8; 32], grant: &InviteGrant) -> Result<Self> {
         let data: Bytes = postcard::to_stdvec(grant)
             .context("encode invite grant")?
             .into();
-        let (issuer, sig) = crate::sigdag::sign_message(seed, &data);
+        let (issuer, sig) =
+            crate::sigdag::sign_message(INVITE_DOMAIN, &grant.workspace, seed, &data);
         Ok(Self {
             issuer,
             grant: data,
@@ -121,13 +129,21 @@ impl SignedInvite {
     }
 
     /// Verify the issuer signature and decode the grant. Returns the issuer's
-    /// lait `UserId` (what membership is keyed on).
+    /// lait `UserId` (what membership is keyed on). The signature is bound to the
+    /// invite domain and the grant's workspace, so it cannot be a lifted gossip
+    /// signature nor replayed for a different workspace.
     pub fn verify(&self) -> Result<(UserId, InviteGrant)> {
-        if !crate::sigdag::verify_message(&self.issuer, &self.grant, &self.signature) {
-            anyhow::bail!("invalid invite signature");
-        }
         let grant: InviteGrant =
             postcard::from_bytes(&self.grant).context("decode invite grant")?;
+        if !crate::sigdag::verify_message(
+            INVITE_DOMAIN,
+            &grant.workspace,
+            &self.issuer,
+            &self.grant,
+            &self.signature,
+        ) {
+            anyhow::bail!("invalid invite signature");
+        }
         Ok((self.issuer.clone(), grant))
     }
 }
@@ -208,24 +224,33 @@ pub struct SignedMessage {
 }
 
 impl SignedMessage {
-    /// Verify the signature and decode the inner payload. Returns the sender's
-    /// transport id (the same 32 bytes as its lait author) so the caller can dial
-    /// it back over gossip.
-    pub fn verify_and_decode(bytes: &[u8]) -> Result<(EndpointId, Payload)> {
+    /// Verify the signature and decode the inner payload. `workspace` is the
+    /// receiver's own workspace: the signature is bound to it, so a message signed
+    /// for a different topic fails here — closing cross-workspace replay of
+    /// presence/join gossip. Returns the sender's transport id (the same 32 bytes
+    /// as its lait author) so the caller can dial it back over gossip.
+    pub fn verify_and_decode(workspace: &str, bytes: &[u8]) -> Result<(EndpointId, Payload)> {
         let signed: Self = postcard::from_bytes(bytes).context("decode signed message")?;
-        if !crate::sigdag::verify_message(&signed.from, &signed.data, &signed.signature) {
+        if !crate::sigdag::verify_message(
+            GOSSIP_DOMAIN,
+            workspace,
+            &signed.from,
+            &signed.data,
+            &signed.signature,
+        ) {
             anyhow::bail!("invalid signature");
         }
         let payload: Payload = postcard::from_bytes(&signed.data).context("decode payload")?;
         Ok((endpoint_of(&signed.from)?, payload))
     }
 
-    /// Sign and encode a payload for broadcast, using the sender's identity seed.
-    pub fn sign_and_encode(seed: &[u8; 32], payload: &Payload) -> Result<Bytes> {
+    /// Sign and encode a payload for broadcast on `workspace`'s topic, using the
+    /// sender's identity seed. The signature binds the gossip domain and workspace.
+    pub fn sign_and_encode(workspace: &str, seed: &[u8; 32], payload: &Payload) -> Result<Bytes> {
         let data: Bytes = postcard::to_stdvec(payload)
             .context("encode payload")?
             .into();
-        let (from, sig) = crate::sigdag::sign_message(seed, &data);
+        let (from, sig) = crate::sigdag::sign_message(GOSSIP_DOMAIN, workspace, seed, &data);
         let signed = Self {
             from,
             data,

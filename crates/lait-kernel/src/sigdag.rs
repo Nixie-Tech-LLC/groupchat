@@ -137,27 +137,57 @@ pub fn sign_node(
     }
 }
 
+/// The preimage a detached message signature covers:
+/// `blake3(domain ‖ workspace_id ‖ author ‖ msg)`. Same discipline as
+/// [`signing_payload`]: the `domain` makes each use-site's signatures mutually
+/// unusable (a gossip signature can never verify as an invite, regardless of
+/// postcard layout), and `workspace_id` closes cross-workspace replay (a message
+/// signed for one topic fails verification on another).
+fn message_payload(domain: &[u8], workspace_id: &str, author: &UserId, msg: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain);
+    h.update(workspace_id.as_bytes());
+    h.update(author.as_str().as_bytes());
+    h.update(msg);
+    *h.finalize().as_bytes()
+}
+
 /// Sign arbitrary bytes with an ed25519 seed — a **detached** signature for the
-/// transport-authenticity plane (signed gossip: announce/presence, and invite
-/// grants) that does not ride the hash-DAG. Returns the seed's `author` and the
+/// transport-authenticity plane (signed gossip, invite grants) that does not ride
+/// the hash-DAG. `domain` separates use-sites and `workspace_id` binds the message
+/// to its topic (see [`message_payload`]). Returns the seed's `author` and the
 /// 64-byte signature. lait's own primitive — no scaffold signing type involved.
-pub fn sign_message(seed: &[u8; 32], msg: &[u8]) -> (UserId, [u8; 64]) {
+pub fn sign_message(
+    domain: &[u8],
+    workspace_id: &str,
+    seed: &[u8; 32],
+    msg: &[u8],
+) -> (UserId, [u8; 64]) {
     let sk = SigningKey::from_bytes(seed);
     let author =
         UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
-    (author, sk.sign(msg).to_bytes())
+    let payload = message_payload(domain, workspace_id, &author, msg);
+    (author, sk.sign(&payload).to_bytes())
 }
 
-/// Verify a [`sign_message`] detached signature: `sig` covers `msg` under
-/// `author`. Rejects a malformed author or signature without panicking.
-pub fn verify_message(author: &UserId, msg: &[u8], sig: &[u8; 64]) -> bool {
+/// Verify a [`sign_message`] detached signature under the same `domain` and
+/// `workspace_id`: `sig` covers `msg` by `author`. Rejects a malformed author or
+/// signature without panicking, and any mismatch of domain or workspace.
+pub fn verify_message(
+    domain: &[u8],
+    workspace_id: &str,
+    author: &UserId,
+    msg: &[u8],
+    sig: &[u8; 64],
+) -> bool {
     let Some(pk) = hex32(author.as_str()) else {
         return false;
     };
     let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
         return false;
     };
-    vk.verify(msg, &Signature::from_bytes(sig)).is_ok()
+    let payload = message_payload(domain, workspace_id, author, msg);
+    vk.verify(&payload, &Signature::from_bytes(sig)).is_ok()
 }
 
 /// Transitive causal ancestors of each node, over present parents only.
@@ -280,16 +310,23 @@ mod tests {
     }
 
     #[test]
-    fn detached_message_signing_roundtrips_and_detects_tampering() {
-        let (author, sig) = sign_message(&seed(5), b"announce: head moved");
-        assert!(verify_message(&author, b"announce: head moved", &sig));
-        // Wrong message, wrong author, and a flipped signature byte all fail.
-        assert!(!verify_message(&author, b"a different message", &sig));
-        let (other, _) = sign_message(&seed(6), b"announce: head moved");
-        assert!(!verify_message(&other, b"announce: head moved", &sig));
+    fn detached_message_signing_roundtrips_and_binds_domain_and_workspace() {
+        const G: &[u8] = b"lait/gossip/1";
+        const I: &[u8] = b"lait/invite/1";
+        let msg = b"announce: head moved";
+        let (author, sig) = sign_message(G, "ws_a", &seed(5), msg);
+        assert!(verify_message(G, "ws_a", &author, msg, &sig));
+        // Wrong message, author, or a flipped byte fail.
+        assert!(!verify_message(G, "ws_a", &author, b"other", &sig));
+        let (other, _) = sign_message(G, "ws_a", &seed(6), msg);
+        assert!(!verify_message(G, "ws_a", &other, msg, &sig));
         let mut bad = sig;
         bad[0] ^= 0xff;
-        assert!(!verify_message(&author, b"announce: head moved", &bad));
+        assert!(!verify_message(G, "ws_a", &author, msg, &bad));
+        // Domain separation: a gossip signature is not usable as an invite …
+        assert!(!verify_message(I, "ws_a", &author, msg, &sig));
+        // … and cross-workspace replay fails: same bytes, different topic.
+        assert!(!verify_message(G, "ws_b", &author, msg, &sig));
     }
 
     #[test]
