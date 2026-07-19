@@ -988,6 +988,56 @@ mod tests {
         assert_eq!(base, nonce_binding(&a, b"msg", &commitments));
     }
 
+    // ---- domain separation ----
+
+    /// §2.3 regression. A group must be able to threshold-sign a ceremony
+    /// proposal, so the signing path takes the domain from `SignTarget`. If it
+    /// did not, a signature over ceremony bytes would be produced under the
+    /// space domain and handed to the space plane — and because postcard is not
+    /// self-describing and `DkgPropose` shares variant tag 0 with
+    /// `SpaceOp::Recover`, that is type confusion, not a filing error.
+    #[test]
+    fn a_ceremony_signature_cannot_pass_as_a_space_event() {
+        let w = ws();
+        let seed = [4u8; 32];
+        // Bytes that are a structurally valid DkgPropose...
+        let op_bytes = postcard::to_stdvec(&CeremonyOp::DkgPropose {
+            nonce: [0u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        })
+        .unwrap();
+        // ...and which postcard will also happily read as a SpaceOp, since the
+        // encoding carries no type information. This is the hazard itself.
+        assert!(
+            postcard::from_bytes::<crate::space::SpaceOp>(&op_bytes).is_ok(),
+            "ceremony bytes decode as a space op — nothing but the domain separates them"
+        );
+
+        // The two targets produce different signing messages...
+        let author = crate::crypto::user_from_seed(&seed);
+        let as_space = sigdag::payload_to_sign(
+            crate::space::SPACE_EVENT_DOMAIN,
+            &op_bytes,
+            &author,
+            &[],
+            w.as_str(),
+        );
+        let as_ceremony =
+            sigdag::payload_to_sign(CEREMONY_DOMAIN, &op_bytes, &author, &[], w.as_str());
+        assert_ne!(as_space, as_ceremony, "the domain must change the message");
+
+        // ...so a node signed for the ceremony plane cannot be installed on the
+        // space plane, even though the bytes parse there.
+        let node = sigdag::sign_node(CEREMONY_DOMAIN, &seed, op_bytes, vec![], w.as_str());
+        assert!(node.verify_sig(CEREMONY_DOMAIN, w.as_str()));
+        assert!(
+            !node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, w.as_str()),
+            "a ceremony-plane signature must never verify as a space event"
+        );
+    }
+
     // ---- retention ----
 
     /// Rounds naming a transcript nobody opened can never be acted on, and

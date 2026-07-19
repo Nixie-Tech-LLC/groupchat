@@ -6116,6 +6116,192 @@ mod tests {
         );
     }
 
+    /// §1.3. Content-derived transcript ids make concurrency visible: two holders
+    /// independently requesting the same recovery author different nodes, so they
+    /// open different transcripts and commitments would split across both.
+    /// Holders converge on the lowest id.
+    #[test]
+    fn concurrent_signing_requests_converge_on_the_lowest_transcript() {
+        let a = new_node();
+        let authority = crate::dkg::TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let op_bytes = vec![1u8, 2, 3];
+        let mk = |nonce: [u8; 16]| crate::dkg::CeremonyOp::SignRequest {
+            nonce,
+            authority,
+            target: crate::dkg::SignTarget::SpaceOp,
+            op: op_bytes.clone(),
+        };
+        let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.tracker.workspace_id);
+        let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.tracker.workspace_id);
+        let (id1, id2) = (
+            crate::dkg::TranscriptId::of(&e1).unwrap(),
+            crate::dkg::TranscriptId::of(&e2).unwrap(),
+        );
+        assert_ne!(id1, id2, "distinct authors open distinct transcripts");
+        a.tracker.membership.add_ceremony_event(&e1).unwrap();
+        a.tracker.membership.add_ceremony_event(&e2).unwrap();
+
+        let events = a.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &a.tracker.workspace_id);
+        let chosen = a
+            .tracker
+            .canonical_signing_session(
+                &board,
+                &authority,
+                crate::dkg::SignTarget::SpaceOp,
+                &op_bytes,
+                2,
+            )
+            .expect("one of the two");
+        assert_eq!(chosen, id1.min(id2), "the lowest id wins");
+    }
+
+    /// The tie-break is a preference, not an override. Abandoning a transcript
+    /// that is one share from completing, in favour of a lower one that may
+    /// never gather K, is the wrong trade for break-glass — and correctness never
+    /// depended on it, since both sign gen+1 and the space plane's monotonicity
+    /// guard rejects the loser.
+    #[test]
+    fn a_signing_transcript_at_threshold_beats_a_lower_incomplete_one() {
+        let a = new_node();
+        let authority = crate::dkg::TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let op_bytes = vec![1u8, 2, 3];
+        let mk = |nonce: [u8; 16]| crate::dkg::CeremonyOp::SignRequest {
+            nonce,
+            authority,
+            target: crate::dkg::SignTarget::SpaceOp,
+            op: op_bytes.clone(),
+        };
+        let e1 = crate::dkg::sign_ceremony(&[1u8; 32], &mk([1u8; 16]), &a.tracker.workspace_id);
+        let e2 = crate::dkg::sign_ceremony(&[2u8; 32], &mk([2u8; 16]), &a.tracker.workspace_id);
+        let (id1, id2) = (
+            crate::dkg::TranscriptId::of(&e1).unwrap(),
+            crate::dkg::TranscriptId::of(&e2).unwrap(),
+        );
+        let (low, high) = if id1 < id2 { (id1, id2) } else { (id2, id1) };
+        a.tracker.membership.add_ceremony_event(&e1).unwrap();
+        a.tracker.membership.add_ceremony_event(&e2).unwrap();
+        // Two shares land on the HIGHER transcript, reaching a threshold of 2.
+        for seed in [[3u8; 32], [4u8; 32]] {
+            let ev = crate::dkg::sign_ceremony(
+                &seed,
+                &crate::dkg::CeremonyOp::SignRound2 {
+                    signing: high,
+                    share: vec![0u8; 32],
+                },
+                &a.tracker.workspace_id,
+            );
+            a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        }
+
+        let events = a.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &a.tracker.workspace_id);
+        let chosen = a
+            .tracker
+            .canonical_signing_session(
+                &board,
+                &authority,
+                crate::dkg::SignTarget::SpaceOp,
+                &op_bytes,
+                2,
+            )
+            .unwrap();
+        assert_eq!(chosen, high, "a transcript at threshold is not abandoned");
+        assert_ne!(chosen, low);
+    }
+
+    /// D5 regression. A FROST nonce may produce a share for exactly one signing
+    /// package. Producing shares for two under one nonce gives two equations in
+    /// one unknown and yields the holder's signing share — so if the package has
+    /// moved since we committed, the signer must refuse rather than sign.
+    ///
+    /// Drives a real 2-of-2 group to the point where a nonce record exists, then
+    /// repoints the record's binding as a package change would, and asserts no
+    /// second share is ever published.
+    #[test]
+    fn a_nonce_bound_to_another_package_refuses_to_sign() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        // Elevate {A, B} to a 2-of-2 group recovery key.
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+
+        // B opens a break-glass recovery: this commits B's nonces.
+        let (resp, _) = b.tracker.space_recover_cmd();
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        let events = b.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &b.tracker.workspace_id);
+        let signing = *board.signing.keys().next().expect("B opened a request");
+        let raw = b
+            .tracker
+            .dkg_read(&signing, "nonce")
+            .expect("B committed nonces");
+        let mut pending: crate::dkg::PendingNonce = postcard::from_bytes(&raw).unwrap();
+
+        // Pin the record to a package B will never see — exactly what a shifted
+        // signer set or a changed message would produce.
+        pending.binding = [0xAB; 32];
+        b.tracker
+            .dkg_write(&signing, "nonce", &postcard::to_stdvec(&pending).unwrap())
+            .unwrap();
+
+        // A consents, so the signer set completes and B would otherwise sign.
+        let b_actor = b.tracker.my_actor().unwrap();
+        for _ in 0..4 {
+            sync_all(&mut b.tracker, &mut a.tracker);
+            sync_all(&mut a.tracker, &mut b.tracker);
+        }
+        let (resp, _) = a
+            .tracker
+            .space_recover_approve_cmd(signing.to_hex(), vec![b_actor.as_str().to_string()]);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+
+        // B published no share, and the nonce record survives — the refusal is
+        // the comparison, not the deletion, precisely so a crash between
+        // publishing and deleting cannot re-open the door.
+        let events = b.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &b.tracker.workspace_id);
+        let b_shares = board.signing[&signing]
+            .rounds
+            .iter()
+            .filter(|v| {
+                v.author == b.tracker.me
+                    && matches!(v.op, crate::dkg::CeremonyOp::SignRound2 { .. })
+            })
+            .count();
+        assert_eq!(
+            b_shares, 0,
+            "a nonce pinned to a different package must never produce a share"
+        );
+        assert!(
+            b.tracker.dkg_read(&signing, "nonce").is_some(),
+            "the record is kept for inspection rather than silently replaced"
+        );
+    }
+
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
     /// valid *device* signature — authentication was never the missing piece.
     /// Without an authorization from the recovery authority, no honest node may
