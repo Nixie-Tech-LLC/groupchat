@@ -39,6 +39,7 @@ pub mod node;
 pub mod presence;
 pub mod proto;
 pub mod registry;
+pub mod secretfs;
 pub mod serve;
 pub mod sync;
 pub mod tracker;

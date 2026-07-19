@@ -179,6 +179,16 @@ libc = "0.2"
 # inherit flag on our own stdio — `disinherit_stdio` in app.rs) and
 # `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (inherit exactly the
 # three handles we name — `daemon_spawn`), which std only exposes as an unstable
+    # `secretfs`: secrets are created with an explicit owner-only DACL rather
+    # than inheriting the parent's. std gives us no way to do that — there is no
+    # `DirBuilderExt` on Windows, and `OpenOptionsExt` exposes only CreateFileW's
+    # access/share/flags bits (`lpSecurityAttributes` is hardcoded null) — so the
+    # secret paths call CreateFileW/CreateDirectoryW directly.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    # DPAPI wrap for device-bound secrets (never for portable recovery keys).
+    "Win32_Security_Cryptography",
 # feature. Already present transitively (iroh/tokio); declared directly for those.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

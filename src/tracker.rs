@@ -313,28 +313,19 @@ fn mint_recovery() -> ([u8; 32], [u8; 32]) {
 /// so it is created **owner-only from the start** (never world-readable, even
 /// for an instant) and any permission error is propagated, never swallowed.
 fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
-    use std::io::Write;
     let home = store.home_path();
-    // Tighten the parent dir to owner-only on unix before writing the secret.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
-            .context("restrict store home permissions for recovery.key")?;
-    }
-    let path = home.join("recovery.key");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&path).context("create recovery.key")?;
-    f.write_all(data_encoding::HEXLOWER.encode(seed).as_bytes())
-        .context("write recovery.key")?;
-    f.sync_all().context("fsync recovery.key")?;
-    Ok(())
+    // Tighten the parent dir to owner-only before writing the secret.
+    crate::secretfs::create_private_dir(home)
+        .context("restrict store home permissions for recovery.key")?;
+    // Portable for the same reason as `space-recovery.key`: an actor-recovery
+    // key is useless if it cannot be carried to the device doing the recovering.
+    crate::secretfs::write_private(
+        &home.join("recovery.key"),
+        data_encoding::HEXLOWER.encode(seed).as_bytes(),
+        crate::secretfs::Create::New,
+        crate::secretfs::Wrap::Portable,
+    )
+    .context("write recovery.key")
 }
 
 /// Persist the workspace **break-glass recovery** secret beside the store as
@@ -342,27 +333,20 @@ fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
 /// created owner-only from the start and errors propagate. Elevating to a K-of-N
 /// group key later replaces this with per-holder DKG shares.
 fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result<()> {
-    use std::io::Write;
     let home = store.home_path();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))
-            .context("restrict store home permissions for space-recovery.key")?;
-    }
-    let path = home.join("space-recovery.key");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&path).context("create space-recovery.key")?;
-    f.write_all(data_encoding::HEXLOWER.encode(secret).as_bytes())
-        .context("write space-recovery.key")?;
-    f.sync_all().context("fsync space-recovery.key")?;
-    Ok(())
+    crate::secretfs::create_private_dir(home)
+        .context("restrict store home permissions for space-recovery.key")?;
+    // PORTABLE, deliberately. The operator is told to move this offline, so a
+    // device-bound wrap would make the copy in the safe unopenable — losing the
+    // workspace's last resort to protect it from a threat the file ACL already
+    // covers.
+    crate::secretfs::write_private(
+        &home.join("space-recovery.key"),
+        data_encoding::HEXLOWER.encode(secret).as_bytes(),
+        crate::secretfs::Create::New,
+        crate::secretfs::Wrap::Portable,
+    )
+    .context("write space-recovery.key")
 }
 
 /// Bootstrap a store from a join ticket — the `lait join` path (A§6/A§10).
@@ -2798,8 +2782,9 @@ impl Tracker {
     /// Load the workspace break-glass recovery seed held beside the store (the
     /// solo bootstrap key). `None` once elevated to a group key held as DKG shares.
     fn read_space_recovery_key(&self) -> Option<[u8; 32]> {
-        let hex =
-            std::fs::read_to_string(self.store.home_path().join("space-recovery.key")).ok()?;
+        let path = self.store.home_path().join("space-recovery.key");
+        let bytes = crate::secretfs::read_private(&path).ok().flatten()?;
+        let hex = String::from_utf8(bytes).ok()?;
         let raw = data_encoding::HEXLOWER_PERMISSIVE
             .decode(hex.trim().as_bytes())
             .ok()?;
@@ -3106,26 +3091,36 @@ impl Tracker {
     fn dkg_has(&self, session: &[u8; 16], label: &str) -> bool {
         self.dkg_path(session, label).exists()
     }
+    /// Read a ceremony artifact. An artifact that exists but cannot be
+    /// unwrapped is **logged at error** rather than folded into `None`: that
+    /// happens when a store is restored onto a different Windows account or
+    /// machine, and reporting it as "no share" would present the loss of a
+    /// holder's recovery capability as an ordinary absence.
     fn dkg_read(&self, session: &[u8; 16], label: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.dkg_path(session, label)).ok()
-    }
-    fn dkg_write(&self, session: &[u8; 16], label: &str, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let dir = self.store.home_path().join("dkg");
-        std::fs::create_dir_all(&dir).context("create dkg dir")?;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+        match crate::secretfs::read_private(&self.dkg_path(session, label)) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    "ceremony artifact {label} for session {} exists but could not be read: {e:#}",
+                    data_encoding::HEXLOWER.encode(session)
+                );
+                None
+            }
         }
-        let mut f = opts
-            .open(self.dkg_path(session, label))
-            .context("open dkg file")?;
-        f.write_all(bytes).context("write dkg file")?;
-        f.sync_all().context("fsync dkg file")?;
-        Ok(())
+    }
+    /// Write a ceremony artifact owner-only. Device-bound: shares, round secrets
+    /// and nonces belong to this holder on this machine and are never carried
+    /// elsewhere, unlike the break-glass keys (see [`crate::secretfs::Wrap`]).
+    fn dkg_write(&self, session: &[u8; 16], label: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.store.home_path().join("dkg");
+        crate::secretfs::create_private_dir(&dir).context("create dkg dir")?;
+        crate::secretfs::write_private(
+            &self.dkg_path(session, label),
+            bytes,
+            crate::secretfs::Create::Replace,
+            crate::secretfs::Wrap::DeviceBound,
+        )
+        .context("write dkg artifact")
     }
 
     /// Begin elevating the recovery authority to a `k`-of-N FROST group key over
@@ -3973,7 +3968,8 @@ impl Tracker {
 
     fn read_recovery_key(&self) -> Option<[u8; 32]> {
         let path = self.store.home_path().join("recovery.key");
-        let hex = std::fs::read_to_string(path).ok()?;
+        let bytes = crate::secretfs::read_private(&path).ok().flatten()?;
+        let hex = String::from_utf8(bytes).ok()?;
         let raw = data_encoding::HEXLOWER_PERMISSIVE
             .decode(hex.trim().as_bytes())
             .ok()?;
