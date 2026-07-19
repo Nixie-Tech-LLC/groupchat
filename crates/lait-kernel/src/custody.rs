@@ -148,6 +148,8 @@ pub struct PackageExpectation<'a> {
     pub leaf: &'a LeafId,
     /// The group public key this holder expects to be part of.
     pub group_key: &'a UserId,
+    /// The participant index this holder expects to occupy.
+    pub index: u16,
 }
 
 impl AuthoritySharePackage {
@@ -242,6 +244,17 @@ impl AuthoritySharePackage {
                         "the package's own public-key package derives a different group key"
                     ));
                 }
+                if f.index != expect.index {
+                    return Err(anyhow!(
+                        "this package is for participant {}, not {}",
+                        f.index,
+                        expect.index
+                    ));
+                }
+                // The decisive check: the PRIVATE material must actually work.
+                // Everything above validates the public half, which a corrupted
+                // or substituted secret would pass unchanged.
+                crate::dkg::validate_share(&f.key_share, &f.public_package, f.index)?;
             }
             SharePayload::GeneralAccess(_) => {
                 return Err(anyhow!(
@@ -553,6 +566,7 @@ mod tests {
             ceremony: "ceremony-1",
             leaf: &leaf,
             group_key: &group_key,
+            index: 1,
         };
         assert!(pkg.verify_and_open(&key, &good).is_ok());
 
@@ -599,6 +613,68 @@ mod tests {
                 }
             )
             .is_err());
+    }
+
+    /// A package whose private material does not work is refused, even though
+    /// every public-half check passes and the envelope opens cleanly.
+    ///
+    /// This is the shape that would otherwise produce an honest custody
+    /// attestation for a dead share — and, for an N-of-N arrangement, install an
+    /// authority on it.
+    #[test]
+    fn a_package_with_unusable_private_material_is_refused() {
+        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let (forged, pkp, group_key) = crate::dkg::tests_support::share_with_foreign_secret();
+        let device = crypto::user_from_seed(&[1u8; 32]);
+        let principal = PrincipalId::of_device(&device);
+        let leaf = LeafId::of_principal(&principal);
+        let config = AuthorityConfiguration::frost_threshold(&FrostThresholdConfig {
+            k: 2,
+            participants: vec![principal.clone()],
+        });
+        let authority = AuthorityId::new(group_key.clone(), &config);
+        let broken = SharePayload::Frost(FrostSharePayload {
+            key_share: forged,
+            public_package: pkp.clone(),
+            index: 1,
+        });
+        let pkg = AuthoritySharePackage::seal(
+            &ws,
+            &authority,
+            "ceremony-1",
+            &principal,
+            &leaf,
+            &broken,
+            &[SlotSpec::Passphrase {
+                passphrase: "pass".into(),
+                salt: [1u8; 16],
+                params: fast(),
+            }],
+        )
+        .unwrap();
+        let key = UnlockKey::Passphrase("pass".into());
+        // The public half is impeccable and the envelope opens.
+        assert_eq!(crate::dkg::group_key_of_package(&pkp).unwrap(), group_key);
+        assert!(pkg.open(&key).is_ok());
+        // Verification refuses it anyway.
+        let err = pkg
+            .verify_and_open(
+                &key,
+                &PackageExpectation {
+                    workspace: &ws,
+                    authority: &authority,
+                    ceremony: "ceremony-1",
+                    leaf: &leaf,
+                    group_key: &group_key,
+                    index: 1,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not correspond to its public half"),
+            "must reject unusable private material: {err}"
+        );
     }
 
     #[test]

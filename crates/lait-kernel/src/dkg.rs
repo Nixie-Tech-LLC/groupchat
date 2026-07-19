@@ -812,6 +812,63 @@ fn ser<T, E: std::fmt::Display>(r: std::result::Result<T, E>, what: &str) -> Res
 
 /// The group public key as a lait `UserId` (a plain Ed25519 key), from a DKG
 /// public-key package. This is the recovery authority the plane commits to.
+/// Check that a private key share is genuinely usable for `index` in the group
+/// described by `public_package`.
+///
+/// Deriving the group key from the public package proves the *public* half is
+/// intact and says nothing about the private half — a corrupted or substituted
+/// `key_share` paired with the correct package would sail through. For an
+/// indispensable arrangement that is the whole ballgame: the backup looks fine,
+/// the attestation is honest, and the share turns out unusable on the one day it
+/// is needed.
+///
+/// Four checks, of which the last is the one that matters:
+///
+/// 1. the share's identifier is the expected participant index;
+/// 2. it names the same group verifying key as the package;
+/// 3. its verifying share matches the one the package publishes for it;
+/// 4. **the verifying share re-derives from the private signing scalar.**
+///
+/// A `KeyPackage` stores the signing share and the verifying share side by side,
+/// so (3) alone would accept a package whose public half is pristine and whose
+/// secret has been swapped. (4) recomputes `s·G` and is what actually binds the
+/// secret to the group.
+pub fn validate_share(key_share: &[u8], public_package: &[u8], index: u16) -> Result<()> {
+    let kp = ser(
+        frost::keys::KeyPackage::deserialize(key_share),
+        "deserialize key package",
+    )?;
+    let pkp = ser(
+        frost::keys::PublicKeyPackage::deserialize(public_package),
+        "deserialize public key package",
+    )?;
+    let expected = ident(index)?;
+    if *kp.identifier() != expected {
+        return Err(anyhow!(
+            "this share is for participant {:?}, not index {index}",
+            kp.identifier()
+        ));
+    }
+    if kp.verifying_key() != pkp.verifying_key() {
+        return Err(anyhow!("this share belongs to a different group"));
+    }
+    let published = pkp
+        .verifying_shares()
+        .get(kp.identifier())
+        .ok_or_else(|| anyhow!("the group does not publish a share for this participant"))?;
+    if published != kp.verifying_share() {
+        return Err(anyhow!(
+            "this share's public half does not match what the group publishes for it"
+        ));
+    }
+    if frost::keys::VerifyingShare::from(*kp.signing_share()) != *kp.verifying_share() {
+        return Err(anyhow!(
+            "this share's secret does not correspond to its public half — the private material is corrupt or substituted"
+        ));
+    }
+    Ok(())
+}
+
 /// The group key **derived** from a serialized public-key package.
 ///
 /// The authority a `Rotate` installs must come from here, never from a stored
@@ -1013,6 +1070,27 @@ pub(crate) mod tests_support {
     /// Per-participant `(key_share, public_key_package)`, keyed by index.
     pub type Holders = BTreeMap<u16, (Vec<u8>, Vec<u8>)>;
 
+    /// A key package for participant 1 whose identifier, verifying share and
+    /// group key are all correct, but whose **secret** belongs to participant 2.
+    ///
+    /// This is the adversarial shape that every public-half check passes: the
+    /// only thing distinguishing it from a good share is that `s·G` no longer
+    /// equals the published verifying share. Returns the forged share, the
+    /// matching public package, and the group key.
+    pub fn share_with_foreign_secret() -> (Vec<u8>, Vec<u8>, UserId) {
+        let (holders, group) = run_dkg(3, 2);
+        let mine = frost::keys::KeyPackage::deserialize(&holders[&1].0).unwrap();
+        let theirs = frost::keys::KeyPackage::deserialize(&holders[&2].0).unwrap();
+        let forged = frost::keys::KeyPackage::new(
+            *mine.identifier(),
+            *theirs.signing_share(),
+            *mine.verifying_share(),
+            *mine.verifying_key(),
+            *mine.min_signers(),
+        );
+        (forged.serialize().unwrap(), holders[&1].1.clone(), group)
+    }
+
     /// Run a full dealer-free `k`-of-`n` DKG through the byte API.
     pub fn run_dkg(n: u16, k: u16) -> (Holders, UserId) {
         let ids: Vec<u16> = (1..=n).collect();
@@ -1118,6 +1196,32 @@ mod tests {
             .as_slice()
             .try_into()
             .ok()
+    }
+
+    /// The check that actually binds a secret to its group. A `KeyPackage`
+    /// stores the signing share and verifying share side by side, so comparing
+    /// the verifying share against the published one accepts a package whose
+    /// public half is pristine and whose secret has been swapped. Only
+    /// re-deriving `s·G` catches that.
+    #[test]
+    fn a_share_whose_secret_does_not_match_its_public_half_is_rejected() {
+        let (holders, _) = tests_support::run_dkg(3, 2);
+        assert!(validate_share(&holders[&1].0, &holders[&1].1, 1).is_ok());
+
+        let (forged, pkp, _) = tests_support::share_with_foreign_secret();
+        let err = validate_share(&forged, &pkp, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("does not correspond to its public half"),
+            "must catch the swapped secret specifically: {err}"
+        );
+    }
+
+    /// A genuine share presented under the wrong index is refused.
+    #[test]
+    fn a_share_validated_against_the_wrong_index_is_rejected() {
+        let (holders, _) = tests_support::run_dkg(3, 2);
+        assert!(validate_share(&holders[&2].0, &holders[&2].1, 2).is_ok());
+        assert!(validate_share(&holders[&2].0, &holders[&2].1, 1).is_err());
     }
 
     // ---- transcript identity ----

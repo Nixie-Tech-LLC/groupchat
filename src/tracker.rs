@@ -3525,6 +3525,14 @@ impl Tracker {
                 None,
             );
         }
+        if !self.rotation_can_complete(&participants) {
+            return (
+                Response::err(
+                    "too few of the current holders are in the proposed arrangement: installing the result needs the current group to sign the rotation, and only a participant of the new ceremony can derive the key it installs. Include at least the current threshold of existing holders.",
+                ),
+                None,
+            );
+        }
         // Sign the proposal FIRST: its id is the hash of the signed node, so it
         // does not exist until now. `nonce` keeps two identical elevations by
         // the same initiator from colliding — Ed25519 signing is deterministic,
@@ -3782,6 +3790,22 @@ impl Tracker {
                 None,
             );
         }
+        // A holder must not authorize a ceremony that cannot be installed. The
+        // proposer checks this too, but a hostile or stale proposer does not, and
+        // the cost of being wrong is a permanently stalled rotation.
+        let proposed: Vec<UserId> = cfg
+            .participants
+            .iter()
+            .filter_map(|p| p.as_device())
+            .collect();
+        if !self.rotation_can_complete(&proposed) {
+            return (
+                Response::err(
+                    "refusing to authorize: too few of the current holders are in the proposed arrangement, so the resulting key could never be installed",
+                ),
+                None,
+            );
+        }
         if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
             return (Response::err(format!("{e:#}")), None);
         }
@@ -3927,6 +3951,41 @@ impl Tracker {
         self.dkg_manifests().into_iter().find_map(|(id, m)| {
             (self.group_key_of_transcript(&id).as_ref() == Some(key)).then(|| m.configuration.id())
         })
+    }
+
+    /// Whether a proposed participant set leaves the current group able to
+    /// install the result.
+    ///
+    /// Installing a rotation needs the *current* authority to sign it, and a
+    /// signer only reaches that point if it can derive the candidate key —
+    /// which requires holding the new ceremony's public package, i.e. being one
+    /// of its participants. So at least `k_current` members of the current
+    /// arrangement must also be in the proposed one.
+    ///
+    /// Checked at authorization time because the failure is otherwise silent and
+    /// terminal: a ceremony with too little overlap authorizes cleanly, runs the
+    /// whole DKG, collects custody attestations, and then stalls forever at
+    /// installation with every participant believing it succeeded.
+    fn rotation_can_complete(&self, proposed: &[UserId]) -> bool {
+        let Some(current) = self.standing_dkg_session() else {
+            // A solo authority signs the rotation by itself; no overlap needed.
+            return true;
+        };
+        let Some(cfg) = self
+            .dkg_manifest(&current)
+            .and_then(|m| m.configuration.as_frost_threshold())
+        else {
+            // Cannot determine the current arrangement, so cannot judge. Let the
+            // ceremony proceed rather than block on our own ignorance.
+            return true;
+        };
+        let overlap = cfg
+            .participants
+            .iter()
+            .filter_map(|p| p.as_device())
+            .filter(|d| proposed.contains(d))
+            .count();
+        overlap >= cfg.k as usize
     }
 
     /// Whether `dkg`'s arrangement is **indispensable**: every holder is
@@ -4096,6 +4155,7 @@ impl Tracker {
             ceremony: &dkg.to_hex(),
             leaf: &leaf,
             group_key: &group_key,
+            index: index as u16 + 1,
         };
         if let Err(e) =
             restored.verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
@@ -4136,17 +4196,186 @@ impl Tracker {
         )
     }
 
+    /// Restore a share from a portable package written by
+    /// [`Self::space_custody_export_cmd`].
+    ///
+    /// This is the half that makes the backup mean anything. Without it the
+    /// package preserves the material and the product still cannot resume
+    /// signing after an account or machine loss — which is not what "DPAPI loss
+    /// does not destroy an owner" claims.
+    ///
+    /// Refuses to replace a share that is already readable unless `force`: the
+    /// common case for running this by mistake is a working device, and
+    /// overwriting good material with an older package would turn a typo into
+    /// the loss it exists to prevent.
+    pub fn space_custody_import_cmd(
+        &mut self,
+        path: String,
+        passphrase: String,
+        force: bool,
+    ) -> (Response, Option<DirtySet>) {
+        let bytes = match crate::secretfs::read_private(std::path::Path::new(&path)) {
+            Ok(Some(b)) => b,
+            Ok(None) => return (Response::not_found(format!("no package at {path}")), None),
+            Err(e) => return (Response::err(format!("reading {path}: {e}")), None),
+        };
+        let package: crate::custody::AuthoritySharePackage = match postcard::from_bytes(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    Response::err(format!("that file is not a share package: {e}")),
+                    None,
+                )
+            }
+        };
+        if package.workspace != self.workspace_id {
+            return (
+                Response::err("that package belongs to a different workspace"),
+                None,
+            );
+        }
+        // Resolve the ceremony it claims, from the board — never from the
+        // package. A package names its own ceremony; that is a claim, not proof.
+        let Some(dkg) = crate::dkg::TranscriptId::parse_hex(&package.ceremony) else {
+            return (Response::err("that package names no valid ceremony"), None);
+        };
+        let events = self.membership.ceremony_events();
+        let board = self.ceremony_board(&events);
+        let Some(t) = board.dkg.get(&dkg) else {
+            return (
+                Response::err(
+                    "that ceremony is not on this device's board — sync the workspace first",
+                ),
+                None,
+            );
+        };
+        let Some((_, _, participants)) = self.accepted_proposal(&dkg, t) else {
+            return (
+                Response::err("that ceremony is not accepted here — it may not be authorized"),
+                None,
+            );
+        };
+        let Some(index) = participants.iter().position(|p| p == &self.me) else {
+            return (
+                Response::err("this device is not a participant of that ceremony"),
+                None,
+            );
+        };
+        let index = index as u16 + 1;
+        let Some(manifest) = self.dkg_manifest(&dkg) else {
+            return (
+                Response::err("no acceptance record for that ceremony"),
+                None,
+            );
+        };
+        // Refuse to clobber usable material.
+        if !force && matches!(self.dkg_artifact(&dkg, "share"), ArtifactRead::Present(_)) {
+            return (
+                Response::err(
+                    "this device already holds a readable share for that ceremony — pass --force only if you mean to replace it",
+                ),
+                None,
+            );
+        }
+        // The expected group key comes from the board's ceremony where possible,
+        // so a package cannot introduce a group this device never accepted. When
+        // the local public package is gone (the very case this command exists
+        // for), fall back to the package's own — still bound by the authority
+        // and workspace checks, and validated against the private half below.
+        let expected_group = match self.dkg_artifact(&dkg, "pkp") {
+            ArtifactRead::Present(pkp) => match crate::dkg::group_key_of_package(&pkp) {
+                Ok(k) => k,
+                Err(e) => {
+                    return (
+                        Response::err(format!("local public package unusable: {e}")),
+                        None,
+                    )
+                }
+            },
+            _ => package.authority.public_key.clone(),
+        };
+        let authority =
+            crate::authority::AuthorityId::new(expected_group.clone(), &manifest.configuration);
+        let principal = crate::authority::PrincipalId::of_device(&self.me);
+        let leaf = crate::authority::LeafId::of_principal(&principal);
+        let expect = crate::custody::PackageExpectation {
+            workspace: &self.workspace_id,
+            authority: &authority,
+            ceremony: &package.ceremony,
+            leaf: &leaf,
+            group_key: &expected_group,
+            index,
+        };
+        // `verify_and_open` performs the private-half validation, so a package
+        // that opens but carries unusable material never reaches storage.
+        let payload = match package
+            .verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
+        {
+            Ok(p) => p,
+            Err(e) => return (Response::err(format!("{e:#}")), None),
+        };
+        let crate::custody::SharePayload::Frost(f) = payload else {
+            return (
+                Response::err("that package carries a share this build cannot use"),
+                None,
+            );
+        };
+        // Write the public package first: if the process dies between the two,
+        // a share without its package is unusable and looks broken, whereas a
+        // package without a share is simply an absent share — the recoverable
+        // side of the failure.
+        if let Err(e) = self.dkg_write_portable(&dkg, "pkp", &f.public_package) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        if let Err(e) = self.dkg_write(&dkg, "share", &f.key_share) {
+            return (Response::err(format!("{e:#}")), None);
+        }
+        // Prove the restore actually worked by reading back what was stored,
+        // rather than trusting the write. This is the same discipline as export:
+        // the failure being guarded is one that only shows up on re-read.
+        let restored = match (
+            self.dkg_artifact(&dkg, "share"),
+            self.dkg_artifact(&dkg, "pkp"),
+        ) {
+            (ArtifactRead::Present(s), ArtifactRead::Present(p)) => (s, p),
+            _ => {
+                return (
+                    Response::err("the restored share could not be read back"),
+                    None,
+                )
+            }
+        };
+        if let Err(e) = crate::dkg::validate_share(&restored.0, &restored.1, index) {
+            return (
+                Response::err(format!("the restored share does not validate: {e:#}")),
+                None,
+            );
+        }
+        let _ = self.dkg_advance();
+        (
+            Response::Ok {
+                message: Some(format!(
+                    "restored and verified your share for ceremony {} — this device can take part in recovery again",
+                    dkg.to_hex()
+                )),
+            },
+            Some(DirtySet::catalog(CatalogScope::Acl)),
+        )
+    }
+
     /// What this device can say about recovery right now.
     pub fn recovery_status(&self) -> RecoveryStatus {
         let authority = self.current_authority();
-        let scheme = authority
-            .as_ref()
-            .and_then(|_| self.active_dkg_session())
+        // Shape describes the STANDING arrangement. Deriving it from a session
+        // we can use would report a fictitious 1-of-1 for exactly the holder
+        // whose share has gone missing — the case where the real shape matters
+        // most, because it says whether anyone else can still recover.
+        let standing = self.standing_dkg_session();
+        let scheme = standing
             .and_then(|id| self.dkg_manifest(&id))
             .map(|m| m.configuration.scheme)
             .unwrap_or(crate::authority::AuthorityScheme::Single);
-        let (k, n) = self
-            .active_dkg_session()
+        let (k, n) = standing
             .and_then(|id| self.dkg_manifest(&id))
             .and_then(|m| m.configuration.as_frost_threshold())
             .map(|c| (c.k, c.participants.len() as u16))
@@ -4169,14 +4398,13 @@ impl Tracker {
             .collect();
         // Worst state wins: an unusable share outranks an unbacked one, which
         // outranks a healthy one.
-        let mut state =
-            if self.read_space_recovery_key().is_some() && self.active_dkg_session().is_none() {
-                LocalCustodyState::Ready
-            } else {
-                // Anyone else starts as not-a-holder and is upgraded by whatever
-                // shares they turn out to hold.
-                LocalCustodyState::NotAHolder
-            };
+        let mut state = if self.read_space_recovery_key().is_some() && standing.is_none() {
+            LocalCustodyState::Ready
+        } else {
+            // Anyone else starts as not-a-holder and is upgraded by whatever
+            // shares they turn out to hold.
+            LocalCustodyState::NotAHolder
+        };
         for id in &mine {
             match self.dkg_artifact(id, "share") {
                 ArtifactRead::Unreadable(e) => {
@@ -4210,9 +4438,13 @@ impl Tracker {
                 ArtifactRead::Missing => {
                     // Only a gap in the STANDING authority is a missing share;
                     // mid-DKG absence is ordinary progress, not a fault.
-                    if Some(*id) == self.active_dkg_session()
-                        && state == LocalCustodyState::NotAHolder
-                    {
+                    //
+                    // This compares against the standing session rather than the
+                    // usable one. `active_dkg_session` requires a readable share,
+                    // so asking it here could never be true when the share is
+                    // missing — the condition was unreachable, and a holder whose
+                    // standing share disappeared reported as "not a holder".
+                    if Some(*id) == standing && state == LocalCustodyState::NotAHolder {
                         state = LocalCustodyState::Missing;
                     }
                 }
@@ -4402,29 +4634,44 @@ impl Tracker {
         postcard::from_bytes(&self.dkg_read(dkg, "manifest")?).ok()
     }
 
-    /// The DKG transcript whose derived group key is the workspace's *current*
-    /// recovery authority — i.e. the share this device would sign a break-glass
-    /// `Recover` with. `None` if this device holds no share for the live group.
+    /// The DKG transcript whose group key is the workspace's **standing**
+    /// recovery authority, whether or not this device can use its share.
     ///
-    /// Resolved through the board, not by scanning the filesystem: the group key
-    /// is *derived* from the stored public-key package rather than read from a
-    /// file that could be swapped.
-    fn active_dkg_session(&self) -> Option<crate::dkg::TranscriptId> {
+    /// Separate from [`Self::active_dkg_session`] because conflating them makes
+    /// two states unreportable. The old single accessor required a readable
+    /// share, so a holder whose standing share went missing or unreadable
+    /// resolved to `None` and was reported as "not a holder" — the one answer
+    /// that is definitely wrong — and the arrangement's shape fell back to a
+    /// fictitious 1-of-1.
+    ///
+    /// Resolution does not depend on the share: the public-key package is stored
+    /// portable precisely so a device that has lost its secret can still say
+    /// which group it belongs to. Failing that, an acceptance record names the
+    /// configuration.
+    fn standing_dkg_session(&self) -> Option<crate::dkg::TranscriptId> {
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        let events = self.membership.ceremony_events();
-        let board = self.ceremony_board(&events);
-        board.dkg.keys().copied().find(|id| {
-            self.dkg_read(id, "share").is_some()
-                && self
-                    .group_key_of_transcript(id)
-                    .as_ref()
-                    .and_then(crate::space::recovery_commit)
-                    == Some(cur.recovery_commit)
+        self.dkg_manifests().into_iter().find_map(|(id, _)| {
+            (self
+                .group_key_of_transcript(&id)
+                .as_ref()
+                .and_then(crate::space::recovery_commit)
+                == Some(cur.recovery_commit))
+            .then_some(id)
         })
+    }
+
+    /// The standing transcript **whose share this device can actually use**.
+    ///
+    /// This is the signing accessor: everything that needs to produce a
+    /// signature needs a readable share, and a holder that cannot read its own
+    /// share must not be treated as able to contribute.
+    fn active_dkg_session(&self) -> Option<crate::dkg::TranscriptId> {
+        let id = self.standing_dkg_session()?;
+        matches!(self.dkg_artifact(&id, "share"), ArtifactRead::Present(_)).then_some(id)
     }
 
     /// This transcript's group key, recomputed from the stored public-key
@@ -8308,6 +8555,222 @@ mod tests {
             nodes[0].tracker.recovery_status().local_custody,
             LocalCustodyState::Ready,
             "and its holders are Ready, not BackupUnverified"
+        );
+    }
+
+    /// Finding 2: the backup must be *restorable*, not merely preserved.
+    ///
+    /// Simulates the case the whole custody design exists for: a holder loses
+    /// its local material (account or machine gone) and comes back with the
+    /// portable package. Before the import path existed, the share survived and
+    /// the product still could not resume signing with it.
+    #[test]
+    fn a_lost_share_is_restored_from_its_portable_package() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let dkg = b.tracker.standing_dkg_session().expect("standing group");
+
+        // B exports a portable package, then loses its local material.
+        let pkg_path = b.home.join("rescue.pkg");
+        let (resp, _) = b.tracker.space_custody_export_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        // Only the SHARE goes. The public-key package is stored portable exactly
+        // so it survives an account change — which is what lets this device still
+        // say which group it belongs to after losing the ability to sign for it.
+        std::fs::remove_file(b.tracker.dkg_path(&dkg, "share")).unwrap();
+
+        // Finding 3: the loss is reported as Missing, not as "not a holder",
+        // and the arrangement's real shape survives the loss.
+        let st = b.tracker.recovery_status();
+        assert_eq!(
+            st.local_custody,
+            LocalCustodyState::Missing,
+            "a holder whose standing share vanished is Missing, not NotAHolder"
+        );
+        assert_eq!(
+            (st.k, st.n),
+            (2, 2),
+            "the standing arrangement's shape does not collapse to 1-of-1"
+        );
+        assert!(
+            b.tracker.active_dkg_session().is_none(),
+            "and it cannot sign"
+        );
+
+        // The package brings it back.
+        let (resp, _) = b.tracker.space_custody_import_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+            false,
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "restore: {resp:?}");
+        assert_eq!(
+            b.tracker.recovery_status().local_custody,
+            LocalCustodyState::Ready
+        );
+        assert_eq!(
+            b.tracker.active_dkg_session(),
+            Some(dkg),
+            "the restored holder can sign again"
+        );
+
+        // Re-importing over usable material is refused unless forced, so a
+        // mistaken run cannot turn a working device into the loss it prevents.
+        let (resp, _) = b.tracker.space_custody_import_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+            false,
+        );
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "must not clobber a readable share: {resp:?}"
+        );
+        let (resp, _) = b.tracker.space_custody_import_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+            true,
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "forced: {resp:?}");
+
+        // A wrong passphrase restores nothing.
+        let (resp, _) = b.tracker.space_custody_import_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "not-the-right-passphrase".into(),
+            true,
+        );
+        assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+
+        // Losing the public package too is a harder case, and the honest answer
+        // is that this device can no longer tell which group it belonged to —
+        // so it reports NotAHolder rather than inventing a shape. The package
+        // still restores it, because the package carries its own public half.
+        std::fs::remove_file(b.tracker.dkg_path(&dkg, "share")).unwrap();
+        std::fs::remove_file(b.tracker.dkg_path(&dkg, "pkp")).unwrap();
+        assert_eq!(
+            b.tracker.recovery_status().local_custody,
+            LocalCustodyState::NotAHolder,
+            "with no public package there is nothing to attribute the device to"
+        );
+        let (resp, _) = b.tracker.space_custody_import_cmd(
+            pkg_path.to_string_lossy().to_string(),
+            "a-sufficiently-long-passphrase".into(),
+            true,
+        );
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        assert_eq!(
+            b.tracker.active_dkg_session(),
+            Some(dkg),
+            "the package carries its own public half, so it restores both"
+        );
+    }
+
+    /// Finding 4: a rotation whose new arrangement excludes too many current
+    /// holders can never be installed, because only a participant of the new
+    /// ceremony can derive the key the current group must sign for.
+    ///
+    /// It must be refused at authorization. Otherwise it authorizes cleanly,
+    /// runs the whole DKG, collects custody attestations, and stalls forever at
+    /// the last step with everyone believing it worked.
+    #[test]
+    fn a_rotation_that_could_never_install_is_refused_up_front() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let proof = a.tracker.founding_proof().unwrap();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(b_user.clone(), b_seed, &a_ws, &proof);
+        let c_seed = [31u8; 32];
+        let c_user = user_from_seed(c_seed);
+        let mut c = new_joiner_node_as(c_user.clone(), c_seed, &a_ws, &proof);
+        let d_seed = [41u8; 32];
+        let d_user = user_from_seed(d_seed);
+        let mut d = new_joiner_node_as(d_user.clone(), d_seed, &a_ws, &proof);
+        for incept in [
+            b.tracker.self_inception().unwrap(),
+            c.tracker.self_inception().unwrap(),
+            d.tracker.self_inception().unwrap(),
+        ] {
+            a.tracker
+                .admit_member(&incept, vec![Grant::Admin, Grant::Write]);
+        }
+        for other in [&mut b, &mut c, &mut d] {
+            sync_all(&mut a.tracker, &mut other.tracker);
+        }
+
+        // A 2-of-2 group over {A, B}.
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        attest_custody(&mut a, "a");
+        attest_custody(&mut b, "b");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        assert!(
+            a.tracker.standing_dkg_session().is_some(),
+            "group installed"
+        );
+
+        // Now propose a handover to {C, D} — disjoint from the current holders.
+        // The current group is 2-of-2, so it needs BOTH of {A, B} to sign the
+        // rotation, and neither would be able to derive the new key.
+        let (resp, _) = a.tracker.space_elevate_cmd(
+            vec![c_user.as_str().to_string(), d_user.as_str().to_string()],
+            2,
+        );
+        match resp {
+            Response::Error { message, .. } => assert!(
+                message.contains("current holders"),
+                "must explain why it cannot work: {message}"
+            ),
+            other => panic!("a disjoint handover must be refused, got {other:?}"),
+        }
+
+        // Keeping one current holder is still not enough for a 2-of-2: two
+        // signatures are needed and only one signer could derive the key.
+        let (resp, _) = a.tracker.space_elevate_cmd(
+            vec![b_user.as_str().to_string(), c_user.as_str().to_string()],
+            2,
+        );
+        // {A, B, C}: both current holders are present, so this one CAN install.
+        assert!(
+            matches!(resp, Response::Ok { .. }),
+            "an overlapping arrangement is allowed: {resp:?}"
         );
     }
 
