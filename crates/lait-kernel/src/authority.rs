@@ -195,8 +195,15 @@ impl PrincipalId {
 pub struct LeafId(String);
 
 impl LeafId {
+    /// The leaf of a flat-FROST principal, where principal and leaf coincide.
+    /// General-access expansion (C2) instead mints per-occurrence leaf ids.
     pub fn of_principal(p: &PrincipalId) -> Self {
         LeafId(p.0.clone())
+    }
+    /// A leaf id from an opaque string (a content-addressed hex id minted by C2
+    /// expansion). Not validated — the caller owns the derivation.
+    pub fn from_string(s: String) -> Self {
+        LeafId(s)
     }
     pub fn as_str(&self) -> &str {
         &self.0
