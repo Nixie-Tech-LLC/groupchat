@@ -649,6 +649,15 @@ pub struct StatusInfo {
     /// host-side nudge to run `members approve`. Only meaningful for an admin.
     #[serde(default)]
     pub pending_requests: usize,
+    /// Recovery shares this device holds that exist but cannot be used.
+    ///
+    /// Structured, not preformatted: the CLI and web layers render it
+    /// differently, and a rendered string would force one of them to parse
+    /// prose. Persistent rather than recovery-only — an operator must be able to
+    /// learn their founder share is unusable *before* the day they need it,
+    /// which is exactly the day it is too late to fix.
+    #[serde(default)]
+    pub degraded_recovery: Vec<crate::tracker::DegradedRecoveryHolder>,
 }
 
 /// What probing a home's control channel found. These three must be told apart

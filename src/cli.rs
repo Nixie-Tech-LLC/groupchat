@@ -1468,6 +1468,33 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
                 );
                 println!("   review: `lait members requests`   approve: `lait members approve <id> --as <name>`");
             }
+            // A degraded recovery holder is reported on every status, not only
+            // when break-glass is attempted: by then it is too late to fix.
+            for h in &s.degraded_recovery {
+                let why = match &h.reason {
+                    crate::tracker::RecoveryArtifactFailure::Undecryptable(_) => {
+                        "it was protected under another Windows account or machine"
+                    }
+                    crate::tracker::RecoveryArtifactFailure::Io(_) => {
+                        "it is present but could not be read"
+                    }
+                };
+                let scope = match h.is_current_authority {
+                    Some(true) => "the workspace recovery key",
+                    _ => "a recovery key (group unidentified)",
+                };
+                println!();
+                println!(
+                    "{}",
+                    paint(
+                        out.color,
+                        ansi::YELLOW,
+                        &format!("⚠ your share of {scope} is unusable — {why}.")
+                    )
+                );
+                println!("   transcript: {}", h.transcript);
+                println!("   you cannot take part in recovery from this device; other threshold holders still can.");
+            }
             0
         }
         Response::Diagnosis(v) => {

@@ -1615,6 +1615,7 @@ impl Node {
                     )
                 };
                 let pending_requests = self.pending_join_requests().len();
+                let degraded_recovery = self.tracker.lock().unwrap().degraded_recovery_holders();
                 Ok(Response::Status(Box::new(StatusInfo {
                     id: self.shared.my_id.to_string(),
                     nick: self.shared.nick(),
@@ -1625,6 +1626,7 @@ impl Node {
                     projects,
                     membership,
                     pending_requests,
+                    degraded_recovery,
                 })))
             }
             Request::Diagnose { expected_workspace } => {

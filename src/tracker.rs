@@ -314,14 +314,45 @@ fn mint_recovery() -> ([u8; 32], [u8; 32]) {
 /// for an instant) and any permission error is propagated, never swallowed.
 /// The state of a device-local ceremony artifact.
 ///
-/// Three states, not two: an artifact that is present but undecryptable under
-/// this Windows identity is neither usable nor absent, and reporting it as
-/// absent would hide the loss of a holder's recovery capability.
+/// Three states, not two: an artifact that is present but unreadable is neither
+/// usable nor absent, and reporting it as absent would hide the loss of a
+/// holder's recovery capability.
+///
+/// `Unreadable` keeps the **typed** cause rather than a rendered string. An
+/// access-denied error, a corrupt file or a transient I/O fault must not be
+/// diagnosed as "this belongs to another Windows account": that is one specific
+/// cause among several, and guessing it sends an operator to the wrong remedy.
 #[derive(Debug)]
 pub enum ArtifactRead {
     Missing,
     Present(Vec<u8>),
-    Unreadable(String),
+    Unreadable(crate::secretfs::SecretError),
+}
+
+/// Why a recovery artifact could not be produced, for structured reporting.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum RecoveryArtifactFailure {
+    /// Wrapped for a different Windows account or machine. The bytes are intact;
+    /// this identity cannot open them.
+    Undecryptable(String),
+    /// Present but could not be read at all — permissions, corruption, I/O.
+    Io(String),
+}
+
+/// A holder whose share exists on this device but cannot be used.
+///
+/// Structured rather than preformatted, so status, diagnosis and the CLI can
+/// each render it as they see fit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DegradedRecoveryHolder {
+    /// The DKG transcript whose share is unusable.
+    pub transcript: String,
+    pub reason: RecoveryArtifactFailure,
+    /// `Some(true)` when this transcript IS the standing recovery authority,
+    /// `None` when currency could not be established (the public-key package
+    /// was itself unreadable).
+    pub is_current_authority: Option<bool>,
 }
 
 fn persist_recovery_key(store: &Store, seed: &[u8; 32]) -> Result<()> {
@@ -2833,23 +2864,39 @@ impl Tracker {
             return self.space_recover_group(&cur);
         }
         // Distinguish "this device never held a share" from "the share is right
-        // here and Windows will not decrypt it". Collapsing those would tell a
-        // holder to look elsewhere when the material they need is on the disk in
-        // front of them, protected under an account they no longer have.
-        let unreadable = self.unreadable_shares();
-        if !unreadable.is_empty() {
-            let detail = unreadable
+        // here and cannot be opened". Collapsing those would send a holder to
+        // look elsewhere for material sitting on the disk in front of them.
+        let degraded = self.degraded_recovery_holders();
+        if !degraded.is_empty() {
+            let detail = degraded
                 .iter()
-                .map(|(id, why)| format!("  transcript {id}: {why}"))
+                .map(|h| {
+                    // The cause decides the remedy, so it must not be guessed:
+                    // an I/O or permissions fault is not an account mismatch.
+                    let why = match &h.reason {
+                        RecoveryArtifactFailure::Undecryptable(m) => {
+                            format!("protected under another Windows account or machine ({m})")
+                        }
+                        RecoveryArtifactFailure::Io(m) => {
+                            format!("present but could not be read ({m})")
+                        }
+                    };
+                    let scope = match h.is_current_authority {
+                        Some(true) => "the current recovery key",
+                        // Unproven currency is reported as such rather than
+                        // asserted either way.
+                        None => "a recovery key whose group could not be identified",
+                        Some(false) => unreachable!("superseded groups are filtered out"),
+                    };
+                    format!("  transcript {}: {scope} — {why}", h.transcript)
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             return (
                 Response::err(format!(
-                    "this device has a FROST share for the workspace recovery key, but \
-                     cannot decrypt it: the share was protected under another Windows \
-                     account or machine.\n{detail}\nThis holder is unavailable rather \
-                     than absent — the other threshold holders can still recover the \
-                     workspace if enough of them remain."
+                    "this device holds a FROST share that cannot be used:\n{detail}\n\
+                     This holder is unavailable rather than absent — the other threshold \
+                     holders can still recover the workspace if enough of them remain."
                 )),
                 None,
             );
@@ -3235,7 +3282,7 @@ impl Tracker {
                     "ceremony artifact {label} for transcript {} is present but unreadable: {e}",
                     t.to_hex()
                 );
-                ArtifactRead::Unreadable(e.to_string())
+                ArtifactRead::Unreadable(e)
             }
         }
     }
@@ -3250,21 +3297,63 @@ impl Tracker {
         }
     }
 
-    /// Every transcript on this device holding a share that exists but cannot be
-    /// decrypted, with the reason. Empty in the normal case.
+    /// Holders on this device whose share exists but cannot be used, restricted
+    /// to transcripts that are — or might be — the workspace's **current**
+    /// recovery authority.
     ///
-    /// This is the operator-facing signal for the DPAPI custody hazard: a store
-    /// restored onto another Windows account keeps the bytes and loses the
-    /// ability to use them, and nothing else in the system would say so.
-    pub fn unreadable_shares(&self) -> Vec<(String, String)> {
+    /// The currency check matters: an unreadable share from a superseded group
+    /// is not a recovery problem, so announcing "this device has a share for the
+    /// workspace recovery key" on its account would be false. Candidates are
+    /// filtered through: public-key package, derived group key, recovery commit,
+    /// standing RootState.
+    ///
+    /// A transcript whose package cannot be read yields `is_current_authority`
+    /// of `None` and is still reported: we cannot prove it is live, but nor can
+    /// we rule it out, and dropping the one artifact an operator needs to hear
+    /// about would be the worse error.
+    pub fn degraded_recovery_holders(&self) -> Vec<DegradedRecoveryHolder> {
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
         let events = self.membership.ceremony_events();
         let board = self.ceremony_board(&events);
         board
             .dkg
             .keys()
-            .filter_map(|id| match self.dkg_artifact(id, "share") {
-                ArtifactRead::Unreadable(why) => Some((id.to_hex(), why)),
-                _ => None,
+            .filter_map(|id| {
+                let reason = match self.dkg_artifact(id, "share") {
+                    ArtifactRead::Unreadable(crate::secretfs::SecretError::Undecryptable(m)) => {
+                        RecoveryArtifactFailure::Undecryptable(m)
+                    }
+                    ArtifactRead::Unreadable(crate::secretfs::SecretError::Io(e)) => {
+                        RecoveryArtifactFailure::Io(e.to_string())
+                    }
+                    _ => return None,
+                };
+                // Currency is DERIVED from the public-key package, never trusted
+                // from a file naming the group key.
+                let is_current_authority = match self.dkg_artifact(id, "pkp") {
+                    ArtifactRead::Present(pkp) => Some(
+                        crate::dkg::group_key_of_package(&pkp)
+                            .ok()
+                            .and_then(|g| crate::space::recovery_commit(&g))
+                            == Some(cur.recovery_commit),
+                    ),
+                    _ => None,
+                };
+                // A share we can PROVE belongs to a superseded group is not a
+                // recovery problem: it could not recover this workspace even if
+                // it were readable, so reporting it would be false.
+                if is_current_authority == Some(false) {
+                    return None;
+                }
+                Some(DegradedRecoveryHolder {
+                    transcript: id.to_hex(),
+                    reason,
+                    is_current_authority,
+                })
             })
             .collect()
     }
@@ -3282,6 +3371,26 @@ impl Tracker {
         )
         .context("write dkg artifact")
     }
+    /// Write a ceremony artifact owner-only but **portable** - no device
+    /// binding. For public material that must stay legible after a store is
+    /// restored onto another account (see [`crate::secretfs::Wrap::Portable`]).
+    fn dkg_write_portable(
+        &self,
+        t: &crate::dkg::TranscriptId,
+        label: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let dir = self.store.home_path().join("dkg");
+        crate::secretfs::create_private_dir(&dir).context("create dkg dir")?;
+        crate::secretfs::write_private(
+            &self.dkg_path(t, label),
+            bytes,
+            crate::secretfs::Create::Replace,
+            crate::secretfs::Wrap::Portable,
+        )
+        .context("write portable dkg artifact")
+    }
+
     /// Write a ceremony artifact that must not already exist. For single-use
     /// material (signing nonces): an existing record has to be *examined* — it
     /// may already be bound to a signing package — never silently replaced.
@@ -3943,7 +4052,13 @@ impl Tracker {
             let (share, pkp, _group_key) =
                 crate::dkg::dkg_round3(&self.dkg_read(dkg, "r2").unwrap(), &others, &round2_to_me)?;
             self.dkg_write(dkg, "share", &share)?;
-            self.dkg_write(dkg, "pkp", &pkp)?;
+            // The public-key package is PUBLIC: it needs owner-only permissions,
+            // not device binding. Wrapping it would mean an account migration
+            // also destroyed our ability to tell which group a stranded share
+            // belongs to - the check `degraded_recovery_holders` depends on. The
+            // group key is still DERIVED from it rather than trusted from a file
+            // naming the key, so portability costs nothing.
+            self.dkg_write_portable(dkg, "pkp", &pkp)?;
             return Ok(true);
         }
 
@@ -6439,7 +6554,7 @@ mod tests {
         }
         let dkg_id = b.tracker.active_dkg_session().expect("B holds a share");
         assert!(
-            b.tracker.unreadable_shares().is_empty(),
+            b.tracker.degraded_recovery_holders().is_empty(),
             "a healthy holder reports nothing"
         );
 
@@ -6454,9 +6569,26 @@ mod tests {
             b.tracker.dkg_artifact(&dkg_id, "share"),
             ArtifactRead::Unreadable(_)
         ));
-        let reported = b.tracker.unreadable_shares();
+        let reported = b.tracker.degraded_recovery_holders();
         assert_eq!(reported.len(), 1, "one degraded transcript");
-        assert_eq!(reported[0].0, dkg_id.to_hex(), "named by transcript");
+        assert_eq!(
+            reported[0].transcript,
+            dkg_id.to_hex(),
+            "named by transcript"
+        );
+        assert!(
+            matches!(
+                reported[0].reason,
+                RecoveryArtifactFailure::Undecryptable(_)
+            ),
+            "an undecryptable wrap is reported as such"
+        );
+        assert_eq!(
+            reported[0].is_current_authority,
+            Some(true),
+            "the public-key package is portable, so currency is still provable \
+             after the share becomes unreadable"
+        );
 
         // Break-glass tells the operator what actually happened rather than
         // "no way to recover from this device".
@@ -6464,8 +6596,12 @@ mod tests {
         match resp {
             Response::Error { message, .. } => {
                 assert!(
-                    message.contains("cannot") && message.contains("decrypt"),
-                    "must say the share is undecryptable: {message}"
+                    message.contains("another Windows account"),
+                    "must name the actual cause: {message}"
+                );
+                assert!(
+                    message.contains("current recovery key"),
+                    "must say this share is for the live authority: {message}"
                 );
                 assert!(
                     message.contains(&dkg_id.to_hex()),
@@ -6478,6 +6614,96 @@ mod tests {
             }
             other => panic!("expected a typed failure, got {other:?}"),
         }
+    }
+
+    /// A share belonging to a group that is **not** the workspace's recovery
+    /// authority is not a recovery problem: it could not recover this workspace
+    /// even if it were readable. Announcing it as "a share for the workspace
+    /// recovery key" would be false, so currency is established from the
+    /// public-key package before anything is reported.
+    #[test]
+    fn an_unreadable_share_for_another_group_is_not_reported() {
+        let mut a = new_node();
+
+        // A real 2-of-2 DKG for a group unrelated to this workspace, so its
+        // public-key package parses and derives a group key that is genuinely
+        // not the standing recovery authority.
+        let (s1_a, p1_a) = crate::dkg::dkg_round1(1, 2, 2).unwrap();
+        let (s1_b, p1_b) = crate::dkg::dkg_round1(2, 2, 2).unwrap();
+        let others_a: crate::dkg::Packages = [(2u16, p1_b.clone())].into_iter().collect();
+        let others_b: crate::dkg::Packages = [(1u16, p1_a.clone())].into_iter().collect();
+        let (s2_a, out_a) = crate::dkg::dkg_round2(&s1_a, &others_a).unwrap();
+        let (_s2_b, out_b) = crate::dkg::dkg_round2(&s1_b, &others_b).unwrap();
+        let to_a: crate::dkg::Packages = [(2u16, out_b[&1].clone())].into_iter().collect();
+        let (_share, pkp, foreign_group) = crate::dkg::dkg_round3(&s2_a, &others_a, &to_a).unwrap();
+        let _ = out_a;
+        assert_ne!(
+            crate::space::recovery_commit(&foreign_group),
+            Some(
+                crate::space::replay(
+                    &a.tracker.genesis,
+                    &a.tracker.workspace_id,
+                    &a.tracker.membership.space_events(),
+                )
+                .recovery_commit
+            ),
+            "the fixture group is not this workspace's authority"
+        );
+
+        // Put a transcript for it on the board so it is a candidate at all.
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: [5u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![a.tracker.me.clone(), user_from_seed([31u8; 32])],
+        };
+        let ev = crate::dkg::sign_ceremony(&[31u8; 32], &propose, &a.tracker.workspace_id);
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.persist_membership("foreign").unwrap();
+
+        // Its package is readable; its share is not.
+        a.tracker.dkg_write_portable(&id, "pkp", &pkp).unwrap();
+        let mut corrupt = b"lait-dpapi-1\n".to_vec();
+        corrupt.extend_from_slice(&[0xAB; 96]);
+        std::fs::write(a.tracker.dkg_path(&id, "share"), &corrupt).unwrap();
+        assert!(matches!(
+            a.tracker.dkg_artifact(&id, "share"),
+            ArtifactRead::Unreadable(_)
+        ));
+
+        assert!(
+            a.tracker.degraded_recovery_holders().is_empty(),
+            "a share for another group must not be announced as the workspace recovery key"
+        );
+
+        // But if the package itself cannot be read, currency is UNKNOWN — and an
+        // unknown share is reported rather than silently dropped.
+        std::fs::write(a.tracker.dkg_path(&id, "pkp"), &corrupt).unwrap();
+        let reported = a.tracker.degraded_recovery_holders();
+        assert_eq!(reported.len(), 1, "unprovable currency is still surfaced");
+        assert_eq!(
+            reported[0].is_current_authority, None,
+            "and is reported as undetermined rather than asserted either way"
+        );
+    }
+
+    /// An I/O failure is not an account mismatch. Diagnosing every read failure
+    /// as DPAPI identity would send an operator to the wrong remedy.
+    #[test]
+    fn an_io_failure_is_not_diagnosed_as_an_account_mismatch() {
+        let dir = std::env::temp_dir().join(format!("lait-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::secretfs::create_private_dir(&dir).unwrap();
+        // A directory where a file is expected: present, but unreadable for a
+        // filesystem reason rather than a cryptographic one.
+        let path = dir.join("share");
+        std::fs::create_dir(&path).unwrap();
+        match crate::secretfs::read_private(&path) {
+            Err(crate::secretfs::SecretError::Io(_)) => {}
+            other => panic!("expected a typed Io failure, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F1 regression, the headline one. A rogue proposal carries a perfectly
