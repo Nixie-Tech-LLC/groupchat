@@ -2865,8 +2865,64 @@ impl Tracker {
         )
     }
 
+    /// The signing transcript holders should converge on for one
+    /// `(authority, target, op)` request, if any is already open.
+    ///
+    /// Content-derived transcript ids make concurrency visible: two holders
+    /// independently requesting the same recovery author different nodes and so
+    /// open different transcripts, and commitments split across both. The rule
+    /// is **prefer the lowest id** — deterministic, no coordinator.
+    ///
+    /// It is a *preference*, not an override, because correctness never depended
+    /// on it: both transcripts sign `Recover { gen: cur.gen + 1 }`, and whichever
+    /// installs first advances the generation, so the space plane's monotonicity
+    /// guard rejects the loser. A split therefore costs liveness only. Strictly
+    /// preferring the lowest id would abandon a transcript that is one share from
+    /// completing in favour of one that may never gather K — the wrong trade for
+    /// break-glass — so a transcript that has already reached threshold wins.
+    fn canonical_signing_session(
+        &self,
+        board: &crate::dkg::CeremonyBoard,
+        authority: &crate::dkg::TranscriptId,
+        target: crate::dkg::SignTarget,
+        op_bytes: &[u8],
+        threshold: u16,
+    ) -> Option<crate::dkg::TranscriptId> {
+        let mut matching: Vec<(&crate::dkg::TranscriptId, &crate::dkg::SignTranscript)> = board
+            .signing
+            .iter()
+            .filter(|(_, t)| {
+                t.request.as_ref().is_some_and(|r| match &r.op {
+                    crate::dkg::CeremonyOp::SignRequest {
+                        authority: a,
+                        target: g,
+                        op,
+                        ..
+                    } => a == authority && *g == target && op.as_slice() == op_bytes,
+                    _ => false,
+                })
+            })
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        // A transcript already at threshold is one aggregation away; take it.
+        let complete = matching.iter().find(|(_, t)| {
+            t.rounds
+                .iter()
+                .filter(|v| matches!(v.op, crate::dkg::CeremonyOp::SignRound2 { .. }))
+                .count()
+                >= threshold as usize
+        });
+        if let Some((id, _)) = complete {
+            return Some(**id);
+        }
+        matching.sort_by_key(|(id, _)| **id);
+        Some(*matching[0].0)
+    }
+
     /// Break-glass recovery under a K-of-N group key: post a signing request for a
-    /// Recover re-rooting to this device (reusing one already open for this gen),
+    /// Recover re-rooting to this device (joining one already open for this gen),
     /// then drive the ceremony as far as this device can. Holders converge on the
     /// group signature and any of them installs it; idempotent across re-runs.
     fn space_recover_group(
@@ -2877,6 +2933,12 @@ impl Tracker {
             Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
             Err(e) => return (Response::err(format!("{e:#}")), None),
         };
+        let Some(authority) = self.active_dkg_session() else {
+            return (
+                Response::err("this device holds no share of the current group recovery key"),
+                None,
+            );
+        };
         let op = crate::space::SpaceOp::Recover {
             new_root: vec![me_actor.clone()],
             gen: cur.gen + 1,
@@ -2885,31 +2947,49 @@ impl Tracker {
             Ok(b) => b,
             Err(e) => return (Response::err(format!("encode recover op: {e}")), None),
         };
-        // Reuse an open request for this exact Recover; else open one. Either way,
-        // record LOCAL intent for this session's op so our node co-signs this
-        // recovery (the consent gate in `sign_advance_session`).
-        let existing = self
-            .membership
-            .ceremony_events()
-            .iter()
-            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
-            .find_map(|op| match op {
-                crate::dkg::CeremonyOp::SignRequest { session, op: req } if req == op_bytes => {
-                    Some(session)
+        let events = self.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let threshold = board
+            .dkg
+            .get(&authority)
+            .and_then(|t| self.accepted_proposal(&authority, t))
+            .map(|(_, k, _)| k)
+            .unwrap_or(0);
+        // Join the transcript holders converge on, or open one.
+        let existing = self.canonical_signing_session(
+            &board,
+            &authority,
+            crate::dkg::SignTarget::SpaceOp,
+            &op_bytes,
+            threshold,
+        );
+        let signing = match existing {
+            Some(id) => id,
+            None => {
+                let req = crate::dkg::CeremonyOp::SignRequest {
+                    nonce: rand16(),
+                    authority,
+                    target: crate::dkg::SignTarget::SpaceOp,
+                    op: op_bytes.clone(),
+                };
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.workspace_id);
+                let Some(id) = crate::dkg::TranscriptId::of(&ev) else {
+                    return (Response::err("could not derive the request id"), None);
+                };
+                if let Err(e) = self
+                    .membership
+                    .add_ceremony_event(&ev)
+                    .and_then(|()| self.persist_membership("sign_request"))
+                {
+                    return (Response::err(format!("{e:#}")), None);
                 }
-                _ => None,
-            });
-        let session = existing.unwrap_or_else(rand16);
-        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        if existing.is_none() {
-            if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::SignRequest {
-                session,
-                op: op_bytes.clone(),
-            }) {
-                return (Response::err(format!("{e:#}")), None);
+                id
             }
+        };
+        // Record LOCAL intent for this transcript's op so our node co-signs this
+        // recovery (the consent gate in `sign_advance_session`).
+        if let Err(e) = self.dkg_write(&signing, "intent", &op_bytes) {
+            return (Response::err(format!("{e:#}")), None);
         }
         if let Err(e) = self.dkg_advance() {
             return (Response::err(format!("{e:#}")), None);
@@ -2928,8 +3008,8 @@ impl Tracker {
         } else {
             format!(
                 "group recovery under way (session {}) — each other holder must approve it with `space recover-approve {}` until the threshold co-signs",
-                data_encoding::HEXLOWER.encode(&session),
-                data_encoding::HEXLOWER.encode(&session),
+                signing.to_hex(),
+                signing.to_hex(),
             )
         };
         (
@@ -2950,13 +3030,11 @@ impl Tracker {
         session_hex: String,
         expect: Vec<String>,
     ) -> (Response, Option<DirtySet>) {
-        let Some(session) = data_encoding::HEXLOWER_PERMISSIVE
-            .decode(session_hex.trim().as_bytes())
-            .ok()
-            .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
-        else {
+        // Strict parse: a session id names a filesystem artifact, so a
+        // permissive decode would let two spellings name one transcript.
+        let Some(session) = crate::dkg::TranscriptId::parse_hex(session_hex.trim()) else {
             return (
-                Response::err("not a valid recovery session id (32 hex chars)"),
+                Response::err("not a valid recovery session id (64 lowercase hex chars)"),
                 None,
             );
         };
@@ -2991,17 +3069,16 @@ impl Tracker {
         }
         expected.sort();
         expected.dedup();
-        // The exact op the request asks the group to sign.
-        let Some(op_bytes) = self
-            .membership
-            .ceremony_events()
-            .iter()
-            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
-            .find_map(|op| match op {
-                crate::dkg::CeremonyOp::SignRequest { session: s, op } if s == session => Some(op),
-                _ => None,
-            })
-        else {
+        // The exact op the request asks the group to sign, taken from the
+        // VERIFIED board and from the transcript the id names — not from the
+        // first raw decode that happens to match.
+        let events = self.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        let request = board.signing.get(&session).and_then(|t| t.request.as_ref());
+        let Some((op_bytes, req_target)) = request.and_then(|r| match &r.op {
+            crate::dkg::CeremonyOp::SignRequest { op, target, .. } => Some((op.clone(), *target)),
+            _ => None,
+        }) else {
             return (
                 Response::err(
                     "no pending recovery request for that session (sync from the initiator first)",
@@ -3009,6 +3086,17 @@ impl Tracker {
                 None,
             );
         };
+        // A recovery approval consents to a SPACE op. Refuse to lend consent to
+        // a request aimed at any other plane — approving a ceremony proposal is
+        // a different decision and must not ride this command.
+        if req_target != crate::dkg::SignTarget::SpaceOp {
+            return (
+                Response::err(
+                    "that request is not a workspace-recovery request — refusing to co-sign",
+                ),
+                None,
+            );
+        }
         // It must be a Recover for the next generation re-rooting to EXACTLY the
         // actor set the holder named — refuse to co-sign anything else.
         let cur = crate::space::replay(
@@ -3082,27 +3170,33 @@ impl Tracker {
 
     // ---- FROST recovery elevation (solo key → K-of-N DKG group key) ----
 
-    fn dkg_path(&self, session: &[u8; 16], label: &str) -> std::path::PathBuf {
-        self.store.home_path().join("dkg").join(format!(
-            "{}-{label}",
-            data_encoding::HEXLOWER.encode(session)
-        ))
+    /// Path of a ceremony artifact. The transcript component is always
+    /// [`TranscriptId::to_hex`] — canonical lowercase hex, validated when the id
+    /// was constructed — so no remote-derived string ever reaches the filesystem
+    /// and two spellings can never name one artifact.
+    ///
+    /// [`TranscriptId::to_hex`]: crate::dkg::TranscriptId::to_hex
+    fn dkg_path(&self, t: &crate::dkg::TranscriptId, label: &str) -> std::path::PathBuf {
+        self.store
+            .home_path()
+            .join("dkg")
+            .join(format!("{}-{label}", t.to_hex()))
     }
-    fn dkg_has(&self, session: &[u8; 16], label: &str) -> bool {
-        self.dkg_path(session, label).exists()
+    fn dkg_has(&self, t: &crate::dkg::TranscriptId, label: &str) -> bool {
+        self.dkg_path(t, label).exists()
     }
     /// Read a ceremony artifact. An artifact that exists but cannot be
     /// unwrapped is **logged at error** rather than folded into `None`: that
     /// happens when a store is restored onto a different Windows account or
     /// machine, and reporting it as "no share" would present the loss of a
     /// holder's recovery capability as an ordinary absence.
-    fn dkg_read(&self, session: &[u8; 16], label: &str) -> Option<Vec<u8>> {
-        match crate::secretfs::read_private(&self.dkg_path(session, label)) {
+    fn dkg_read(&self, t: &crate::dkg::TranscriptId, label: &str) -> Option<Vec<u8>> {
+        match crate::secretfs::read_private(&self.dkg_path(t, label)) {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(
-                    "ceremony artifact {label} for session {} exists but could not be read: {e:#}",
-                    data_encoding::HEXLOWER.encode(session)
+                    "ceremony artifact {label} for transcript {} exists but could not be read: {e:#}",
+                    t.to_hex()
                 );
                 None
             }
@@ -3111,16 +3205,30 @@ impl Tracker {
     /// Write a ceremony artifact owner-only. Device-bound: shares, round secrets
     /// and nonces belong to this holder on this machine and are never carried
     /// elsewhere, unlike the break-glass keys (see [`crate::secretfs::Wrap`]).
-    fn dkg_write(&self, session: &[u8; 16], label: &str, bytes: &[u8]) -> Result<()> {
+    fn dkg_write(&self, t: &crate::dkg::TranscriptId, label: &str, bytes: &[u8]) -> Result<()> {
         let dir = self.store.home_path().join("dkg");
         crate::secretfs::create_private_dir(&dir).context("create dkg dir")?;
         crate::secretfs::write_private(
-            &self.dkg_path(session, label),
+            &self.dkg_path(t, label),
             bytes,
             crate::secretfs::Create::Replace,
             crate::secretfs::Wrap::DeviceBound,
         )
         .context("write dkg artifact")
+    }
+    /// Write a ceremony artifact that must not already exist. For single-use
+    /// material (signing nonces): an existing record has to be *examined* — it
+    /// may already be bound to a signing package — never silently replaced.
+    fn dkg_write_new(&self, t: &crate::dkg::TranscriptId, label: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.store.home_path().join("dkg");
+        crate::secretfs::create_private_dir(&dir).context("create dkg dir")?;
+        crate::secretfs::write_private(
+            &self.dkg_path(t, label),
+            bytes,
+            crate::secretfs::Create::New,
+            crate::secretfs::Wrap::DeviceBound,
+        )
+        .context("write single-use dkg artifact")
     }
 
     /// Begin elevating the recovery authority to a `k`-of-N FROST group key over
@@ -3150,10 +3258,25 @@ impl Tracker {
                 None,
             );
         }
-        // Assemble the sorted participant set (co-founders + me).
-        let mut participants: std::collections::BTreeSet<String> = cofounders.into_iter().collect();
-        participants.insert(self.me.as_str().to_string());
-        let participants: Vec<String> = participants.into_iter().collect();
+        // Assemble the sorted participant set (co-founders + me). Sorted and
+        // deduped here AND re-checked by every acceptor: a hostile proposer must
+        // not be able to hand honest nodes a malformed participant list.
+        let mut set: std::collections::BTreeSet<UserId> = std::collections::BTreeSet::new();
+        for c in cofounders {
+            match UserId::parse(&c) {
+                Some(u) => {
+                    set.insert(u);
+                }
+                None => {
+                    return (
+                        Response::err(format!("'{c}' is not a device key (64 hex chars)")),
+                        None,
+                    )
+                }
+            }
+        }
+        set.insert(self.me.clone());
+        let participants: Vec<UserId> = set.into_iter().collect();
         let n = participants.len() as u16;
         // k == 0 means "all holders" (N-of-N) — the safe default.
         let k = if k == 0 { n } else { k };
@@ -3163,22 +3286,45 @@ impl Tracker {
                 None,
             );
         }
-        let session = rand16();
-        let propose = crate::dkg::CeremonyOp::Propose {
-            session,
+        // Sign the proposal FIRST: its id is the hash of the signed node, so it
+        // does not exist until now. `nonce` keeps two identical elevations by
+        // the same initiator from colliding — Ed25519 signing is deterministic,
+        // so without it the same (n, k, participants) would hash identically.
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: rand16(),
             n,
             k,
             participants,
         };
-        // Record local intent BEFORE posting: only this initiator (which also holds
-        // the current recovery key) installs the resulting Rotate — see step 4.
-        if let Err(e) = self.dkg_write(&session, "intent", b"elevate") {
+        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
+        let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
+            return (Response::err("could not derive the proposal id"), None);
+        };
+        // Authorize it with the recovery key we just proved we hold. THIS is
+        // what every participant checks — the device signature above only proves
+        // control of a device, not authority to configure an elevation.
+        let Some(secret) = self.read_space_recovery_key() else {
+            return (
+                Response::err("recovery key disappeared mid-elevation"),
+                None,
+            );
+        };
+        let auth = crate::dkg::sign_proposal_auth(&secret, &self.workspace_id, &transcript);
+        // Local consent record, keyed by the transcript it consents to. Written
+        // before posting so a crash leaves an orphan marker (harmless) rather
+        // than a proposal nobody will install (also safe, but less useful).
+        if let Err(e) = self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes()) {
             return (Response::err(format!("{e:#}")), None);
         }
-        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.workspace_id);
+        let auth_ev = crate::dkg::sign_ceremony(
+            &self.seed,
+            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &self.workspace_id,
+        );
         if let Err(e) = self
             .membership
             .add_ceremony_event(&ev)
+            .and_then(|()| self.membership.add_ceremony_event(&auth_ev))
             .and_then(|()| self.persist_membership("dkg_propose"))
         {
             return (Response::err(format!("{e:#}")), None);
@@ -3219,46 +3365,43 @@ impl Tracker {
     }
 
     fn dkg_advance_once(&mut self) -> Result<bool> {
+        // ONE verified pass over the board. Everything below reads from this —
+        // discovery included. Previously sessions were discovered by decoding
+        // events *unverified* and the whole board was then re-verified once per
+        // discovered session, so forged events both manufactured transcripts and
+        // multiplied the work (`transcripts × board`, attacker-controlled on
+        // both axes).
         let events = self.membership.ceremony_events();
-        // Sessions I'm proposed into.
-        let sessions: Vec<[u8; 16]> = events
-            .iter()
-            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
-            .filter_map(|op| match op {
-                crate::dkg::CeremonyOp::Propose {
-                    session,
-                    participants,
-                    ..
-                } if participants.contains(&self.me.as_str().to_string()) => Some(session),
-                _ => None,
-            })
-            .collect();
-        // Per-session advancement is best-effort: a malformed, signature-valid
+        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        // Per-transcript advancement is best-effort: a malformed, signature-valid
         // package from one participant must never fail the whole import (which
         // would wedge membership sync permanently on the persisted event). Isolate
-        // and log each session's error instead of propagating it.
+        // and log each transcript's error instead of propagating it.
         let mut progressed = false;
-        for session in sessions {
-            match self.dkg_advance_session(&session, &events) {
+        // DKG transcripts naming me as a participant, under an *accepted*
+        // proposal. Acceptance (not just a valid signature) is the gate — see
+        // `accepted_proposal`.
+        let dkg_ids: Vec<crate::dkg::TranscriptId> = board
+            .dkg
+            .iter()
+            .filter(|(id, t)| {
+                self.accepted_proposal(id, t)
+                    .is_some_and(|(_, _, participants)| participants.contains(&self.me))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dkg_ids {
+            let t = &board.dkg[&id];
+            match self.dkg_advance_session(&id, t) {
                 Ok(p) => progressed |= p,
                 Err(e) => tracing::warn!("dkg ceremony advance failed (skipped): {e:#}"),
             }
         }
-        // Threshold-signing sessions (break-glass group recovery) I can co-sign.
-        let sign_sessions: Vec<[u8; 16]> = {
-            let mut seen = std::collections::BTreeSet::new();
-            events
-                .iter()
-                .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
-                .filter_map(|op| match op {
-                    crate::dkg::CeremonyOp::SignRequest { session, .. } => Some(session),
-                    _ => None,
-                })
-                .filter(|s| seen.insert(*s))
-                .collect()
-        };
-        for session in sign_sessions {
-            match self.sign_advance_session(&session, &events) {
+        // Threshold-signing transcripts I can co-sign.
+        let sign_ids: Vec<crate::dkg::TranscriptId> = board.signing.keys().copied().collect();
+        for id in sign_ids {
+            let t = &board.signing[&id];
+            match self.sign_advance_session(&id, t, &board) {
                 Ok(p) => progressed |= p,
                 Err(e) => tracing::warn!("recovery signing advance failed (skipped): {e:#}"),
             }
@@ -3266,119 +3409,189 @@ impl Tracker {
         Ok(progressed)
     }
 
-    /// The DKG session whose derived group key is the workspace's *current*
-    /// recovery authority — i.e. the share this device would sign a break-glass
-    /// `Recover` with. `None` if this device holds no share for the live group.
-    fn active_dkg_session(&self) -> Option<[u8; 16]> {
+    /// A DKG transcript's configuration, **only if the proposal is accepted**.
+    ///
+    /// The device signature on a proposal proves control of a device and nothing
+    /// more. Acceptance requires an authorization signed by the key that is the
+    /// workspace's recovery authority — without this, any device could post a
+    /// proposal for a transcript and supply its `(n, k, participants)`, which on
+    /// the node that initiated an elevation and holds the recovery key would be
+    /// installed as the new recovery authority.
+    ///
+    /// Two ways to satisfy it, and the second is not a weaker path:
+    /// - the authorizer IS the standing authority; or
+    /// - we recorded a [`crate::dkg::DkgManifest`] for this exact proposal
+    ///   earlier, i.e. it was the standing authority when we accepted. Required
+    ///   because a successful elevation *rotates* the authority: re-checking
+    ///   against the standing key would un-accept every transcript at the moment
+    ///   it succeeds, orphaning holders mid-DKG.
+    ///
+    /// Well-formedness is re-checked here rather than trusted from the proposer:
+    /// `space_elevate_cmd` sorts and dedupes, but a hostile proposer does not.
+    fn accepted_proposal(
+        &self,
+        dkg: &crate::dkg::TranscriptId,
+        t: &crate::dkg::DkgTranscript,
+    ) -> Option<(u16, u16, Vec<UserId>)> {
+        let proposal = t.proposal.as_ref()?;
+        let crate::dkg::CeremonyOp::DkgPropose {
+            n, k, participants, ..
+        } = &proposal.op
+        else {
+            return None;
+        };
+        let mut sorted = participants.clone();
+        sorted.sort();
+        sorted.dedup();
+        let well_formed = *n as usize == participants.len()
+            && sorted.len() == participants.len()
+            && &sorted == participants
+            && *n >= 2
+            && (1..=*n).contains(k);
+        if !well_formed {
+            return None;
+        }
         let cur = crate::space::replay(
             &self.genesis,
             &self.workspace_id,
             &self.membership.space_events(),
         );
-        let dir = self.store.home_path().join("dkg");
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(hex) = name.strip_suffix("-group") else {
-                continue;
-            };
-            let Ok(bytes) = data_encoding::HEXLOWER_PERMISSIVE.decode(hex.as_bytes()) else {
-                continue;
-            };
-            let Ok(session) = <[u8; 16]>::try_from(bytes.as_slice()) else {
-                continue;
-            };
-            let group_key = self
-                .dkg_read(&session, "group")
-                .and_then(|b| String::from_utf8(b).ok())
-                .map(UserId::from_key_string);
-            if group_key.as_ref().and_then(crate::space::recovery_commit)
-                == Some(cur.recovery_commit)
-            {
-                return Some(session);
-            }
-        }
-        None
+        // `parse_board` already checked the detached signature; what it cannot
+        // know is whether that key is the standing authority.
+        let fresh = t
+            .auth
+            .as_ref()
+            .is_some_and(|a| crate::space::recovery_commit(&a.by) == Some(cur.recovery_commit));
+        let recorded = self.dkg_manifest(dkg).is_some_and(|m| {
+            m.proposal == *dkg
+                && m.proposal_author == proposal.author
+                && m.n == *n
+                && m.k == *k
+                && m.participants == *participants
+        });
+        (fresh || recorded).then(|| (*n, *k, participants.clone()))
     }
 
-    /// Advance one FROST threshold-signing session over the bulletin board: post
-    /// my commitment, then my signature share once the signer set has committed,
-    /// then (any holder) aggregate the group signature and install the signed
-    /// space op. The signer set is fixed as the `threshold` lowest-index holders,
-    /// so every participant assembles the identical `SigningPackage` — which keeps
-    /// the ceremony convergent without a coordinator, at the cost that recovery
-    /// needs *those* K holders (not any K-of-N) online and consenting. For the
-    /// common K=N case that is every holder anyway; loosening it to any committed
-    /// K-of-N needs a coordinator op to freeze the set (future work), since a set
-    /// derived from "who has committed" can shift under a late lower-index holder
-    /// and invalidate shares already bound to an earlier `SigningPackage`.
+    /// This transcript's local acceptance record, if we wrote one.
+    fn dkg_manifest(&self, dkg: &crate::dkg::TranscriptId) -> Option<crate::dkg::DkgManifest> {
+        postcard::from_bytes(&self.dkg_read(dkg, "manifest")?).ok()
+    }
+
+    /// The DKG transcript whose derived group key is the workspace's *current*
+    /// recovery authority — i.e. the share this device would sign a break-glass
+    /// `Recover` with. `None` if this device holds no share for the live group.
     ///
-    /// Contribution is gated on local `intent` (see below): a passive replica
-    /// never co-signs a request it did not itself authorize.
+    /// Resolved through the board, not by scanning the filesystem: the group key
+    /// is *derived* from the stored public-key package rather than read from a
+    /// file that could be swapped.
+    fn active_dkg_session(&self) -> Option<crate::dkg::TranscriptId> {
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let events = self.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &self.workspace_id);
+        board.dkg.keys().copied().find(|id| {
+            self.dkg_read(id, "share").is_some()
+                && self
+                    .group_key_of_transcript(id)
+                    .as_ref()
+                    .and_then(crate::space::recovery_commit)
+                    == Some(cur.recovery_commit)
+        })
+    }
+
+    /// This transcript's group key, recomputed from the stored public-key
+    /// package. Never read from a `-group` file: a plaintext artifact naming the
+    /// rotation target is a swap target, and the value is derivable.
+    fn group_key_of_transcript(&self, t: &crate::dkg::TranscriptId) -> Option<UserId> {
+        crate::dkg::group_key_of_package(&self.dkg_read(t, "pkp")?).ok()
+    }
+
+    /// Advance one FROST threshold-signing transcript over the bulletin board:
+    /// post my commitment, then my signature share once the signer set has
+    /// committed, then (any holder) aggregate and install.
+    ///
+    /// The signer set is fixed as the `threshold` lowest-index holders, so every
+    /// participant assembles the identical `SigningPackage`. That keeps the
+    /// ceremony convergent without a coordinator, at the cost that recovery needs
+    /// *those* K holders online — for the common K=N case, every holder anyway.
+    ///
+    /// **The fixed set is load-bearing for safety, not just convergence.** A
+    /// signature share binds to the whole `SigningPackage`; signing twice with
+    /// one nonce under two different packages is textbook nonce reuse and leaks
+    /// the signing share. Loosening this to any-committed-K therefore needs a
+    /// coordinator op to freeze the set, *and* the nonce binding check below to
+    /// stay in force.
+    ///
+    /// Contribution is gated on local `intent`: a passive replica never co-signs
+    /// a request it did not itself authorize.
     fn sign_advance_session(
         &mut self,
-        sign_session: &[u8; 16],
-        events: &[crate::space::SignedSpaceEvent],
+        signing: &crate::dkg::TranscriptId,
+        t: &crate::dkg::SignTranscript,
+        board: &crate::dkg::CeremonyBoard,
     ) -> Result<bool> {
-        let Some(dkg) = self.active_dkg_session() else {
+        let Some(request) = t.request.as_ref() else {
             return Ok(false);
         };
-        let (Some(share), Some(pkp)) = (self.dkg_read(&dkg, "share"), self.dkg_read(&dkg, "pkp"))
+        let crate::dkg::CeremonyOp::SignRequest {
+            authority,
+            target,
+            op: op_bytes,
+            ..
+        } = &request.op
         else {
             return Ok(false);
         };
-        let threshold: u16 = self
-            .dkg_read(&dkg, "threshold")
-            .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let participants: Vec<String> = self
-            .dkg_read(&dkg, "participants")
-            .and_then(|b| String::from_utf8(b).ok())
-            .map(|s| s.lines().map(String::from).collect())
-            .unwrap_or_default();
-        let group_key = self
-            .dkg_read(&dkg, "group")
-            .and_then(|b| String::from_utf8(b).ok())
-            .map(UserId::from_key_string);
-        let (Some(group_key), true) = (group_key, threshold >= 1) else {
+        // The request names the DKG whose group key it asks to sign. Only act if
+        // we hold a share for THAT authority — binding the request to one group
+        // rather than "whichever group happens to be current".
+        let Some(dkg_t) = board.dkg.get(authority) else {
             return Ok(false);
         };
-        let index_of = |dev: &str| {
+        let Some((_, threshold, participants)) = self.accepted_proposal(authority, dkg_t) else {
+            return Ok(false);
+        };
+        let (Some(share), Some(pkp)) = (
+            self.dkg_read(authority, "share"),
+            self.dkg_read(authority, "pkp"),
+        ) else {
+            return Ok(false);
+        };
+        let Ok(group_key) = crate::dkg::group_key_of_package(&pkp) else {
+            return Ok(false);
+        };
+        let index_of = |dev: &UserId| {
             participants
                 .iter()
                 .position(|p| p == dev)
                 .map(|i| i as u16 + 1)
         };
-        let Some(my_index) = index_of(self.me.as_str()) else {
+        let Some(my_index) = index_of(&self.me) else {
             return Ok(false);
         };
-
-        let parsed = crate::dkg::parse_ceremony(events, &self.workspace_id, sign_session);
-        // The op the group is being asked to sign (first request wins).
-        let Some(op_bytes) = parsed.iter().find_map(|(_, op)| match op {
-            crate::dkg::CeremonyOp::SignRequest { op, .. } => Some(op.clone()),
-            _ => None,
-        }) else {
-            return Ok(false);
-        };
-        // SECURITY (break-glass consent): only contribute a signature share to — or
-        // install — a recovery this device has LOCALLY authorized, via `space
-        // recover` (initiate) or `space recover-approve <session>` (co-sign a
-        // specific request). Both write an `intent` file pinning the exact op bytes.
-        // A holder auto-driving ceremonies on passive import must NEVER co-sign an
-        // unsolicited `SignRequest` that merely appeared, signature-valid, on the
-        // synced board: authenticating the requester is not the co-signer consenting
-        // to hand the workspace to `new_root`. Without this gate any member could
-        // post a Recover-to-me request and let honest holders' shares re-root the
-        // workspace to them — a full takeover with no threshold of secrets held.
-        if self.dkg_read(sign_session, "intent").as_deref() != Some(op_bytes.as_slice()) {
+        // Consent gate: we contribute only to a request we ourselves authorized,
+        // byte-for-byte. Without it, posting a Recover-to-me request would let
+        // honest holders' shares hand the workspace over.
+        if self.dkg_read(signing, "intent").as_deref() != Some(op_bytes.as_slice()) {
             return Ok(false);
         }
-        // The exact 32-byte message `verify_sig` will check for a group-authored node.
+        // Domain separation. The message is built under the domain matching what
+        // the signature is FOR, and the finished signature is installed on the
+        // matching plane. Postcard is not self-describing and
+        // `CeremonyOp::DkgPropose` shares variant tag 0 with `SpaceOp::Recover`,
+        // so signing ceremony bytes under the space domain would not merely be
+        // misfiled — it would be a type-confusion primitive. No default arm: a
+        // future target must make an explicit choice here.
+        let domain: &[u8] = match target {
+            crate::dkg::SignTarget::SpaceOp => crate::space::SPACE_EVENT_DOMAIN,
+            crate::dkg::SignTarget::CeremonyProposal => crate::dkg::CEREMONY_DOMAIN,
+        };
         let message = crate::sigdag::payload_to_sign(
-            crate::space::SPACE_EVENT_DOMAIN,
-            &op_bytes,
+            domain,
+            op_bytes,
             &group_key,
             &[],
             self.workspace_id.as_str(),
@@ -3388,53 +3601,77 @@ impl Tracker {
 
         // Round-1 commitments from the signer set, keyed by index.
         let mut r1: crate::dkg::Packages = std::collections::BTreeMap::new();
-        for (author, op) in &parsed {
-            if let crate::dkg::CeremonyOp::SignRound1 { commitments, .. } = op {
-                if let Some(i) = index_of(author.as_str()) {
+        for v in &t.rounds {
+            if let crate::dkg::CeremonyOp::SignRound1 { commitments, .. } = &v.op {
+                if let Some(i) = index_of(&v.author) {
                     if i <= threshold {
                         r1.entry(i).or_insert_with(|| commitments.clone());
                     }
                 }
             }
         }
-        let i_posted_r1 = parsed.iter().any(|(a, op)| {
-            a == &self.me && matches!(op, crate::dkg::CeremonyOp::SignRound1 { .. })
+        let i_posted_r1 = t.rounds.iter().any(|v| {
+            v.author == self.me && matches!(v.op, crate::dkg::CeremonyOp::SignRound1 { .. })
         });
 
-        // Step 1 — post my commitment (if I'm in the signer set).
-        if in_set && !i_posted_r1 {
+        // Step 1 — post my commitment (if I am in the signer set). The nonce
+        // record is created EXCLUSIVELY: single-use material that already exists
+        // must be examined, never overwritten.
+        if in_set && !i_posted_r1 && !self.dkg_has(signing, "nonce") {
             let (nonces, commitments) = crate::dkg::sign_round1(&share)?;
-            self.dkg_write(sign_session, "nonces", &nonces)?;
+            let pending = crate::dkg::PendingNonce {
+                signing: *signing,
+                // Filled in at step 2, once the full commitment set is known.
+                binding: [0u8; 32],
+                nonces,
+            };
+            self.dkg_write_new(signing, "nonce", &postcard::to_stdvec(&pending)?)?;
             self.post_ceremony(crate::dkg::CeremonyOp::SignRound1 {
-                session: *sign_session,
+                signing: *signing,
                 commitments,
             })?;
             return Ok(true);
         }
 
-        // Step 2 — once the whole signer set has committed, post my signature share.
-        let i_posted_r2 = parsed.iter().any(|(a, op)| {
-            a == &self.me && matches!(op, crate::dkg::CeremonyOp::SignRound2 { .. })
+        // Step 2 — once the whole signer set has committed, post my share.
+        let i_posted_r2 = t.rounds.iter().any(|v| {
+            v.author == self.me && matches!(v.op, crate::dkg::CeremonyOp::SignRound2 { .. })
         });
-        if in_set
-            && r1.len() == threshold as usize
-            && !i_posted_r2
-            && self.dkg_has(sign_session, "nonces")
-        {
-            let nonces = self.dkg_read(sign_session, "nonces").unwrap();
-            let share_sig = crate::dkg::sign_round2(&r1, &message, &nonces, &share)?;
+        if in_set && r1.len() == threshold as usize && !i_posted_r2 {
+            let Some(raw) = self.dkg_read(signing, "nonce") else {
+                return Ok(false);
+            };
+            let mut pending: crate::dkg::PendingNonce = postcard::from_bytes(&raw)?;
+            let binding = crate::dkg::nonce_binding(signing, &message, &r1);
+            // THE nonce-reuse gate. One stored record may produce shares for
+            // exactly one signing package; if the package moved under us, refuse
+            // rather than sign. The comparison — not the deletion — is what
+            // prevents reuse, since a crash between posting and deleting always
+            // leaves the record behind.
+            if pending.binding == [0u8; 32] {
+                pending.binding = binding;
+                self.dkg_write(signing, "nonce", &postcard::to_stdvec(&pending)?)?;
+            } else if pending.binding != binding {
+                anyhow::bail!(
+                    "refusing to sign: this transcript's signing package changed after commitment (signing again would reuse the nonce and leak the key share)"
+                );
+            }
+            let share_sig = crate::dkg::sign_round2(&r1, &message, &pending.nonces, &share)?;
             self.post_ceremony(crate::dkg::CeremonyOp::SignRound2 {
-                session: *sign_session,
+                signing: *signing,
                 share: share_sig,
             })?;
+            // `post_ceremony` persisted the share, so the one-use material can
+            // go. Order matters: never delete before the share is durable.
+            let _ = std::fs::remove_file(self.dkg_path(signing, "nonce"));
             return Ok(true);
         }
 
-        // Step 3 — any holder aggregates the group signature and installs the op.
+        // Step 3 — any holder aggregates the group signature and installs it.
         let mut r2: crate::dkg::Packages = std::collections::BTreeMap::new();
-        for (author, op) in &parsed {
-            if let crate::dkg::CeremonyOp::SignRound2 { share, .. } = op {
-                if let Some(i) = index_of(author.as_str()) {
+        for v in &t.rounds {
+            if let crate::dkg::CeremonyOp::SignRound2 { share, .. } = &v.op {
+                if let Some(i) = index_of(&v.author) {
                     if i <= threshold {
                         r2.entry(i).or_insert_with(|| share.clone());
                     }
@@ -3443,54 +3680,88 @@ impl Tracker {
         }
         if r1.len() == threshold as usize && r2.len() == threshold as usize {
             let sig = crate::dkg::aggregate(&r1, &message, &r2, &pkp)?;
-            let node = crate::sigdag::assemble_signed(op_bytes, group_key, sig, vec![]);
-            let fresh = !self
-                .membership
-                .space_events()
-                .iter()
-                .any(|e| e.hash() == node.hash());
-            if fresh
-                && node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, self.workspace_id.as_str())
-            {
-                self.membership.add_space_event(&node)?;
-                self.persist_membership("group_recover")?;
-                self.bootstrap_root_epoch_if_needed()?;
-                return Ok(true);
+            let node = crate::sigdag::assemble_signed(op_bytes.clone(), group_key, sig, vec![]);
+            match target {
+                crate::dkg::SignTarget::SpaceOp => {
+                    let fresh = !self
+                        .membership
+                        .space_events()
+                        .iter()
+                        .any(|e| e.hash() == node.hash());
+                    if fresh
+                        && node.verify_sig(
+                            crate::space::SPACE_EVENT_DOMAIN,
+                            self.workspace_id.as_str(),
+                        )
+                    {
+                        self.membership.add_space_event(&node)?;
+                        self.persist_membership("group_recover")?;
+                        self.bootstrap_root_epoch_if_needed()?;
+                        return Ok(true);
+                    }
+                }
+                crate::dkg::SignTarget::CeremonyProposal => {
+                    let fresh = !self
+                        .membership
+                        .ceremony_events()
+                        .iter()
+                        .any(|e| e.hash() == node.hash());
+                    if fresh
+                        && node.verify_sig(crate::dkg::CEREMONY_DOMAIN, self.workspace_id.as_str())
+                    {
+                        self.membership.add_ceremony_event(&node)?;
+                        self.persist_membership("group_authorize")?;
+                        return Ok(true);
+                    }
+                }
             }
         }
         Ok(false)
     }
 
+    /// Advance one DKG transcript. Configuration comes **only** from the
+    /// accepted proposal ([`Self::accepted_proposal`]) — never from whichever
+    /// signature-valid proposal happens to sort first, which is how a rogue
+    /// proposal could previously substitute `(n, k, participants)` into a
+    /// transcript an honest initiator had opened.
     fn dkg_advance_session(
         &mut self,
-        session: &[u8; 16],
-        events: &[crate::space::SignedSpaceEvent],
+        dkg: &crate::dkg::TranscriptId,
+        t: &crate::dkg::DkgTranscript,
     ) -> Result<bool> {
-        let parsed = crate::dkg::parse_ceremony(events, &self.workspace_id, session);
-        // Config from the Propose.
-        let Some((n, k, participants)) = parsed.iter().find_map(|(_, op)| match op {
-            crate::dkg::CeremonyOp::Propose {
-                n, k, participants, ..
-            } => Some((*n, *k, participants.clone())),
-            _ => None,
-        }) else {
+        let Some((n, k, participants)) = self.accepted_proposal(dkg, t) else {
             return Ok(false);
         };
-        let index_of = |dev: &str| {
+        // Record acceptance the first time we act on this proposal, so a later
+        // rotation of the authority cannot orphan a transcript mid-DKG.
+        if self.dkg_manifest(dkg).is_none() {
+            if let Some(proposal) = t.proposal.as_ref() {
+                let manifest = crate::dkg::DkgManifest {
+                    proposal: *dkg,
+                    proposal_author: proposal.author.clone(),
+                    n,
+                    k,
+                    participants: participants.clone(),
+                };
+                self.dkg_write(dkg, "manifest", &postcard::to_stdvec(&manifest)?)?;
+            }
+        }
+        let index_of = |dev: &UserId| {
             participants
                 .iter()
                 .position(|p| p == dev)
                 .map(|i| i as u16 + 1)
         };
-        let Some(my_index) = index_of(self.me.as_str()) else {
+        let Some(my_index) = index_of(&self.me) else {
             return Ok(false);
         };
 
-        // Round-1 packages posted so far, keyed by participant index.
+        // Round-1 packages posted so far, keyed by participant index. Authors
+        // outside the participant set resolve to no index and are dropped.
         let mut round1: crate::dkg::Packages = std::collections::BTreeMap::new();
-        for (author, op) in &parsed {
-            if let crate::dkg::CeremonyOp::Round1 { package, .. } = op {
-                if let Some(i) = index_of(author.as_str()) {
+        for v in &t.rounds {
+            if let crate::dkg::CeremonyOp::DkgRound1 { package, .. } = &v.op {
+                if let Some(i) = index_of(&v.author) {
                     round1.entry(i).or_insert_with(|| package.clone());
                 }
             }
@@ -3500,49 +3771,52 @@ impl Tracker {
         // Step 1 — post my round-1.
         if !i_posted_round1 {
             let (s1, pkg) = crate::dkg::dkg_round1(my_index, n, k)?;
-            self.dkg_write(session, "r1", &s1)?;
-            self.post_ceremony(crate::dkg::CeremonyOp::Round1 {
-                session: *session,
+            self.dkg_write(dkg, "r1", &s1)?;
+            self.post_ceremony(crate::dkg::CeremonyOp::DkgRound1 {
+                dkg: *dkg,
                 package: pkg,
             })?;
             return Ok(true);
         }
 
         // Step 2 — once all N round-1s are in, post my (sealed) round-2 shares.
-        let i_posted_round2 = parsed
-            .iter()
-            .any(|(a, op)| a == &self.me && matches!(op, crate::dkg::CeremonyOp::Round2 { .. }));
-        if round1.len() == n as usize && !i_posted_round2 && self.dkg_has(session, "r1") {
+        let i_posted_round2 = t.rounds.iter().any(|v| {
+            v.author == self.me && matches!(v.op, crate::dkg::CeremonyOp::DkgRound2 { .. })
+        });
+        if round1.len() == n as usize && !i_posted_round2 && self.dkg_has(dkg, "r1") {
             let others: crate::dkg::Packages = round1
                 .iter()
                 .filter(|(i, _)| **i != my_index)
                 .map(|(i, v)| (*i, v.clone()))
                 .collect();
             let (s2, outgoing) =
-                crate::dkg::dkg_round2(&self.dkg_read(session, "r1").unwrap(), &others)?;
-            self.dkg_write(session, "r2", &s2)?;
+                crate::dkg::dkg_round2(&self.dkg_read(dkg, "r1").unwrap(), &others)?;
+            self.dkg_write(dkg, "r2", &s2)?;
             for (recipient_index, pkg) in outgoing {
-                let recipient = &participants[recipient_index as usize - 1];
-                let recipient_uid = UserId::from_key_string(recipient.clone());
-                let Some(sealed) = crypto::seal_to(&recipient_uid, &pkg) else {
+                let recipient = participants[recipient_index as usize - 1].clone();
+                let Some(sealed) = crypto::seal_to(&recipient, &pkg) else {
                     continue;
                 };
-                self.post_ceremony(crate::dkg::CeremonyOp::Round2 {
-                    session: *session,
-                    to: recipient.clone(),
+                self.post_ceremony(crate::dkg::CeremonyOp::DkgRound2 {
+                    dkg: *dkg,
+                    to: recipient,
                     sealed,
                 })?;
             }
             return Ok(true);
         }
 
-        // Step 3 — once all round-2 shares sent TO me are in, finalize my key share.
+        // Step 3 — once all round-2 shares sent TO me are in, finalize my key
+        // share. Only `r2`, `share` and `pkp` are persisted: everything else the
+        // old code stored (`group`, `index`, `threshold`, `participants`) is
+        // derivable from the accepted proposal or the public-key package, and a
+        // trusted plaintext copy is only a swap target.
         let mut round2_to_me: crate::dkg::Packages = std::collections::BTreeMap::new();
-        for (author, op) in &parsed {
-            if let crate::dkg::CeremonyOp::Round2 { to, sealed, .. } = op {
-                if to == self.me.as_str() {
+        for v in &t.rounds {
+            if let crate::dkg::CeremonyOp::DkgRound2 { to, sealed, .. } = &v.op {
+                if to == &self.me {
                     if let (Some(sender_i), Some(pkg)) = (
-                        index_of(author.as_str()),
+                        index_of(&v.author),
                         crypto::open_sealed(&self.seed, &self.me, sealed),
                     ) {
                         round2_to_me.entry(sender_i).or_insert(pkg);
@@ -3551,58 +3825,66 @@ impl Tracker {
             }
         }
         if round2_to_me.len() == n as usize - 1
-            && self.dkg_has(session, "r2")
-            && !self.dkg_has(session, "share")
+            && self.dkg_has(dkg, "r2")
+            && !self.dkg_has(dkg, "share")
         {
             let others: crate::dkg::Packages = round1
                 .iter()
                 .filter(|(i, _)| **i != my_index)
                 .map(|(i, v)| (*i, v.clone()))
                 .collect();
-            let (share, pkp, group_key) = crate::dkg::dkg_round3(
-                &self.dkg_read(session, "r2").unwrap(),
-                &others,
-                &round2_to_me,
-            )?;
-            self.dkg_write(session, "share", &share)?;
-            self.dkg_write(session, "pkp", &pkp)?;
-            self.dkg_write(session, "group", group_key.as_str().as_bytes())?;
-            self.dkg_write(session, "index", my_index.to_string().as_bytes())?;
-            self.dkg_write(session, "threshold", k.to_string().as_bytes())?;
-            self.dkg_write(session, "participants", participants.join("\n").as_bytes())?;
+            let (share, pkp, _group_key) =
+                crate::dkg::dkg_round3(&self.dkg_read(dkg, "r2").unwrap(), &others, &round2_to_me)?;
+            self.dkg_write(dkg, "share", &share)?;
+            self.dkg_write(dkg, "pkp", &pkp)?;
             return Ok(true);
         }
 
         // Step 4 — the recovery-key holder installs the group key with a Rotate.
-        // SECURITY: gated on local `intent`, written only by `space_elevate_cmd` on
-        // the node that started this elevation. A rogue Propose can make honest
-        // devices compute DKG rounds, but only a device that BOTH holds the current
-        // recovery key AND initiated this session installs the rotation — so an
-        // unsolicited proposal can never coerce a change of recovery authority.
-        if self.dkg_has(session, "group") && self.dkg_has(session, "intent") {
-            let group_key = String::from_utf8(self.dkg_read(session, "group").unwrap())
-                .ok()
-                .map(UserId::from_key_string);
-            let cur = crate::space::replay(
-                &self.genesis,
-                &self.workspace_id,
-                &self.membership.space_events(),
-            );
-            let already = group_key.as_ref().and_then(crate::space::recovery_commit)
+        //
+        // SECURITY. Four things must hold, and each closes a distinct path:
+        // - the proposal is ACCEPTED (checked above): the recovery authority
+        //   signed this exact transcript, so its configuration is not attacker-
+        //   chosen;
+        // - local `intent` names THIS transcript: we consented to this exact
+        //   proposal, not merely to "an elevation" (the old marker was the
+        //   constant `b"elevate"`, which a substituted config satisfied just as
+        //   well as the real one);
+        // - the group key is DERIVED from the stored public-key package, not
+        //   read from a plaintext file that could be swapped;
+        // - we still hold the current recovery key, and it is not already
+        //   installed.
+        if !self.dkg_has(dkg, "share") {
+            return Ok(false);
+        }
+        let consented = self
+            .dkg_read(dkg, "intent")
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|h| h == dkg.to_hex());
+        if !consented {
+            return Ok(false);
+        }
+        let Some(group_key) = self.group_key_of_transcript(dkg) else {
+            return Ok(false);
+        };
+        let cur = crate::space::replay(
+            &self.genesis,
+            &self.workspace_id,
+            &self.membership.space_events(),
+        );
+        let already = crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit);
+        if let Some(secret) = self.read_space_recovery_key() {
+            let hold = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret))
                 == Some(cur.recovery_commit);
-            if let (Some(group_key), Some(secret)) = (group_key, self.read_space_recovery_key()) {
-                let hold = crate::space::recovery_commit(&crate::space::recovery_pub_of(&secret))
-                    == Some(cur.recovery_commit);
-                if hold && !already {
-                    let op = crate::space::SpaceOp::Rotate {
-                        new_recovery_key: group_key,
-                        gen: cur.gen + 1,
-                    };
-                    let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
-                    self.membership.add_space_event(&ev)?;
-                    self.persist_membership("dkg_install")?;
-                    return Ok(true);
-                }
+            if hold && !already {
+                let op = crate::space::SpaceOp::Rotate {
+                    new_recovery_key: group_key,
+                    gen: cur.gen + 1,
+                };
+                let ev = crate::space::sign_op(&secret, &op, vec![], &self.workspace_id);
+                self.membership.add_space_event(&ev)?;
+                self.persist_membership("dkg_install")?;
+                return Ok(true);
             }
         }
         Ok(false)
@@ -5834,6 +6116,232 @@ mod tests {
         );
     }
 
+    /// F1 regression, the headline one. A rogue proposal carries a perfectly
+    /// valid *device* signature — authentication was never the missing piece.
+    /// Without an authorization from the recovery authority, no honest node may
+    /// spend a single DKG round on it, because acting on it is what would
+    /// eventually let its configuration be installed as the recovery authority.
+    #[test]
+    fn an_unauthorized_proposal_moves_no_honest_node() {
+        let mut a = new_node(); // founder; holds the solo recovery key
+        let a_ws = a.tracker.workspace_str();
+        let rogue_seed = [77u8; 32];
+        let rogue = user_from_seed(rogue_seed);
+
+        // The attacker names A as a participant, with a threshold they control.
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: {
+                let mut v = vec![a.tracker.me.clone(), rogue.clone()];
+                v.sort();
+                v
+            },
+        };
+        let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.tracker.workspace_id);
+        assert!(
+            ev.verify_sig(crate::dkg::CEREMONY_DOMAIN, &a_ws),
+            "the rogue proposal is genuinely signature-valid"
+        );
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.persist_membership("rogue").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+
+        assert!(
+            a.tracker.dkg_read(&id, "r1").is_none(),
+            "no round-1 secret was computed for an unauthorized proposal"
+        );
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none(),
+            "and no acceptance was recorded"
+        );
+        // Nothing reached the space plane either.
+        let cur = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        );
+        assert_eq!(cur.gen, 0, "the recovery authority is untouched");
+    }
+
+    /// The same rogue proposal, now injected into a transcript alongside a
+    /// *genuine* authorization for a different proposal. Authorization is bound
+    /// to one proposal hash, so it cannot be lifted to cover another.
+    #[test]
+    fn an_authorization_cannot_be_lifted_to_another_proposal() {
+        let mut a = new_node();
+        let rogue_seed = [78u8; 32];
+        let rogue = user_from_seed(rogue_seed);
+        let secret = a.tracker.read_space_recovery_key().expect("solo key");
+
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: [2u8; 16],
+            n: 2,
+            k: 2,
+            participants: {
+                let mut v = vec![a.tracker.me.clone(), rogue.clone()];
+                v.sort();
+                v
+            },
+        };
+        let ev = crate::dkg::sign_ceremony(&rogue_seed, &propose, &a.tracker.workspace_id);
+        let rogue_id = crate::dkg::TranscriptId::of(&ev).unwrap();
+
+        // A real authorization, by the real recovery key — but for a DIFFERENT
+        // proposal id. Re-pointing it at the rogue proposal must not verify.
+        let other = crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap();
+        let real = crate::dkg::sign_proposal_auth(&secret, &a.tracker.workspace_id, &other);
+        let lifted = crate::dkg::ProposalAuth {
+            proposal: rogue_id,
+            ..real
+        };
+        let aev = crate::dkg::sign_ceremony(
+            &rogue_seed,
+            &crate::dkg::CeremonyOp::DkgAuthorize(lifted),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("lifted").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&rogue_id).is_none()
+                && a.tracker.dkg_read(&rogue_id, "r1").is_none(),
+            "an authorization for another proposal authorizes nothing here"
+        );
+    }
+
+    /// A proposal authorized by a key that is no longer the recovery authority
+    /// is not accepted. Guards the case where an old solo key, superseded by a
+    /// group, is used to authorize a fresh elevation back to attacker control.
+    #[test]
+    fn a_proposal_authorized_by_a_superseded_authority_is_rejected() {
+        let mut a = new_node();
+        let stale_seed = [66u8; 32]; // never the workspace's recovery key
+        let rogue = user_from_seed([79u8; 32]);
+
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: [3u8; 16],
+            n: 2,
+            k: 2,
+            participants: {
+                let mut v = vec![a.tracker.me.clone(), rogue];
+                v.sort();
+                v
+            },
+        };
+        let ev = crate::dkg::sign_ceremony(&stale_seed, &propose, &a.tracker.workspace_id);
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        // Well-formed authorization, signed by a key that is not the authority.
+        let auth = crate::dkg::sign_proposal_auth(&stale_seed, &a.tracker.workspace_id, &id);
+        assert!(
+            crate::dkg::verify_proposal_auth(&auth, &a.tracker.workspace_id),
+            "the signature itself is valid — only the signer is wrong"
+        );
+        let aev = crate::dkg::sign_ceremony(
+            &stale_seed,
+            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("stale").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none() && a.tracker.dkg_read(&id, "r1").is_none(),
+            "authorization must come from the STANDING recovery authority"
+        );
+    }
+
+    /// A malformed participant list is rejected at the acceptor, not merely at
+    /// the proposer. `space_elevate_cmd` sorts and dedupes; a hostile proposer
+    /// does not, and duplicate entries would corrupt the index→participant map.
+    #[test]
+    fn a_malformed_participant_list_is_rejected_by_the_acceptor() {
+        let mut a = new_node();
+        let secret = a.tracker.read_space_recovery_key().expect("solo key");
+        let me = a.tracker.me.clone();
+
+        // Duplicated participant, and n disagreeing with the list length.
+        let propose = crate::dkg::CeremonyOp::DkgPropose {
+            nonce: [4u8; 16],
+            n: 3,
+            k: 2,
+            participants: vec![me.clone(), me.clone()],
+        };
+        let ev = crate::dkg::sign_ceremony(&[80u8; 32], &propose, &a.tracker.workspace_id);
+        let id = crate::dkg::TranscriptId::of(&ev).unwrap();
+        // Authorized by the REAL recovery key — only the shape is wrong.
+        let auth = crate::dkg::sign_proposal_auth(&secret, &a.tracker.workspace_id, &id);
+        let aev = crate::dkg::sign_ceremony(
+            &[80u8; 32],
+            &crate::dkg::CeremonyOp::DkgAuthorize(auth),
+            &a.tracker.workspace_id,
+        );
+        a.tracker.membership.add_ceremony_event(&ev).unwrap();
+        a.tracker.membership.add_ceremony_event(&aev).unwrap();
+        a.tracker.persist_membership("malformed").unwrap();
+
+        a.tracker.dkg_advance().unwrap();
+        assert!(
+            a.tracker.dkg_manifest(&id).is_none() && a.tracker.dkg_read(&id, "r1").is_none(),
+            "a duplicated/miscounted participant list is not well-formed"
+        );
+    }
+
+    /// The rotation target is derived from the stored public-key package, so
+    /// swapping that artifact cannot redirect the recovery authority — it
+    /// produces an unusable package rather than an attacker-chosen group key.
+    #[test]
+    fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
+        let mut a = new_node();
+        let a_ws = a.tracker.workspace_str();
+        let b_seed = [21u8; 32];
+        let b_user = user_from_seed(b_seed);
+        let mut b = new_joiner_node_as(
+            b_user.clone(),
+            b_seed,
+            &a_ws,
+            &a.tracker.founding_proof().unwrap(),
+        );
+        let b_incept = b.tracker.self_inception().unwrap();
+        a.tracker
+            .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]);
+        sync_all(&mut a.tracker, &mut b.tracker);
+
+        let (resp, _) = a
+            .tracker
+            .space_elevate_cmd(vec![b_user.as_str().to_string()], 2);
+        assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        for _ in 0..6 {
+            sync_all(&mut a.tracker, &mut b.tracker);
+            sync_all(&mut b.tracker, &mut a.tracker);
+        }
+        let installed = crate::space::replay(
+            &a.tracker.genesis,
+            &a.tracker.workspace_id,
+            &a.tracker.membership.space_events(),
+        );
+        assert_eq!(installed.gen, 1, "the group key was installed");
+
+        // Corrupt the local public-key package; the group key is derived from it,
+        // so it can no longer be resolved and the share stops being usable.
+        let dkg_id = a.tracker.active_dkg_session().expect("A holds a share");
+        a.tracker.dkg_write(&dkg_id, "pkp", b"swapped").unwrap();
+        assert!(
+            a.tracker.group_key_of_transcript(&dkg_id).is_none(),
+            "a swapped package yields no group key rather than an attacker's"
+        );
+        assert!(
+            a.tracker.active_dkg_session().is_none(),
+            "and the transcript no longer resolves as the live authority"
+        );
+    }
     #[test]
     fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
         // After elevation to a 2-of-2 group key, break-glass recovery is a FROST
@@ -5878,19 +6386,15 @@ mod tests {
         let (resp, _) = b.tracker.space_recover_cmd();
         assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
         let b_actor = b.tracker.my_actor().unwrap();
-        // The session id B posted its request under.
-        let session_hex = b
-            .tracker
-            .membership
-            .ceremony_events()
-            .iter()
-            .filter_map(|ev| postcard::from_bytes::<crate::dkg::CeremonyOp>(&ev.op).ok())
-            .find_map(|op| match op {
-                crate::dkg::CeremonyOp::SignRequest { session, .. } => {
-                    Some(data_encoding::HEXLOWER.encode(&session))
-                }
-                _ => None,
-            })
+        // The transcript id B posted its request under — the hash of the signed
+        // request node, read off the verified board.
+        let events = b.tracker.membership.ceremony_events();
+        let board = crate::dkg::parse_board(&events, &b.tracker.workspace_id);
+        let session_hex = board
+            .signing
+            .keys()
+            .next()
+            .map(|id| id.to_hex())
             .expect("B posted a recovery request");
 
         // SECURITY (C1): A auto-drives ceremonies on every import — but it must NOT

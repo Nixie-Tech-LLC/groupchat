@@ -23,53 +23,214 @@ use crate::ids::{UserId, WorkspaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// Signing domain for FROST ceremony contributions (bulletin-board packages).
-pub const CEREMONY_DOMAIN: &[u8] = b"lait/space/1/ceremony";
+///
+/// `/2` is the transcript-identity format. v1 keyed every op by a random
+/// `session: [u8; 16]` that nothing bound to the proposal defining it, so a
+/// signature-valid proposal from any device could supply the configuration for
+/// a session it did not open. Bumping the domain means v1 events fail
+/// [`SignedNode::verify_sig`] and are ignored rather than mis-parsed — the safe
+/// failure. Any in-flight v1 ceremony must be restarted.
+pub const CEREMONY_DOMAIN: &[u8] = b"lait/space/1/ceremony/2";
+
+/// The content-address of the signed node that **opened** a transcript: a DKG's
+/// `DkgPropose`, or a signing session's `SignRequest`.
+///
+/// Two properties of [`SignedNode::hash`] shape this type:
+///
+/// - it covers `op ‖ author ‖ sorted(parents)` and **excludes the signature**,
+///   which is what we want — Ed25519 signature bytes are not a canonical
+///   function of the message across implementations, so hashing the envelope
+///   could yield two ids for one proposal;
+/// - it is deliberately **not** domain- or workspace-bound (see its docs), so a
+///   `TranscriptId` is only meaningful within the plane that produced it. Never
+///   use one as a key in anything shared across planes, and keep the explicit
+///   `nonce` on both openers: Ed25519 signing is deterministic (RFC 8032), so
+///   without it a device re-opening an identical transcript would collide.
+///
+/// Only [`TranscriptId::to_hex`] ever becomes a filename, and [`Self::parse_hex`]
+/// is strict — permissive hex would let two spellings name one id, and an
+/// unvalidated remote string could carry path separators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TranscriptId([u8; 32]);
+
+impl TranscriptId {
+    /// The id of the transcript this node opens.
+    pub fn of(node: &SignedNode) -> Option<Self> {
+        Self::parse_hex(&node.hash())
+    }
+    /// Strict canonical lowercase hex, exactly 64 chars. Rejects everything
+    /// else, including uppercase, path separators and `..`.
+    pub fn parse_hex(s: &str) -> Option<Self> {
+        if s.len() != 64
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        let raw = data_encoding::HEXLOWER.decode(s.as_bytes()).ok()?;
+        raw.as_slice().try_into().ok().map(Self)
+    }
+    /// The canonical form — the only one that may become a path component.
+    pub fn to_hex(&self) -> String {
+        data_encoding::HEXLOWER.encode(&self.0)
+    }
+}
+
+/// What a threshold signature is *for*. Carried on the request so the signing
+/// message is domain-separated and the finished signature is installed on the
+/// matching plane.
+///
+/// This exists because a group must be able to threshold-sign a ceremony
+/// proposal (group→group reconfiguration), and the signing path would otherwise
+/// build every message under [`crate::space::SPACE_EVENT_DOMAIN`] and hand the
+/// result to the space plane. Postcard is not self-describing and
+/// `CeremonyOp::DkgPropose` shares variant tag 0 with `SpaceOp::Recover`, so a
+/// cross-target signature is not merely misfiled — it is a type-confusion
+/// primitive that could reinterpret attacker-chosen bytes as a re-root op
+/// carrying a genuine group signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignTarget {
+    /// A [`crate::space::SpaceOp`] — `Recover` or `Rotate`.
+    SpaceOp,
+    /// A `DkgPropose` authorizing a new DKG (group→group reconfiguration).
+    CeremonyProposal,
+}
 
 /// One participant's contribution to a FROST ceremony, posted to the shared
 /// bulletin board and signed by the contributing **device** (the sigdag author).
-/// A session is a DKG (produce a recovery group key) followed by one `Rotate`.
+///
+/// Openers (`DkgPropose`, `SignRequest`) carry no transcript field — they
+/// *define* one, as the hash of the node carrying them, which the op alone
+/// cannot know. Callers must take the id from the enclosing [`SignedNode`];
+/// [`CeremonyOp::dkg`] and [`CeremonyOp::signing`] return `None` for them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CeremonyOp {
-    /// Open a DKG session: the ordered participant devices + threshold. Authored
-    /// by the initiator, who must hold the current recovery key to install the
-    /// result. `participants` are device `UserId` strings, sorted (index = pos+1).
-    Propose {
-        session: [u8; 16],
+    /// Open a DKG transcript: the ordered participant devices + threshold.
+    /// Authorization is *not* the device signature on this node — see
+    /// [`ProposalAuth`].
+    DkgPropose {
+        nonce: [u8; 16],
         n: u16,
         k: u16,
-        participants: Vec<String>,
+        /// Participant devices, sorted + deduped (index = position + 1).
+        participants: Vec<UserId>,
     },
+    /// The recovery authority's authorization for a `DkgPropose`. Carried as its
+    /// own board entry because what it signs is the proposal's *hash*, which
+    /// cannot be a field of the proposal.
+    DkgAuthorize(ProposalAuth),
     /// A broadcast DKG round-1 package.
-    Round1 { session: [u8; 16], package: Vec<u8> },
+    DkgRound1 { dkg: TranscriptId, package: Vec<u8> },
     /// A DKG round-2 secret share, sealed to recipient device `to`.
-    Round2 {
-        session: [u8; 16],
-        to: String,
+    DkgRound2 {
+        dkg: TranscriptId,
+        to: UserId,
         sealed: Vec<u8>,
     },
-    /// Open a threshold-signing session: the space-plane op (serialized) the
-    /// group should sign. Authored by any holder; others co-sign it.
-    SignRequest { session: [u8; 16], op: Vec<u8> },
+    /// Open a threshold-signing transcript over `op`.
+    SignRequest {
+        nonce: [u8; 16],
+        /// The DKG transcript whose group key is being asked to sign. Binds the
+        /// request to one authority rather than "whichever group is current".
+        authority: TranscriptId,
+        target: SignTarget,
+        op: Vec<u8>,
+    },
     /// A broadcast signing round-1 commitment.
     SignRound1 {
-        session: [u8; 16],
+        signing: TranscriptId,
         commitments: Vec<u8>,
     },
     /// A broadcast signing round-2 signature share (not secret).
-    SignRound2 { session: [u8; 16], share: Vec<u8> },
+    SignRound2 {
+        signing: TranscriptId,
+        share: Vec<u8>,
+    },
 }
 
 impl CeremonyOp {
-    pub fn session(&self) -> [u8; 16] {
+    /// The DKG transcript this op belongs to, where the op alone determines it.
+    /// `None` for openers — their id is the hash of the enclosing node.
+    pub fn dkg(&self) -> Option<TranscriptId> {
         match self {
-            CeremonyOp::Propose { session, .. }
-            | CeremonyOp::Round1 { session, .. }
-            | CeremonyOp::Round2 { session, .. }
-            | CeremonyOp::SignRequest { session, .. }
-            | CeremonyOp::SignRound1 { session, .. }
-            | CeremonyOp::SignRound2 { session, .. } => *session,
+            CeremonyOp::DkgRound1 { dkg, .. } | CeremonyOp::DkgRound2 { dkg, .. } => Some(*dkg),
+            _ => None,
         }
     }
+    /// The signing transcript this op belongs to, where the op alone determines
+    /// it. `None` for openers.
+    pub fn signing(&self) -> Option<TranscriptId> {
+        match self {
+            CeremonyOp::SignRound1 { signing, .. } | CeremonyOp::SignRound2 { signing, .. } => {
+                Some(*signing)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Authorization for a `DkgPropose`, detached from the proposal node.
+///
+/// A ceremony signature proves only control of the declared **device** key. It
+/// says nothing about authority to configure an elevation, so acceptance rests
+/// on this instead: a signature by the recovery authority current at proposal
+/// time, over the proposal's own id.
+///
+/// Detached rather than a field on `DkgPropose`, because the thing being
+/// authorized is the proposal's *hash*, which cannot be a field of the proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalAuth {
+    /// The proposal being authorized.
+    pub proposal: TranscriptId,
+    /// The key that authorized it — checked against the standing recovery
+    /// commitment by the acceptance rule, not trusted from here.
+    pub by: UserId,
+    /// Detached signature over the proposal id (see [`sign_proposal_auth`]).
+    pub sig: Vec<u8>,
+}
+
+/// Domain for the detached proposal authorization. Distinct from
+/// [`CEREMONY_DOMAIN`] so an authorization can never verify as a ceremony
+/// contribution, or vice versa.
+pub const PROPOSAL_AUTH_DOMAIN: &[u8] = b"lait/space/1/ceremony/2/proposal-auth";
+
+/// Authorize `proposal` with the current recovery secret. Rides
+/// [`sigdag::sign_message`], so it is domain-separated and workspace-bound: an
+/// authorization cannot be lifted to another workspace, replayed against a
+/// different proposal, or reused as any other kind of signature.
+pub fn sign_proposal_auth(
+    recovery_seed: &[u8; 32],
+    ws: &WorkspaceId,
+    proposal: &TranscriptId,
+) -> ProposalAuth {
+    let (by, sig) = sigdag::sign_message(
+        PROPOSAL_AUTH_DOMAIN,
+        ws.as_str(),
+        recovery_seed,
+        &proposal.0,
+    );
+    ProposalAuth {
+        proposal: *proposal,
+        by,
+        sig: sig.to_vec(),
+    }
+}
+
+/// Whether `auth` is a well-formed authorization for its named proposal. Says
+/// nothing about *whose* key signed it — the caller must still check
+/// `auth.by` against the standing recovery commitment.
+pub fn verify_proposal_auth(auth: &ProposalAuth, ws: &WorkspaceId) -> bool {
+    let Ok(sig) = <[u8; 64]>::try_from(auth.sig.as_slice()) else {
+        return false;
+    };
+    sigdag::verify_message(
+        PROPOSAL_AUTH_DOMAIN,
+        ws.as_str(),
+        &auth.by,
+        &auth.proposal.0,
+        &sig,
+    )
 }
 
 /// Sign a [`CeremonyOp`] with the contributing device's seed.
@@ -83,27 +244,179 @@ pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &WorkspaceId) -> Sign
     )
 }
 
-/// Signature-verified `(author_device, op)` pairs for one session.
-pub fn parse_ceremony(
-    events: &[SignedNode],
-    ws: &WorkspaceId,
-    session: &[u8; 16],
-) -> Vec<(UserId, CeremonyOp)> {
-    events
-        .iter()
-        .filter_map(|ev| {
-            if !ev.verify_sig(CEREMONY_DOMAIN, ws.as_str()) {
-                return None;
+/// A signature-verified board entry: who posted it, the id of the node (which
+/// *is* the transcript id when the op is an opener), and the op.
+#[derive(Debug, Clone)]
+pub struct Verified {
+    pub author: UserId,
+    pub id: TranscriptId,
+    pub op: CeremonyOp,
+}
+
+/// One DKG transcript's verified contributions.
+#[derive(Debug, Clone, Default)]
+pub struct DkgTranscript {
+    /// The opening proposal, if it has been seen.
+    pub proposal: Option<Verified>,
+    /// The recovery authority's authorization, if posted. Signature-checked
+    /// here; whether `by` is the *standing* authority is the caller's rule.
+    pub auth: Option<ProposalAuth>,
+    /// Round packages referencing this transcript (openers excluded).
+    pub rounds: Vec<Verified>,
+}
+
+/// One signing transcript's verified contributions.
+#[derive(Debug, Clone, Default)]
+pub struct SignTranscript {
+    pub request: Option<Verified>,
+    pub rounds: Vec<Verified>,
+}
+
+/// Every verified ceremony contribution, indexed by transcript.
+#[derive(Debug, Clone, Default)]
+pub struct CeremonyBoard {
+    pub dkg: BTreeMap<TranscriptId, DkgTranscript>,
+    pub signing: BTreeMap<TranscriptId, SignTranscript>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Signature verifications performed by [`parse_board`], so tests can assert
+    /// the scan is linear in board size rather than `transcripts × board`.
+    pub static VERIFY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Verify and index the whole board in **one pass**.
+///
+/// Replaces the per-session parse this used to do: callers previously decoded
+/// events *unverified* to discover sessions, then re-verified the entire board
+/// once per discovered session. That let unsigned events manufacture transcripts
+/// and made the work `transcripts × board` — both attacker-controlled. Here every
+/// event is verified exactly once and an event that fails is dropped before it
+/// can name anything.
+///
+/// Note this establishes *authenticity*, not *authorization*: a validly signed
+/// proposal from any device still lands here. Accepting it is
+/// [`ProposalAuth`]'s job, applied by the caller.
+pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
+    let mut board = CeremonyBoard::default();
+    for ev in events {
+        #[cfg(test)]
+        VERIFY_COUNT.with(|c| c.set(c.get() + 1));
+        if !ev.verify_sig(CEREMONY_DOMAIN, ws.as_str()) {
+            continue;
+        }
+        let Ok(op) = postcard::from_bytes::<CeremonyOp>(&ev.op) else {
+            continue;
+        };
+        let Some(id) = TranscriptId::of(ev) else {
+            continue;
+        };
+        let entry = Verified {
+            author: ev.author.clone(),
+            id,
+            op,
+        };
+        match &entry.op {
+            // Openers are keyed by their OWN id — they define the transcript.
+            CeremonyOp::DkgPropose { .. } => {
+                board.dkg.entry(id).or_default().proposal = Some(entry);
             }
-            let op = postcard::from_bytes::<CeremonyOp>(&ev.op).ok()?;
-            (op.session() == *session).then(|| (ev.author.clone(), op))
-        })
-        .collect()
+            CeremonyOp::SignRequest { .. } => {
+                board.signing.entry(id).or_default().request = Some(entry);
+            }
+            // Authorizations are filed against the proposal they name, and only
+            // if the detached signature actually covers it — an unverifiable one
+            // must never occupy the slot a real authorization would fill.
+            CeremonyOp::DkgAuthorize(auth) => {
+                if verify_proposal_auth(auth, ws) {
+                    let (proposal, auth) = (auth.proposal, auth.clone());
+                    board.dkg.entry(proposal).or_default().auth = Some(auth);
+                }
+            }
+            // Rounds are keyed by the transcript they name.
+            CeremonyOp::DkgRound1 { dkg, .. } | CeremonyOp::DkgRound2 { dkg, .. } => {
+                let dkg = *dkg;
+                board.dkg.entry(dkg).or_default().rounds.push(entry);
+            }
+            CeremonyOp::SignRound1 { signing, .. } | CeremonyOp::SignRound2 { signing, .. } => {
+                let signing = *signing;
+                board.signing.entry(signing).or_default().rounds.push(entry);
+            }
+        }
+    }
+    board
 }
 
 /// Serialized packages keyed by 1-based participant index — how a round's
 /// contributions travel on the transport.
 pub type Packages = BTreeMap<u16, Vec<u8>>;
+
+/// A local record that this device accepted a specific proposal, written the
+/// first time it acts on one.
+///
+/// Acceptance is checked against the recovery authority **current at proposal
+/// time**, and "proposal time" cannot be re-derived later: the elevation this
+/// authorizes ends by rotating the authority, so re-checking against the
+/// standing key would un-accept every transcript the moment it succeeds —
+/// orphaning holders who had not finished their rounds.
+///
+/// It is not a second authorization path. It is only consulted for a proposal
+/// whose configuration still matches the board byte-for-byte, and it is written
+/// only after a genuine acceptance. Comparing local files against the board's
+/// signed proposal is a real check; checking that a local file agrees with
+/// itself would be circular.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DkgManifest {
+    pub proposal: TranscriptId,
+    pub proposal_author: UserId,
+    pub n: u16,
+    pub k: u16,
+    pub participants: Vec<UserId>,
+}
+
+/// One signing transcript's single-use nonce state.
+///
+/// FROST nonces are one-use cryptographic material. Producing shares for two
+/// different signing packages under one nonce is textbook reuse — two equations,
+/// one unknown — and yields the holder's signing share. The record therefore
+/// carries the [`nonce_binding`] of the package it was committed for, and the
+/// signer refuses if the package it is about to sign does not match.
+///
+/// The **comparison** is what enforces the invariant, not deletion: a crash
+/// between publishing a share and deleting the record always leaves the record
+/// behind, so the check has to stand alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingNonce {
+    pub signing: TranscriptId,
+    /// [`nonce_binding`] of the package these nonces may sign. All-zero until
+    /// the full commitment set is known, then fixed for the record's life.
+    pub binding: [u8; 32],
+    pub nonces: Vec<u8>,
+}
+
+/// The binding a [`PendingNonce`] is pinned to: a domain-separated hash over the
+/// signing transcript, the exact message, and the complete frozen commitment map
+/// (which encodes the signer set — the indices are its keys).
+///
+/// One composite hash rather than several separate comparisons: a single value
+/// cannot be partially checked, and the field most likely to be dropped in a
+/// later refactor is the signer set — exactly what any-K selection would start
+/// mutating.
+pub fn nonce_binding(signing: &TranscriptId, message: &[u8], commitments: &Packages) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"lait/space/1/ceremony/2/nonce-binding");
+    h.update(&signing.0);
+    h.update(&(message.len() as u64).to_le_bytes());
+    h.update(message);
+    h.update(&(commitments.len() as u64).to_le_bytes());
+    for (i, c) in commitments {
+        h.update(&i.to_le_bytes());
+        h.update(&(c.len() as u64).to_le_bytes());
+        h.update(c);
+    }
+    *h.finalize().as_bytes()
+}
 
 fn ident(index: u16) -> Result<frost::Identifier> {
     frost::Identifier::try_from(index).map_err(|e| anyhow!("dkg identifier {index}: {e}"))
@@ -115,6 +428,19 @@ fn ser<T, E: std::fmt::Display>(r: std::result::Result<T, E>, what: &str) -> Res
 
 /// The group public key as a lait `UserId` (a plain Ed25519 key), from a DKG
 /// public-key package. This is the recovery authority the plane commits to.
+/// The group key **derived** from a serialized public-key package.
+///
+/// The authority a `Rotate` installs must come from here, never from a stored
+/// plaintext `-group` artifact: the derivation is cheap and the file is a swap
+/// target that would let a local attacker redirect the rotation.
+pub fn group_key_of_package(pkp: &[u8]) -> Result<UserId> {
+    let pkp = ser(
+        frost::keys::PublicKeyPackage::deserialize(pkp),
+        "deserialize public key package",
+    )?;
+    group_key_of(&pkp)
+}
+
 fn group_key_of(pkp: &frost::keys::PublicKeyPackage) -> Result<UserId> {
     let bytes = ser(pkp.verifying_key().serialize(), "serialize group key")?;
     Ok(UserId::from_key_string(
@@ -384,5 +710,234 @@ mod tests {
             .as_slice()
             .try_into()
             .ok()
+    }
+
+    // ---- transcript identity ----
+
+    fn ws() -> WorkspaceId {
+        WorkspaceId::mint(&crate::ids::SystemUlidSource)
+    }
+
+    /// A transcript id only ever reaches the filesystem as `to_hex`, so the
+    /// parser must reject anything that is not canonical — a permissive decode
+    /// would let two spellings name one artifact, and a remote-supplied string
+    /// could carry path components.
+    #[test]
+    fn transcript_ids_parse_only_canonical_hex() {
+        let good = "a".repeat(64);
+        assert!(TranscriptId::parse_hex(&good).is_some());
+        for bad in [
+            "",
+            "a",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"A".repeat(64),                  // uppercase
+            &format!("{}/", "a".repeat(63)),  // path separator
+            &format!("{}\\", "a".repeat(63)), // windows separator
+            &format!("..{}", "a".repeat(62)), // traversal
+            &format!("{}\0", "a".repeat(63)), // NUL
+            &format!("{} ", "a".repeat(63)),  // trailing space
+            &"g".repeat(64),                  // non-hex
+        ] {
+            assert!(
+                TranscriptId::parse_hex(bad).is_none(),
+                "must reject {bad:?}"
+            );
+        }
+        // Round-trip is canonical and stable.
+        let id = TranscriptId::parse_hex(&good).unwrap();
+        assert_eq!(id.to_hex(), good);
+    }
+
+    /// A transcript's id is the hash of the node that opened it.
+    #[test]
+    fn a_transcript_id_is_the_opening_nodes_hash() {
+        let w = ws();
+        let op = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        };
+        let ev = sign_ceremony(&[7u8; 32], &op, &w);
+        assert_eq!(TranscriptId::of(&ev).unwrap().to_hex(), ev.hash());
+    }
+
+    /// Openers cannot report their own transcript — the id is the hash of the
+    /// enclosing node, which the op alone cannot know. Callers must take it from
+    /// the `SignedNode`, and this pins that asymmetry.
+    #[test]
+    fn openers_report_no_transcript_of_their_own() {
+        let opener = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        };
+        assert!(opener.dkg().is_none() && opener.signing().is_none());
+        let id = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
+        let round = CeremonyOp::DkgRound1 {
+            dkg: id,
+            package: vec![],
+        };
+        assert_eq!(round.dkg(), Some(id));
+        assert!(round.signing().is_none());
+    }
+
+    // ---- board scan ----
+
+    /// A forged event cannot name anything: `parse_board` drops it before it
+    /// reaches an index, so it can neither supply configuration nor manufacture
+    /// a transcript for the caller to spend work on.
+    #[test]
+    fn the_board_drops_events_whose_signature_does_not_verify() {
+        let w = ws();
+        let op = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        };
+        let mut ev = sign_ceremony(&[7u8; 32], &op, &w);
+        assert_eq!(parse_board(std::slice::from_ref(&ev), &w).dkg.len(), 1);
+        ev.sig = vec![0u8; 64];
+        assert!(parse_board(&[ev.clone()], &w).dkg.is_empty());
+        // Nor can it be lifted into a different workspace.
+        assert!(parse_board(std::slice::from_ref(&ev), &ws()).dkg.is_empty());
+    }
+
+    /// The scan verifies each event exactly once, however many transcripts the
+    /// board holds. The old per-session parse re-verified the whole board once
+    /// per discovered session — `transcripts × board`, both attacker-controlled.
+    #[test]
+    fn board_scan_cost_is_linear_in_events_not_transcripts() {
+        let w = ws();
+        let events: Vec<SignedNode> = (0..24u8)
+            .map(|i| {
+                sign_ceremony(
+                    &[9u8; 32],
+                    &CeremonyOp::DkgPropose {
+                        nonce: [i; 16],
+                        n: 2,
+                        k: 2,
+                        participants: vec![],
+                    },
+                    &w,
+                )
+            })
+            .collect();
+        VERIFY_COUNT.with(|c| c.set(0));
+        let board = parse_board(&events, &w);
+        let verifies = VERIFY_COUNT.with(|c| c.get());
+        assert_eq!(board.dkg.len(), 24, "24 distinct transcripts");
+        assert_eq!(
+            verifies,
+            events.len(),
+            "one verification per event, not per (transcript, event) pair"
+        );
+    }
+
+    // ---- proposal authorization ----
+
+    /// An authorization is bound to one proposal in one workspace: it cannot be
+    /// replayed against a different proposal, nor lifted to another workspace.
+    #[test]
+    fn a_proposal_authorization_binds_to_its_proposal_and_workspace() {
+        let w = ws();
+        let seed = [3u8; 32];
+        let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let b = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
+
+        let auth = sign_proposal_auth(&seed, &w, &a);
+        assert!(verify_proposal_auth(&auth, &w));
+        // Same signature, different proposal.
+        let swapped = ProposalAuth {
+            proposal: b,
+            ..auth.clone()
+        };
+        assert!(!verify_proposal_auth(&swapped, &w));
+        // Same signature, different workspace.
+        assert!(!verify_proposal_auth(&auth, &ws()));
+        // Tampered signature.
+        let mut bad = auth.clone();
+        bad.sig[0] ^= 0xff;
+        assert!(!verify_proposal_auth(&bad, &w));
+    }
+
+    /// An unverifiable authorization must not occupy the slot a real one would
+    /// fill — otherwise it could mask a genuine authorization arriving later.
+    #[test]
+    fn the_board_files_only_verifiable_authorizations() {
+        let w = ws();
+        let propose = CeremonyOp::DkgPropose {
+            nonce: [1u8; 16],
+            n: 2,
+            k: 2,
+            participants: vec![],
+        };
+        let pev = sign_ceremony(&[7u8; 32], &propose, &w);
+        let id = TranscriptId::of(&pev).unwrap();
+
+        let mut auth = sign_proposal_auth(&[3u8; 32], &w, &id);
+        auth.sig[0] ^= 0xff;
+        let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(auth), &w);
+        let board = parse_board(&[pev.clone(), aev], &w);
+        assert!(
+            board.dkg[&id].auth.is_none(),
+            "a broken authorization is not filed"
+        );
+
+        let good = sign_proposal_auth(&[3u8; 32], &w, &id);
+        let aev = sign_ceremony(&[7u8; 32], &CeremonyOp::DkgAuthorize(good), &w);
+        let board = parse_board(&[pev, aev], &w);
+        assert!(board.dkg[&id].auth.is_some());
+    }
+
+    // ---- nonce binding ----
+
+    /// The binding covers the transcript, the message AND the complete
+    /// commitment map (whose keys are the signer set). Any of them moving is a
+    /// different binding, so a stored nonce cannot sign two distinct packages.
+    #[test]
+    fn the_nonce_binding_covers_transcript_message_and_signer_set() {
+        let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
+        let b = TranscriptId::parse_hex(&"b".repeat(64)).unwrap();
+        let commitments: Packages = [(1u16, vec![1, 2, 3]), (2u16, vec![4, 5, 6])]
+            .into_iter()
+            .collect();
+        let base = nonce_binding(&a, b"msg", &commitments);
+
+        assert_ne!(base, nonce_binding(&b, b"msg", &commitments), "transcript");
+        assert_ne!(base, nonce_binding(&a, b"other", &commitments), "message");
+
+        // A different signer set at the same size.
+        let moved: Packages = [(1u16, vec![1, 2, 3]), (3u16, vec![4, 5, 6])]
+            .into_iter()
+            .collect();
+        assert_ne!(base, nonce_binding(&a, b"msg", &moved), "signer set");
+
+        // A changed commitment for the same signer.
+        let tweaked: Packages = [(1u16, vec![1, 2, 3]), (2u16, vec![4, 5, 7])]
+            .into_iter()
+            .collect();
+        assert_ne!(
+            base,
+            nonce_binding(&a, b"msg", &tweaked),
+            "commitment bytes"
+        );
+
+        // Stable for identical input.
+        assert_eq!(base, nonce_binding(&a, b"msg", &commitments));
+    }
+
+    /// The group key must be derivable from the public-key package, since that
+    /// derivation is what replaces trusting a stored plaintext `-group` file.
+    #[test]
+    fn the_group_key_derives_from_the_public_key_package() {
+        let (holders, group_key) = run_dkg(3, 2);
+        for (_, pkp) in holders.values() {
+            assert_eq!(group_key_of_package(pkp).unwrap(), group_key);
+        }
+        assert!(group_key_of_package(b"not a package").is_err());
     }
 }
