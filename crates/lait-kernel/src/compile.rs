@@ -12,15 +12,26 @@
 //! access control right. An unqualified set has no valid `λ`, so it can produce
 //! no reconstruction — which is the whole security property.
 //!
-//! # The validation boundary
+//! # Two boundaries: structural safety vs. policy correctness
 //!
-//! [`CompiledPolicy`] is `Deserialize` and therefore **untrusted**: future
-//! ceremony/configuration material carries it in over the wire. Reconstruction
-//! and witness verification live only on [`ValidatedCompiledPolicy`], which is
-//! reachable solely through [`CompiledPolicy::validate`]. Validation rejects
-//! non-canonical scalars, dimension mismatches, a target that is not `e1`,
-//! duplicate leaves and over-limit structures — so the arithmetic paths never see
-//! hostile shapes and cannot panic on them.
+//! [`CompiledPolicy`] is `Deserialize` and therefore **untrusted**.
+//!
+//! [`CompiledPolicy::validate_structure`] proves only that an artifact is *safe
+//! to process* — supported version, consistent dimensions, canonical scalars, an
+//! `e1` target, unique leaves, in-bounds size. It yields a
+//! [`StructurallyValidatedCompiledPolicy`], which alone exposes the arithmetic
+//! paths, so those never see a hostile shape and cannot panic. **It does not
+//! prove the matrix implements any particular policy.** A hostile party can craft
+//! an arbitrary well-formed matrix and label it with an approved `PolicyId`; it
+//! passes structural validation. The name says *structurally* validated on
+//! purpose.
+//!
+//! Policy correctness is a *different* proof, and cannot come from the artifact
+//! alone: [`verify_compilation`] **recompiles** the committed canonical policy's
+//! immutable [`Expansion`] and requires the result's [`AccessStructureCommitment`]
+//! to equal the advertised one. Only recompilation ties a matrix to the policy an
+//! authority approved. C4 acceptance MUST use `verify_compilation`; it must never
+//! treat a structurally-valid artifact as semantic proof.
 //!
 //! # The review boundary
 //!
@@ -93,7 +104,7 @@ pub struct CompiledPolicy {
 /// type exposes reconstruction and witness verification, so those paths are never
 /// reached with an unvalidated (possibly hostile) structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedCompiledPolicy(CompiledPolicy);
+pub struct StructurallyValidatedCompiledPolicy(CompiledPolicy);
 
 /// The content-address of a compiled access structure — the second of the three
 /// identities (§17): the exact compiler output, distinct from the human
@@ -152,10 +163,12 @@ impl std::fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 impl CompiledPolicy {
-    /// Check every structural invariant, returning a [`ValidatedCompiledPolicy`]
+    /// Check every structural invariant, returning a [`StructurallyValidatedCompiledPolicy`]
     /// that alone exposes the arithmetic paths. Consumes `self` so an unvalidated
     /// value cannot linger.
-    pub fn validate(self) -> Result<ValidatedCompiledPolicy, ValidationError> {
+    pub fn validate_structure(
+        self,
+    ) -> Result<StructurallyValidatedCompiledPolicy, ValidationError> {
         if self.version != COMPILER_VERSION {
             return Err(ValidationError::UnsupportedVersion(self.version));
         }
@@ -196,11 +209,11 @@ impl CompiledPolicy {
         if distinct.len() != self.leaves.len() {
             return Err(ValidationError::DuplicateLeaf);
         }
-        Ok(ValidatedCompiledPolicy(self))
+        Ok(StructurallyValidatedCompiledPolicy(self))
     }
 }
 
-impl ValidatedCompiledPolicy {
+impl StructurallyValidatedCompiledPolicy {
     pub fn inner(&self) -> &CompiledPolicy {
         &self.0
     }
@@ -314,10 +327,12 @@ impl ValidatedCompiledPolicy {
 
 /// Compile an expansion into its validated access structure. Identity is taken
 /// from the expansion (finding 4), so no mismatched policy id can be asserted.
-pub fn compile(expansion: &Expansion) -> Result<ValidatedCompiledPolicy, ValidationError> {
+pub fn compile(
+    expansion: &Expansion,
+) -> Result<StructurallyValidatedCompiledPolicy, ValidationError> {
     let mut rows: Vec<(LeafId, Vec<Scalar>)> = Vec::new();
     let mut cols = 1usize; // column 0 is the secret
-    build(&expansion.tree, vec![Scalar::ONE], &mut cols, &mut rows);
+    build(expansion.tree(), vec![Scalar::ONE], &mut cols, &mut rows);
 
     let matrix_rows: Vec<Vec<Fe>> = rows
         .iter()
@@ -334,7 +349,7 @@ pub fn compile(expansion: &Expansion) -> Result<ValidatedCompiledPolicy, Validat
 
     CompiledPolicy {
         version: COMPILER_VERSION,
-        policy: expansion.id,
+        policy: expansion.id(),
         leaves,
         matrix: AccessMatrix {
             rows: matrix_rows,
@@ -342,7 +357,58 @@ pub fn compile(expansion: &Expansion) -> Result<ValidatedCompiledPolicy, Validat
         },
         target,
     }
-    .validate()
+    .validate_structure()
+}
+
+/// The error of [`verify_compilation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyError {
+    /// The recompiled artifact did not even validate structurally (should not
+    /// happen for an expansion we built, but the boundary is explicit).
+    Structure(ValidationError),
+    /// The recompiled commitment does not equal the advertised one — the
+    /// advertised matrix does not implement this policy's expansion.
+    CommitmentMismatch,
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyError::Structure(e) => write!(f, "recompilation failed to validate: {e}"),
+            VerifyError::CommitmentMismatch => {
+                write!(
+                    f,
+                    "the advertised access structure does not implement this policy"
+                )
+            }
+        }
+    }
+}
+impl std::error::Error for VerifyError {}
+
+/// Prove that `advertised` is the access structure of `expansion`'s policy —
+/// **not** merely that some structurally-valid artifact carries that commitment.
+///
+/// This is the policy-correctness proof structural validation cannot give: it
+/// recompiles the immutable expansion locally and requires the recomputed
+/// [`AccessStructureCommitment`] to equal `advertised`. Because [`Expansion`] can
+/// only be produced by [`crate::expand::expand`] — which stamps its `id` from the
+/// policy whose tree it built — an accepter that recomputes the expansion from
+/// the approved canonical policy and immutable custody snapshot, then calls this,
+/// has an unbroken chain: policy → expansion → matrix → commitment.
+///
+/// C4 acceptance uses this. A candidate configuration is accepted only when this
+/// returns `Ok` for the approved policy's expansion and the candidate's advertised
+/// commitment.
+pub fn verify_compilation(
+    expansion: &Expansion,
+    advertised: AccessStructureCommitment,
+) -> Result<StructurallyValidatedCompiledPolicy, VerifyError> {
+    let recompiled = compile(expansion).map_err(VerifyError::Structure)?;
+    if recompiled.commitment() != advertised {
+        return Err(VerifyError::CommitmentMismatch);
+    }
+    Ok(recompiled)
 }
 
 fn build(
@@ -459,7 +525,7 @@ mod tests {
         }
     }
 
-    fn compile_policy(o: OwnershipPolicy) -> (ValidatedCompiledPolicy, Expansion) {
+    fn compile_policy(o: OwnershipPolicy) -> (StructurallyValidatedCompiledPolicy, Expansion) {
         let canon = o.canonicalize().unwrap();
         let exp = expand(&canon, &resolver()).unwrap();
         (compile(&exp).unwrap(), exp)
@@ -479,7 +545,7 @@ mod tests {
     /// semantics directly.
     fn exhaustive_check(o: OwnershipPolicy) {
         let (compiled, exp) = compile_policy(o);
-        let leaves: Vec<LeafId> = exp.tree.leaves().into_iter().cloned().collect();
+        let leaves: Vec<LeafId> = exp.tree().leaves().into_iter().cloned().collect();
         let n = leaves.len();
         assert!(n <= 12);
         for mask in 0u32..(1u32 << n) {
@@ -488,7 +554,7 @@ mod tests {
                 .map(|i| leaves[i].clone())
                 .collect();
             let present: BTreeSet<LeafId> = subset.iter().cloned().collect();
-            let boolean = satisfied(&exp.tree, &present);
+            let boolean = satisfied(exp.tree(), &present);
             let witness = compiled.reconstruct(&subset);
             assert_eq!(witness.is_some(), boolean, "subset {mask:b}");
             if let Some(w) = witness {
@@ -538,13 +604,13 @@ mod tests {
         ]);
         let (compiled, exp) = compile_policy(policy);
         let team_b: BTreeSet<LeafId> = exp
-            .leaves
+            .leaves()
             .iter()
             .filter(|d| d.principal == prin(4))
             .map(|d| d.leaf.clone())
             .collect();
         let team_a: Vec<LeafId> = exp
-            .leaves
+            .leaves()
             .iter()
             .filter(|d| !team_b.contains(&d.leaf))
             .map(|d| d.leaf.clone())
@@ -556,7 +622,7 @@ mod tests {
     #[test]
     fn a_forged_witness_over_an_unqualified_set_fails_verification() {
         let (compiled, exp) = compile_policy(OwnershipPolicy::AllOf(vec![key(1), key(2)]));
-        let leaves: Vec<LeafId> = exp.tree.leaves().into_iter().cloned().collect();
+        let leaves: Vec<LeafId> = exp.tree().leaves().into_iter().cloned().collect();
         let forged = ReconstructionWitness {
             structure: compiled.commitment(),
             leaves: vec![leaves[0].clone()],
@@ -628,6 +694,66 @@ mod tests {
     }
 
     #[test]
+    fn verify_compilation_proves_the_matrix_implements_the_policy() {
+        // Honest: the advertised commitment is the real one.
+        let canon = OwnershipPolicy::AllOf(vec![key(1), key(2)])
+            .canonicalize()
+            .unwrap();
+        let exp = expand(&canon, &resolver()).unwrap();
+        let honest = compile(&exp).unwrap().commitment();
+        assert!(verify_compilation(&exp, honest).is_ok());
+
+        // Hostile: a well-formed matrix for a DIFFERENT policy, labeled with the
+        // approved policy id, passes STRUCTURAL validation — but advertising its
+        // commitment for THIS policy's expansion fails recompilation.
+        let other = expand(
+            &OwnershipPolicy::AnyOf(vec![key(3), key(4)])
+                .canonicalize()
+                .unwrap(),
+            &resolver(),
+        )
+        .unwrap();
+        let hostile_commitment = compile(&other).unwrap().commitment();
+        assert_ne!(hostile_commitment, honest);
+        assert_eq!(
+            verify_compilation(&exp, hostile_commitment),
+            Err(VerifyError::CommitmentMismatch),
+            "a matrix that does not implement this policy is rejected by recompilation"
+        );
+    }
+
+    #[test]
+    fn a_hostile_matrix_with_an_approved_id_passes_structure_but_not_compilation() {
+        // Compile policy B, then relabel it with policy A's id: structurally
+        // valid, semantically a lie.
+        let a = OwnershipPolicy::AllOf(vec![key(1), key(2)])
+            .canonicalize()
+            .unwrap();
+        let exp_a = expand(&a, &resolver()).unwrap();
+        let mut forged = compile(
+            &expand(
+                &OwnershipPolicy::AnyOf(vec![key(1), key(2)])
+                    .canonicalize()
+                    .unwrap(),
+                &resolver(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .inner()
+        .clone();
+        forged.policy = a.id(); // attach the approved policy id
+                                // Structural validation accepts it — shape is fine.
+        assert!(forged.clone().validate_structure().is_ok());
+        // But it does not compile from A's expansion.
+        assert_ne!(
+            compile(&exp_a).unwrap().commitment(),
+            forged.validate_structure().unwrap().commitment(),
+            "structural validity is not policy correctness"
+        );
+    }
+
+    #[test]
     fn hostile_deserialized_structures_are_rejected_not_panicked() {
         let (good, _) = compile_policy(OwnershipPolicy::AllOf(vec![key(1), key(2)]));
         let base = good.inner().clone();
@@ -635,26 +761,38 @@ mod tests {
         // Non-canonical scalar in a row.
         let mut bad = base.clone();
         bad.matrix.rows[0][0] = Fe([0xff; 32]);
-        assert_eq!(bad.validate(), Err(ValidationError::NoncanonicalScalar));
+        assert_eq!(
+            bad.validate_structure(),
+            Err(ValidationError::NoncanonicalScalar)
+        );
 
         // Inconsistent row length.
         let mut bad = base.clone();
         bad.matrix.rows[0].push(Fe::from_scalar(&Scalar::ONE));
-        assert_eq!(bad.validate(), Err(ValidationError::DimensionMismatch));
+        assert_eq!(
+            bad.validate_structure(),
+            Err(ValidationError::DimensionMismatch)
+        );
 
         // Target that is not e1.
         let mut bad = base.clone();
         bad.target[0] = Fe::from_scalar(&Scalar::from(5u64));
-        assert_eq!(bad.validate(), Err(ValidationError::BadTarget));
+        assert_eq!(bad.validate_structure(), Err(ValidationError::BadTarget));
 
         // Duplicate leaf.
         let mut bad = base.clone();
         bad.leaves[1] = bad.leaves[0].clone();
-        assert_eq!(bad.validate(), Err(ValidationError::DuplicateLeaf));
+        assert_eq!(
+            bad.validate_structure(),
+            Err(ValidationError::DuplicateLeaf)
+        );
 
         // Wrong version.
         let mut bad = base;
         bad.version = 99;
-        assert_eq!(bad.validate(), Err(ValidationError::UnsupportedVersion(99)));
+        assert_eq!(
+            bad.validate_structure(),
+            Err(ValidationError::UnsupportedVersion(99))
+        );
     }
 }

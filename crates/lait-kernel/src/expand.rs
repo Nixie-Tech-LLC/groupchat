@@ -98,9 +98,28 @@ pub enum ExpandedPolicy {
 /// travels with the expansion rather than being asserted alongside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expansion {
-    pub id: PolicyId,
-    pub tree: ExpandedPolicy,
-    pub leaves: Vec<LeafDescriptor>,
+    // Private: an Expansion can only be produced by `expand`, which stamps `id`
+    // from the very policy whose tree it built. Public fields would let a caller
+    // pair policy A's id with policy B's tree — the exact mismatch this binding
+    // exists to forbid (finding 1).
+    id: PolicyId,
+    tree: ExpandedPolicy,
+    leaves: Vec<LeafDescriptor>,
+}
+
+impl Expansion {
+    /// The canonical policy this expansion is of.
+    pub fn id(&self) -> PolicyId {
+        self.id
+    }
+    /// The leaf-level structure.
+    pub fn tree(&self) -> &ExpandedPolicy {
+        &self.tree
+    }
+    /// Each leaf's provenance, in canonical order.
+    pub fn leaves(&self) -> &[LeafDescriptor] {
+        &self.leaves
+    }
 }
 
 /// Why expansion failed.
@@ -295,13 +314,13 @@ mod tests {
         .canonicalize()
         .unwrap();
         let e = expand(&policy, &resolver(BTreeMap::new())).unwrap();
-        assert_eq!(e.leaves.len(), 3);
+        assert_eq!(e.leaves().len(), 3);
         // Each leaf's provenance points at its principal and device.
         for d in &e.leaves {
             assert_eq!(d.device, d.principal.as_device().unwrap());
         }
         // The structure is preserved, over leaves.
-        assert!(matches!(e.tree, ExpandedPolicy::Threshold { k: 2, .. }));
+        assert!(matches!(e.tree(), ExpandedPolicy::Threshold { k: 2, .. }));
     }
 
     #[test]
@@ -321,10 +340,10 @@ mod tests {
             .unwrap();
         let e = expand(&policy, &resolver(fed)).unwrap();
         // Four leaves: the 3 sub-devices of founder 1, plus device 2.
-        assert_eq!(e.leaves.len(), 4);
+        assert_eq!(e.leaves().len(), 4);
         // The federation flattened in — the top gate now has a threshold child,
         // not an opaque leaf for founder 1.
-        let ExpandedPolicy::Threshold { members, .. } = &e.tree else {
+        let ExpandedPolicy::Threshold { members, .. } = e.tree() else {
             panic!("expected a threshold root");
         };
         assert!(members
@@ -343,8 +362,11 @@ mod tests {
         .unwrap();
         let e = expand(&policy, &resolver(BTreeMap::new())).unwrap();
         // Three leaf rows: two occurrences of principal 1, one of principal 2.
-        let ones: Vec<&LeafDescriptor> =
-            e.leaves.iter().filter(|d| d.principal == prin(1)).collect();
+        let ones: Vec<&LeafDescriptor> = e
+            .leaves()
+            .iter()
+            .filter(|d| d.principal == prin(1))
+            .collect();
         assert_eq!(ones.len(), 2, "one principal, two rows");
         assert_ne!(ones[0].leaf, ones[1].leaf, "distinct leaf ids");
         assert_ne!(ones[0].path, ones[1].path, "distinct occurrence paths");
@@ -434,8 +456,8 @@ mod tests {
         let policy = key(1).canonicalize().unwrap();
         let e = expand(&policy, &resolver(fed)).unwrap();
         // Leaves: 20, 21 (from 2), and 3.
-        assert_eq!(e.leaves.len(), 3);
-        let principals: Vec<&PrincipalId> = e.leaves.iter().map(|d| &d.principal).collect();
+        assert_eq!(e.leaves().len(), 3);
+        let principals: Vec<&PrincipalId> = e.leaves().iter().map(|d| &d.principal).collect();
         assert!(principals.contains(&&prin(20)));
         assert!(principals.contains(&&prin(21)));
         assert!(principals.contains(&&prin(3)));
