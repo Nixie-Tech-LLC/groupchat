@@ -31,6 +31,7 @@ pub mod expand;
 pub mod gaccess;
 pub mod gdkg;
 pub mod genesis;
+pub mod handover;
 pub mod ids;
 pub mod policy;
 pub mod sigdag;
