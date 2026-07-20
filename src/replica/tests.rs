@@ -1346,8 +1346,7 @@ fn break_glass_recovery_re_roots_the_space() {
     .unwrap();
 
     // C recovers: the solo recovery key re-roots the space to C.
-    let (resp, _) = c.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(c.replica.space_recover_cmd());
     let c_actor = c.replica.my_actor().unwrap();
     assert!(
         c.replica.acl_state().is_admin(&c_actor),
@@ -1459,8 +1458,7 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
 
     // A's solo key is retired: recovery now runs through the group ceremony,
     // and a lone holder cannot meet the 2-of-2 threshold by itself.
-    let (resp, _) = a.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.space_recover_cmd());
     let still = crate::space::replay(
         &a.replica.genesis,
         &a.replica.space_id,
@@ -1612,8 +1610,7 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     }
 
     // B opens a break-glass recovery: this commits B's nonces.
-    let (resp, _) = b.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.space_recover_cmd());
     let events = b.replica.membership.ceremony_events();
     let board = crate::dkg::parse_board(&events, &b.replica.space_id);
     let signing = *board.signing.keys().next().expect("B opened a request");
@@ -1636,10 +1633,8 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
         sync_all(&mut b.replica, &mut a.replica);
         sync_all(&mut a.replica, &mut b.replica);
     }
-    let (resp, _) = a
-        .replica
-        .space_recover_approve_cmd(signing.to_hex(), vec![b_actor.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_recover_approve_cmd(signing.to_hex(), vec![b_actor.as_str().to_string()]));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -1743,32 +1738,37 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
 
     // Break-glass tells the operator what actually happened rather than
     // "no way to recover from this device".
-    let (resp, _) = b.replica.space_recover_cmd();
-    match resp {
-        Response::Error { message, .. } => {
-            assert!(
-                message.contains("another Windows account"),
-                "must name the actual cause: {message}"
-            );
-            assert!(
-                message.contains("current recovery key"),
-                "must say this share is for the live authority: {message}"
-            );
-            assert!(
-                message.contains(&dkg_id.to_hex()),
-                "must name the transcript: {message}"
-            );
-            assert!(
-                message.contains("cannot take part in recovery"),
-                "must say what THIS device can do: {message}"
-            );
-            assert!(
-                !message.contains("can still recover the space"),
-                "must not claim other holders can recover — this device cannot know that: {message}"
-            );
-        }
-        other => panic!("expected a typed failure, got {other:?}"),
-    }
+    let refusal = refused(b.replica.space_recover_cmd());
+    // The refusal names the holders rather than a pre-rendered sentence, so the
+    // remedy can be derived from the cause. The text it renders is the contract.
+    assert!(
+        matches!(
+            &refusal,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::ShareUnusable { holders } if holders.len() == 1)
+        ),
+        "{refusal:?}"
+    );
+    let message = refusal.to_string();
+    assert!(
+        message.contains("another Windows account"),
+        "must name the actual cause: {message}"
+    );
+    assert!(
+        message.contains("current recovery key"),
+        "must say this share is for the live authority: {message}"
+    );
+    assert!(
+        message.contains(&dkg_id.to_hex()),
+        "must name the transcript: {message}"
+    );
+    assert!(
+        message.contains("cannot take part in recovery"),
+        "must say what THIS device can do: {message}"
+    );
+    assert!(
+        !message.contains("can still recover the space"),
+        "must not claim other holders can recover — this device cannot know that: {message}"
+    );
 }
 
 /// A share belonging to a group that is **not** the space's recovery
@@ -2313,8 +2313,7 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
 
     // The remaining two recover, with #1 never syncing again.
     let recovering = nodes[0].replica.my_actor().unwrap();
-    let (resp, _) = nodes[0].replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(nodes[0].replica.space_recover_cmd());
     sync_mesh(&mut nodes, 3);
 
     let events = nodes[1].replica.membership.ceremony_events();
@@ -2324,10 +2323,9 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
         .keys()
         .next()
         .expect("a recovery request reached the other holder");
-    let (resp, _) = nodes[1]
+    ok(nodes[1]
         .replica
-        .space_recover_approve_cmd(session.to_hex(), vec![recovering.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+        .space_recover_approve_cmd(session.to_hex(), vec![recovering.as_str().to_string()]));
     sync_mesh(&mut nodes, 8);
 
     let after = crate::space::replay(
@@ -3007,8 +3005,7 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     assert!(!elevated.recovered);
 
     // B triggers break-glass recovery, re-rooting to itself.
-    let (resp, _) = b.replica.space_recover_cmd();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.space_recover_cmd());
     let b_actor = b.replica.my_actor().unwrap();
     // The transcript id B posted its request under — the hash of the signed
     // request node, read off the verified board.
@@ -3041,18 +3038,21 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
 
     // A must name the expected target: approving with the WRONG target is
     // refused before any share is contributed (consent binds to the roots).
-    let (bad, _) = a
-        .replica
-        .space_recover_approve_cmd(session_hex.clone(), vec![a_actor.as_str().to_string()]);
+    let bad = refused(
+        a.replica
+            .space_recover_approve_cmd(session_hex.clone(), vec![a_actor.as_str().to_string()]),
+    );
     assert!(
-        matches!(bad, Response::Error { .. }),
-        "approving a mismatched target must be refused: {bad:?}"
+        matches!(
+            &bad,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::RootMismatch { .. })
+        ),
+        "approving a mismatched target must be refused as a root mismatch, \
+         not something a holder could read as a transient fault: {bad:?}"
     );
     // A explicitly co-signs, having verified out-of-band that it re-roots to B.
-    let (resp, _) = a
-        .replica
-        .space_recover_approve_cmd(session_hex, vec![b_actor.as_str().to_string()]);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_recover_approve_cmd(session_hex, vec![b_actor.as_str().to_string()]));
 
     // Now the threshold consents; the group signature aggregates and installs.
     for _ in 0..6 {
@@ -4926,4 +4926,76 @@ fn the_device_projections_render_as_text() {
     let (actor, space) = text.split_once(' ').expect("two fields");
     assert_eq!(actor, n.replica.my_actor().unwrap().as_str());
     assert_eq!(space, n.replica.space_str());
+}
+
+// ---- a recovery that lands but does not finish ----
+
+#[test]
+fn a_re_root_that_cannot_re_key_still_reports_the_re_root() {
+    // The shape this guards: `space_recover_solo` commits the re-root, then
+    // bootstraps a fresh content key. That second step used to be able to fail
+    // into an error with no dirty set — denying a change that was already
+    // durable and, because `ring_doorbell` never fires, leaving every
+    // subscriber unaware the space had been re-rooted at all.
+    //
+    // The outcome type no longer has room for that: the re-root is `Installed`
+    // either way, and a failed re-key rides along as data the adapter reports.
+    let done = SpaceRecovered {
+        root: ActorId::from_incept_hash(&"a".repeat(64)),
+        rekey_failed: Some(anyhow!("epoch store is read-only")),
+    };
+    let (resp, dirty) = Replica::respond(
+        Ok(Change::committed(
+            SpaceRecovery::Installed(done),
+            DirtySet::catalog(CatalogScope::Acl),
+        )),
+        Replica::space_recovery_response,
+    );
+    assert!(
+        dirty.is_some(),
+        "a landed re-root rings, whatever happened after it"
+    );
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("a committed re-root is not an error: {other:?}"),
+    };
+    assert!(
+        message.contains("recovered the space") && message.contains("re-keying failed"),
+        "says both what landed and what did not: {message}"
+    );
+    assert!(
+        message.contains("still readable under the old key"),
+        "names the consequence the operator has to act on: {message}"
+    );
+}
+
+#[test]
+fn a_group_recovery_reports_a_share_it_could_not_add() {
+    // Same shape on the group path: once the signing request is on the board it
+    // is durable and visible to the other holders, so a local failure to
+    // contribute must not erase it.
+    let (resp, dirty) = Replica::respond(
+        Ok(Change::committed(
+            SpaceRecovery::Pending {
+                session: crate::dkg::TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
+                incomplete: Some(anyhow!("share file is unreadable")),
+            },
+            DirtySet::catalog(CatalogScope::Acl),
+        )),
+        Replica::space_recovery_response,
+    );
+    assert!(dirty.is_some(), "the open request rings");
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("an open ceremony is not an error: {other:?}"),
+    };
+    assert!(
+        message.contains("group recovery under way"),
+        "the request stands: {message}"
+    );
+    assert!(
+        message.contains("could not add its own share")
+            && message.contains("other holders can still complete it"),
+        "says what this device failed to do without implying the ceremony died: {message}"
+    );
 }

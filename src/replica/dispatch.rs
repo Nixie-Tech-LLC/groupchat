@@ -238,7 +238,9 @@ impl Replica {
             Request::Recover => {
                 return Self::respond(self.recover(), Self::actor_recovered_response)
             }
-            Request::SpaceRecover => Ok(self.space_recover_cmd()),
+            Request::SpaceRecover => {
+                return Self::respond(self.space_recover_cmd(), Self::space_recovery_response)
+            }
             Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
             Request::SpaceElevateApprove { session, proposal } => {
                 Ok(self.space_elevate_approve_cmd(session, proposal))
@@ -252,7 +254,10 @@ impl Replica {
                 force,
             } => Ok(self.space_custody_import_cmd(path, passphrase, force)),
             Request::SpaceRecoverApprove { session, expect } => {
-                Ok(self.space_recover_approve_cmd(session, expect))
+                return Self::respond(
+                    self.space_recover_approve_cmd(session, expect),
+                    Self::recovery_approved_response,
+                )
             }
             Request::Members => Ok((
                 Response::Members {
@@ -317,6 +322,61 @@ impl Replica {
         let verb = if d.restored { "restored" } else { "deleted" };
         Response::Ok {
             message: Some(format!("{verb} {}", d.reff)),
+        }
+    }
+
+    /// A recovery always reports what durably happened, then what did not.
+    ///
+    /// Both arms are committed outcomes, so both are acknowledgements rather
+    /// than errors — but a re-root whose re-key failed, or a ceremony this
+    /// device could not contribute to, must say so plainly. Silence there reads
+    /// as success and leaves a degraded space looking healthy.
+    // `pub(super)` only so the post-commit regression tests can drive it with an
+    // injected failure that is otherwise unreachable from `handle`. Narrowed
+    // with the other adapter helpers in the structural-lock stage.
+    pub(super) fn space_recovery_response(r: SpaceRecovery) -> Response {
+        let message = match r {
+            SpaceRecovery::Installed(done) => {
+                let head = format!("recovered the space — root reset to {}", done.root.short());
+                match done.rekey_failed {
+                    None => format!("{head} and re-keyed"),
+                    Some(e) => format!(
+                        "{head}, but re-keying failed ({e:#}) — the space is still readable under the old key until an admin rotates it"
+                    ),
+                }
+            }
+            SpaceRecovery::Pending {
+                session,
+                incomplete,
+            } => {
+                let hex = session.to_hex();
+                let head = format!(
+                    "group recovery under way (session {hex}) — each other holder must approve it with `space recover-approve {hex}` until the threshold co-signs"
+                );
+                match incomplete {
+                    None => head,
+                    Some(e) => format!(
+                        "{head}. This device could not add its own share ({e:#}); the request stands and the other holders can still complete it"
+                    ),
+                }
+            }
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    fn recovery_approved_response(a: RecoveryApproved) -> Response {
+        let roots = a
+            .roots
+            .iter()
+            .map(|r| r.short())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Response::Ok {
+            message: Some(format!(
+                "co-signed the recovery re-rooting the space to {roots} — it installs once the threshold has co-signed"
+            )),
         }
     }
 

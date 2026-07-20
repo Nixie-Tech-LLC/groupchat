@@ -2,6 +2,45 @@
 
 use super::*;
 
+/// What a break-glass space recovery did.
+///
+/// The two arms are not success-and-failure: a group recovery that has not yet
+/// gathered its threshold is a correct, expected outcome that the operator must
+/// act on. Both are committed changes.
+#[derive(Debug)]
+pub enum SpaceRecovery {
+    /// The re-root is installed and this device is the new root.
+    Installed(SpaceRecovered),
+    /// A signing ceremony is open and needs the other holders.
+    Pending {
+        session: crate::dkg::TranscriptId,
+        /// A local step that did not complete *after* the request landed on the
+        /// board. Carried rather than returned as an error: the request is
+        /// durable and other holders can see it, so the change must still be
+        /// announced even though this device's own contribution did not land.
+        incomplete: Option<anyhow::Error>,
+    },
+}
+
+/// A completed re-root.
+#[derive(Debug)]
+pub struct SpaceRecovered {
+    pub root: ActorId,
+    /// The re-root landed; this says whether the follow-on content re-key did.
+    ///
+    /// A failure here leaves the space re-rooted but still under the old key —
+    /// a degraded state the operator must be told about and can retry. It is
+    /// never reported as a plain error, because the re-root is already durable
+    /// and an error would suppress its doorbell.
+    pub rekey_failed: Option<anyhow::Error>,
+}
+
+/// A holder co-signed a pending recovery.
+#[derive(Debug)]
+pub struct RecoveryApproved {
+    pub roots: Vec<ActorId>,
+}
+
 /// Persist the recovery secret beside the store. This is a root credential (the
 /// pre-rotation escrow — losing it forfeits recovery, never space access),
 /// so it is created **owner-only from the start** (never world-readable, even
@@ -165,7 +204,7 @@ impl Replica {
     /// verifies one signature either way — the threshold is invisible here).
     ///
     /// The private `bootstrap_root_epoch_if_needed` helper performs the re-key.
-    pub fn space_recover_cmd(&mut self) -> (Response, Option<DirtySet>) {
+    pub fn space_recover_cmd(&mut self) -> ChangeResult<SpaceRecovery> {
         let cur = crate::space::replay(
             &self.genesis,
             &self.space_id,
@@ -191,84 +230,44 @@ impl Replica {
         // look elsewhere for material sitting on the disk in front of them.
         let degraded = self.degraded_recovery_holders();
         if !degraded.is_empty() {
-            let detail = degraded
-                .iter()
-                .map(|h| {
-                    // The cause decides the remedy, so it must not be guessed:
-                    // an I/O or permissions fault is not an account mismatch.
-                    let why = match &h.reason {
-                        RecoveryArtifactFailure::Undecryptable(m) => {
-                            format!("protected under another Windows account or machine ({m})")
-                        }
-                        RecoveryArtifactFailure::Io(m) => {
-                            format!("present but could not be read ({m})")
-                        }
-                    };
-                    let scope = match h.is_current_authority {
-                        Some(true) => "the current recovery key",
-                        // Unproven currency is reported as such rather than
-                        // asserted either way.
-                        None => "a recovery key whose group could not be identified",
-                        Some(false) => unreachable!("superseded groups are filtered out"),
-                    };
-                    format!("  transcript {}: {scope} — {why}", h.transcript)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return (
-                Response::err(format!(
-                    "this device holds a FROST share that cannot be used:\n{detail}\n\
-                     This device cannot take part in recovery. Recovery remains \
-                     possible only if the configured authority requirements can \
-                     still be satisfied by the other holders, which this device \
-                     cannot verify."
-                )),
-                None,
-            );
+            return Err(ReplicaError::Ceremony(Box::new(Ceremony::ShareUnusable {
+                holders: degraded,
+            })));
         }
-        (
-            Response::err(
-                "no way to recover from this device — need either the space's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
-            ),
-            None,
-        )
+        Err(ReplicaError::ceremony(
+            "no way to recover from this device — need either the space's current space-recovery.key beside the store, or a threshold share of the current group recovery key",
+        ))
     }
 
     fn space_recover_solo(
         &mut self,
         cur: &crate::space::RootState,
         secret: &[u8; 32],
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<SpaceRecovery> {
         // Re-root to this device's actor (self-incept if needed).
-        let me_actor = match self.self_inception() {
-            Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        let me_actor = ActorId::from_incept_hash(&self.self_inception()?.hash());
         let op = crate::space::SpaceOp::Recover {
             new_root: vec![me_actor.clone()],
             gen: cur.gen + 1,
         };
         let ev = crate::space::sign_op(secret, &op, vec![], &self.space_id);
-        let res = (|| -> Result<()> {
+        (|| -> Result<()> {
             self.membership.add_space_event(&ev)?;
             self.persist_membership("space_recover")
-        })();
-        if let Err(e) = res {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        // The new root bootstraps a fresh content key (fencing the old root).
-        if let Err(e) = self.bootstrap_root_epoch_if_needed() {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "recovered the space — root reset to {} and re-keyed",
-                    me_actor.short()
-                )),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        })()?;
+        // The re-root is now durable. The follow-on re-key fences the old root,
+        // and if it fails the space is left re-rooted but readable under the old
+        // key — degraded, not un-recovered. Reporting that as an error would
+        // both deny a change that landed and silence its doorbell, so it rides
+        // out as part of the committed outcome.
+        let rekey_failed = self.bootstrap_root_epoch_if_needed().err();
+        Ok(Change::committed(
+            SpaceRecovery::Installed(SpaceRecovered {
+                root: me_actor,
+                rekey_failed,
+            }),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// The signing transcript holders should converge on for one
@@ -334,25 +333,19 @@ impl Replica {
     fn space_recover_group(
         &mut self,
         cur: &crate::space::RootState,
-    ) -> (Response, Option<DirtySet>) {
-        let me_actor = match self.self_inception() {
-            Ok(ev) => ActorId::from_incept_hash(&ev.hash()),
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+    ) -> ChangeResult<SpaceRecovery> {
+        let me_actor = ActorId::from_incept_hash(&self.self_inception()?.hash());
         let Some(authority) = self.active_dkg_session() else {
-            return (
-                Response::err("this device holds no share of the current group recovery key"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device holds no share of the current group recovery key",
+            ));
         };
         let op = crate::space::SpaceOp::Recover {
             new_root: vec![me_actor.clone()],
             gen: cur.gen + 1,
         };
-        let op_bytes = match postcard::to_stdvec(&op) {
-            Ok(b) => b,
-            Err(e) => return (Response::err(format!("encode recover op: {e}")), None),
-        };
+        let op_bytes = postcard::to_stdvec(&op)
+            .map_err(|e| ReplicaError::ceremony(format!("encode recover op: {e}")))?;
         let events = self.membership.ceremony_events();
         let board = self.ceremony_board(&events);
         let threshold = board
@@ -381,50 +374,46 @@ impl Replica {
                 };
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space_id);
                 let Some(id) = crate::dkg::TranscriptId::of(&ev) else {
-                    return (Response::err("could not derive the request id"), None);
+                    return Err(ReplicaError::ceremony("could not derive the request id"));
                 };
-                if let Err(e) = self
-                    .membership
+                self.membership
                     .add_ceremony_event(&ev)
-                    .and_then(|()| self.persist_membership("sign_request"))
-                {
-                    return (Response::err(format!("{e:#}")), None);
-                }
+                    .and_then(|()| self.persist_membership("sign_request"))?;
                 id
             }
         };
         // Record LOCAL intent for this transcript's op so our node co-signs this
         // recovery (the consent gate in `sign_advance_session`).
-        if let Err(e) = self.dkg_write(&signing, "intent", &op_bytes) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        if let Err(e) = self.dkg_advance() {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        //
+        // The request is on the board by now — durable, and visible to the other
+        // holders. A failure from here is this device failing to contribute, not
+        // the ceremony failing to open, so it rides out with the committed
+        // outcome instead of erasing it.
+        let incomplete = self
+            .dkg_write(&signing, "intent", &op_bytes)
+            .and_then(|()| self.dkg_advance())
+            .err();
         let after = crate::space::replay(
             &self.genesis,
             &self.space_id,
             &self.membership.space_events(),
         );
         let installed = after.gen > cur.gen && after.root == vec![me_actor.clone()];
-        let message = if installed {
-            format!(
-                "recovered the space — root reset to {} and re-keyed",
-                me_actor.short()
-            )
+        let outcome = if installed {
+            SpaceRecovery::Installed(SpaceRecovered {
+                root: me_actor,
+                rekey_failed: None,
+            })
         } else {
-            format!(
-                "group recovery under way (session {}) — each other holder must approve it with `space recover-approve {}` until the threshold co-signs",
-                signing.to_hex(),
-                signing.to_hex(),
-            )
+            SpaceRecovery::Pending {
+                session: signing,
+                incomplete,
+            }
         };
-        (
-            Response::Ok {
-                message: Some(message),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            outcome,
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Co-sign a pending break-glass recovery request as a holder of the current
@@ -436,41 +425,33 @@ impl Replica {
         &mut self,
         session_hex: String,
         expect: Vec<String>,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<RecoveryApproved> {
         // Strict parse: a session id names a filesystem artifact, so a
         // permissive decode would let two spellings name one transcript.
         let Some(session) = crate::dkg::TranscriptId::parse_hex(session_hex.trim()) else {
-            return (
-                Response::err("not a valid recovery session id (64 lowercase hex chars)"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "not a valid recovery session id (64 lowercase hex chars)",
+            ));
         };
         if self.active_dkg_session().is_none() {
-            return (
-                Response::err("this device holds no share of the current group recovery key — nothing to co-sign"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device holds no share of the current group recovery key — nothing to co-sign",
+            ));
         }
         // The holder MUST state which actor(s) they expect this recovery to re-root
         // to, so consent binds to the roots — not to an opaque session id whose
         // request could re-root anywhere. Resolve them up front.
         if expect.is_empty() {
-            return (
-                Response::err(
-                    "name the actor(s) you expect this recovery to re-root to (`--to <actor>`); refusing to co-sign a session blind",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "name the actor(s) you expect this recovery to re-root to (`--to <actor>`); refusing to co-sign a session blind",
+            ));
         }
         let mut expected: Vec<ActorId> = Vec::with_capacity(expect.len());
         for who in &expect {
             let Some(a) = self.resolve_actor(who) else {
-                return (
-                    Response::not_found(format!(
-                        "no known actor matches '{who}' — sync the recovering device's identity first"
-                    )),
-                    None,
-                );
+                return Err(ReplicaError::NotFound(NotFound::RecoveryActor {
+                    named: who.clone(),
+                }));
             };
             expected.push(a);
         }
@@ -486,21 +467,17 @@ impl Replica {
             crate::dkg::CeremonyOp::SignRequest { op, target, .. } => Some((op.clone(), *target)),
             _ => None,
         }) else {
-            return (
-                Response::err(
-                    "no pending recovery request for that session (sync from the initiator first)",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "no pending recovery request for that session (sync from the initiator first)",
+            ));
         };
         // A recovery approval consents to a SPACE op. Refuse to lend consent to
         // a request aimed at any other plane — approving a ceremony proposal is
         // a different decision and must not ride this command.
         if req_target != crate::dkg::SignTarget::SpaceOp {
-            return (
-                Response::err("that request is not a space-recovery request — refusing to co-sign"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that request is not a space-recovery request — refusing to co-sign",
+            ));
         }
         // It must be a Recover for the next generation re-rooting to EXACTLY the
         // actor set the holder named — refuse to co-sign anything else.
@@ -516,49 +493,27 @@ impl Replica {
                 new_root
             }
             _ => {
-                return (
-                    Response::err(
-                        "that request is not a current-generation Recover — refusing to co-sign",
-                    ),
-                    None,
-                );
+                return Err(ReplicaError::ceremony(
+                    "that request is not a current-generation Recover — refusing to co-sign",
+                ));
             }
         };
         let mut got = target.clone();
         got.sort();
         got.dedup();
         if got != expected {
-            let roots = target
-                .iter()
-                .map(|a| a.short())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return (
-                Response::err(format!(
-                    "that request re-roots to {roots}, not the actor(s) you named — refusing to co-sign"
-                )),
-                None,
-            );
+            return Err(ReplicaError::Ceremony(Box::new(Ceremony::RootMismatch {
+                roots: target,
+            })));
         }
-        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        if let Err(e) = self.dkg_advance() {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        let roots = target
-            .iter()
-            .map(|a| a.short())
-            .collect::<Vec<_>>()
-            .join(", ");
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "co-signed the recovery re-rooting the space to {roots} — it installs once the threshold has co-signed"
-                )),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        // Both steps precede any durable ceremony write on this path, so a
+        // failure here has committed nothing.
+        self.dkg_write(&session, "intent", &op_bytes)?;
+        self.dkg_advance()?;
+        Ok(Change::committed(
+            RecoveryApproved { roots: target },
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// After a re-root the old admin's epochs are de-authorized, so the new root

@@ -87,6 +87,11 @@ pub enum NotFound {
     /// is the widest failure in this family, and every `Result` in the replica
     /// would otherwise carry its three strings by value.
     Link(Box<LinkRef>),
+    /// No actor answers to that `<who>`, when co-signing a recovery. The fix is
+    /// to sync the recovering device's identity, not to invite anyone.
+    RecoveryActor {
+        named: String,
+    },
     /// No actor answers to that `<who>`, on the agent-sponsorship path — which
     /// says how to fix it in its own terms: an agent arrives by being started,
     /// not by being invited.
@@ -264,6 +269,19 @@ pub enum Ceremony {
     /// ceremony surface is wide and mostly one-of-a-kind; structuring every
     /// distinct refusal would produce a variant per message and buy nothing.
     Refused { message: String },
+    /// This device holds shares of the current group key that it cannot open.
+    ///
+    /// Structured rather than pre-rendered because the *cause* decides the
+    /// remedy — a file protected under another Windows account is not an I/O
+    /// fault — and because this is the one refusal whose text is built by
+    /// looping over a collection. The loop belongs to the adapter.
+    ShareUnusable {
+        holders: Vec<super::DegradedRecoveryHolder>,
+    },
+    /// The request re-roots somewhere other than the actors the holder named.
+    /// Carries where it actually points, since that is what the holder needs
+    /// to see before deciding.
+    RootMismatch { roots: Vec<crate::ids::ActorId> },
 }
 
 impl ReplicaError {
@@ -313,6 +331,10 @@ impl fmt::Display for NotFound {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
             Self::Member { named } => write!(f, "no known member matches '{named}'"),
+            Self::RecoveryActor { named } => write!(
+                f,
+                "no known actor matches '{named}' — sync the recovering device's identity first"
+            ),
             Self::AgentActor { named } => write!(
                 f,
                 "no known actor for '{named}' — start the agent so it joins the space, then sponsor it"
@@ -473,6 +495,44 @@ impl fmt::Display for Ceremony {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused { message } => f.write_str(message),
+            Self::ShareUnusable { holders } => {
+                f.write_str(
+                    "this device holds a FROST share that cannot be used:
+",
+                )?;
+                for h in holders {
+                    let why = match &h.reason {
+                        super::RecoveryArtifactFailure::Undecryptable(m) => {
+                            format!("protected under another Windows account or machine ({m})")
+                        }
+                        super::RecoveryArtifactFailure::Io(m) => {
+                            format!("present but could not be read ({m})")
+                        }
+                    };
+                    let scope = match h.is_current_authority {
+                        Some(true) => "the current recovery key",
+                        // Unproven currency is reported as such rather than
+                        // asserted either way.
+                        None => "a recovery key whose group could not be identified",
+                        Some(false) => unreachable!("superseded groups are filtered out"),
+                    };
+                    writeln!(f, "  transcript {}: {scope} — {why}", h.transcript)?;
+                }
+                f.write_str(
+                    "This device cannot take part in recovery. Recovery remains possible only if the configured authority requirements can still be satisfied by the other holders, which this device cannot verify.",
+                )
+            }
+            Self::RootMismatch { roots } => {
+                let roots = roots
+                    .iter()
+                    .map(|a| a.short())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "that request re-roots to {roots}, not the actor(s) you named — refusing to co-sign"
+                )
+            }
         }
     }
 }
