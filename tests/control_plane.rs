@@ -155,7 +155,7 @@ async fn seed_project_and_issue(home: &Path) -> String {
 
 /// A deliberately-stale `since` must not cause silent deafness: the daemon
 /// always rebaselines a new Subscribe with a `Reset` first frame at the current
-/// seq (UI.md §4.1), and a subsequent live edit then rings a real, non-reset
+/// sequence, and a subsequent live edit then rings a real, non-reset
 /// doorbell whose dirty-set names the touched project.
 #[tokio::test]
 async fn stale_since_after_restart_yields_reset() {
@@ -219,7 +219,7 @@ async fn stale_since_after_restart_yields_reset() {
     let _ = request(home.path(), &Request::Stop).await;
 }
 
-/// A rejected write rings nothing: validate-then-commit (UI.md §4.3) means an
+/// A rejected write rings nothing: validate-then-commit means an
 /// invalid `IssueEdit` returns an `Error` having touched nothing and produced no
 /// dirty-set, so no doorbell arrives. We drain the initial Reset, send a bad
 /// status, and assert the stream stays silent for a grace window.

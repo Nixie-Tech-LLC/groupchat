@@ -1,4 +1,4 @@
-//! Layer C — live P2P sync over iroh (A§8, S§8). A **catalog-first pull** over a
+//! Live peer-to-peer sync over iroh. A **catalog-first pull** over a
 //! direct QUIC bi-stream on a custom ALPN: exchange the one Catalog VV-diff to
 //! learn the whole changed-head set, then fetch each changed issue doc by
 //! per-doc VV-diff, multiplexed over the one stream as length-prefixed,
@@ -11,8 +11,8 @@
 //! work happens under the tracker lock in short synchronous sections; all QUIC
 //! IO happens outside the lock.
 //!
-//! Forward-compat (A§10): frames are already per-doc `export(updates)` blobs
-//! keyed by `DocId`, so P2/P3 wrap the ciphertext-chunk envelope around them
+//! For forward compatibility, frames are per-document `export(updates)` blobs
+//! keyed by `DocId`, so encrypted workspace data wraps them in ciphertext chunks
 //! without reshaping this protocol.
 
 use std::sync::Mutex;
@@ -85,7 +85,7 @@ enum Msg {
         catalog_vv: Vec<u8>,
     },
     /// Accepter → dialer: the plaintext membership update-diff (signed ACL +
-    /// sealed key envelopes), sent *before* the encrypted catalog (A§11).
+    /// sealed key envelopes), sent *before* the encrypted catalog.
     Membership { update: Vec<u8> },
     /// Accepter → dialer: the (encrypted) catalog update-diff.
     Catalog { update: Vec<u8> },
@@ -132,7 +132,7 @@ async fn read_msg(recv: &mut RecvStream) -> Result<Option<Msg>> {
 
 /// **Dialer side.** Pull a peer's state up to date and return a coalesced
 /// dirty-set describing everything that changed locally (the node rings one
-/// doorbell for it — daemon-side batching, UI.md §4.2).
+/// doorbell for it through daemon-side batching.
 pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySet> {
     let (mut send, mut recv) = conn.open_bi().await.context("open sync stream")?;
 
@@ -156,7 +156,7 @@ pub async fn pull(conn: &Connection, tracker: &Mutex<Tracker>) -> Result<DirtySe
     )
     .await?;
 
-    // 2a. read the plaintext membership diff first (A§11) and import it — we may
+    // Read and import the plaintext membership diff first; it may provide the
     // have just been added and can now decrypt the catalog/docs below.
     let mut dirty = DirtySet::default();
     match read_msg(&mut recv).await? {

@@ -1,6 +1,6 @@
 //! Programmatic clap command registry.
 //!
-//! The CLI surface (UI.md §2) is defined as **data** — a `Vec<Spec>` built by
+//! The CLI command set is defined as **data** — a `Vec<Spec>` built by
 //! [`specs`] — instead of a `#[derive(Parser)]` enum. [`build_cli`] turns that
 //! data into a `clap::Command` at runtime, so completions (`clap_complete`) and
 //! the man page (`clap_mangen`) still generate from the live tree exactly as
@@ -295,7 +295,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
         .version(env!("LAIT_VERSION_LONG"))
         .about("A local-first, peer-to-peer issue tracker")
         // No subcommand required: bare `lait` is the FOCUS view (inbox + your
-        // active issues, UI.md §2) — the most valuable keystroke goes to the
+        // active issues) — the most valuable keystroke goes to the
         // most-asked question, not to help. `lait help` / `-h` still work.
         .arg(
             Arg::new("home")
@@ -326,7 +326,7 @@ pub fn build_cli(specs: &[Spec]) -> Command {
                 .global(true)
                 .action(ArgAction::SetTrue)
                 .help_heading(GLOBAL_HEADING)
-                .help("Emit the versioned JSON DTO instead of human output (UI.md §2.3)."),
+                .help("Emit the versioned JSON DTO instead of human output."),
         )
         .arg(
             Arg::new("yes")
@@ -1087,7 +1087,7 @@ pub fn specs() -> Vec<Spec> {
             ],
             ..Spec::req(
                 "members",
-                "Manage space membership (the signed ACL, P3). `members` lists.",
+                "Manage space membership through the signed ACL. `members` lists.",
                 vec![],
                 |_| Ok(Request::Members),
             )

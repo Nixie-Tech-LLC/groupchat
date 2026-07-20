@@ -2,11 +2,10 @@
 //! `main.rs`) so integration tests and doctests can drive the same command
 //! surface the binary exposes. `main.rs` is a thin shim over [`run`].
 //!
-//! The command surface follows UI.md §2: flat verbs act on **issues**, plural
+//! Flat verbs act on **issues**, while plural
 //! nouns manage **registries** (`label <ref> +bug` vs `labels new`), and every
-//! `<ref>` is resolved daemon-side (UI.md §3). Each verb maps to exactly one
-//! Layer-B `Request` (S§7), which keeps one command = one commit = one activity
-//! row (S§7.1).
+//! `<ref>` is resolved daemon-side. Each verb maps to exactly one control
+//! `Request`, preserving one command = one commit = one activity row.
 //!
 //! The surface is defined as **data** in [`crate::cmdspec`] — a `Vec<Spec>` turned
 //! into a `clap::Command` at runtime — not a `#[derive(Parser)]` enum. This module
@@ -127,7 +126,7 @@ pub async fn run() -> std::process::ExitCode {
     let specs = cmdspec::specs();
     let cli = cmdspec::build_cli(&specs);
     // `try_get_matches` (not `get_matches`) so a usage/parse error exits `1` — the
-    // documented code (UI.md §2.3) — instead of clap's default `2`, which collides
+    // documented code — instead of clap's default `2`, which collides
     // with `2 = ref not found / ambiguous`. `--help`/`--version` still exit `0`.
     let matches = match cli.try_get_matches() {
         Ok(m) => m,
@@ -189,7 +188,7 @@ pub async fn run() -> std::process::ExitCode {
 async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Result<()> {
     let resolved = cmdspec::resolve(specs, matches);
 
-    // Bare `lait` = the FOCUS view (inbox + your active issues, UI.md §2): the
+    // Bare `lait` = the FOCUS view (inbox + your active issues): the
     // most valuable keystroke answers "what's addressed to me / what am I on",
     // not help. Global flags (--home/-w/--json) still apply.
     let Some((leaf, m)) = resolved else {
@@ -377,7 +376,7 @@ async fn dispatch(specs: &[cmdspec::Spec], matches: &ArgMatches, out: Out) -> Re
                 std::process::exit(1);
             }
             // `new --start` chains the create into the work loop: file it, then
-            // claim it (two honest commits = two activity rows, S§7.1).
+            // claim it (two honest commits produce two activity rows).
             //
             // Ask for `start` in a way that can answer "there is no such arg".
             // `leaf.name` is only the *last* path segment, so `labels new` answers
@@ -687,7 +686,7 @@ async fn run_join_cli(m: &ArgMatches, out: Out) -> Result<()> {
 
     // Set the display name before the daemon is auto-spawned so a cold joiner
     // announces the right name on its join request. It stays a self-asserted
-    // claim — the admin approves by key, never by this nick (UI.md §8).
+    // claim — the admin approves by key, never by this nickname.
     if let Some(n) = m.get_one::<String>("nick") {
         let p = config::store_config_path(&target);
         let mut cfg = config::ConfigMap::load(&p);

@@ -4,13 +4,13 @@
 //! in-process (no socket, no iroh, injected clock), which is where the SCHEMA and
 //! control-plane invariants are exercised.
 //!
-//! **Validate-then-commit (UI.md §4.3, S§7.5).** Every mutating request fully
+//! **Validate then commit.** Every mutating request fully
 //! resolves refs and validates *before* any Loro commit; on failure it returns
 //! `Response::Error` having touched nothing and produced **no** dirty-set (so no
 //! doorbell rings), which is what makes an optimistic client's rollback
-//! race-free. There is no CAS (S§7.2): the only failures are pre-commit.
+//! race-free. There is no compare-and-swap token: failures occur before commit.
 //!
-//! **Writer-direction (S§3.1).** Every mutation ends by recomputing the issue's
+//! **Writer-direction projection.** Every mutation ends by recomputing the issue's
 //! `DocMeta` row from the issue doc via [`CatalogDoc::upsert_row`] — the issue
 //! doc is always truth; the row is a one-directional cache.
 
@@ -37,12 +37,12 @@ use crate::issue::{IssueDoc, NewIssue};
 use crate::membership::MembershipDoc;
 use crate::store::Store;
 
-/// Issue-link kinds the Layer-B façade accepts (contract §3.2). `relates` is
+/// Issue-link kinds accepted by the control interface. `relates` is
 /// symmetric and canonicalized (sorted endpoints) so one edge represents it.
 pub const LINK_KINDS: [&str; 3] = ["blocks", "relates", "duplicates"];
 
 /// A 16-byte content-addressed epoch id prefixed to every AEAD ciphertext so the
-/// reader selects the right key from its keyring (lazy revocation, A§11).
+/// reader selects the right key from its keyring during lazy revocation.
 /// Content-addressed (not a counter) so concurrent rotations never collide.
 fn epoch_prefix(id: &[u8; 16], mut blob: Vec<u8>) -> Vec<u8> {
     let mut out = id.to_vec();
@@ -57,7 +57,7 @@ fn split_epoch(blob: &[u8]) -> Option<([u8; 16], &[u8])> {
     Some((e.try_into().ok()?, rest))
 }
 
-/// The batched, project-keyed dirty-set a mutation produces (UI.md §4.2). The
+/// The batched, project-keyed dirty set produced by a mutation. The
 /// node layer stamps it with an epoch + session `seq` to form a `Doorbell`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirtySet {
@@ -89,7 +89,7 @@ impl DirtySet {
     }
 
     /// Coalesce another dirty-set into this one (daemon-side doorbell batching,
-    /// UI.md §4.2): a whole sync-import transaction becomes one frame.
+    /// a whole sync-import transaction becomes one frame.
     pub fn merge(&mut self, other: DirtySet) {
         for (proj, docs) in other.dirty_by_project {
             let e = self.dirty_by_project.entry(proj).or_default();
@@ -129,7 +129,7 @@ impl DirtySet {
 
 const ACTIVITY_RING: usize = 1000;
 
-/// The three work-state intents (`start`/`done`/`stop`, UI.md §2).
+/// The three work-state intents: `start`, `done`, and `stop`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkAction {
     Start,
@@ -137,7 +137,7 @@ enum WorkAction {
     Stop,
 }
 
-/// One issue doc a puller must fetch during catalog-first sync (A§8): the
+/// One issue document a puller must fetch during catalog-first sync: the
 /// `doc_id` plus the puller's local version vector for it (empty ⇒ fetch all).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocNeed {
@@ -157,10 +157,10 @@ pub struct Tracker {
     activity: VecDeque<ActivityEvent>,
     activity_seq: u64,
     clock: Box<dyn UlidSource + Send + Sync>,
-    // ---- P3 E2EE ----
+    // ---- workspace encryption ----
     /// The plaintext membership layer (signed ACL + sealed key envelopes).
     membership: MembershipDoc,
-    /// The genesis trust root (workspace id + founding admin keys, S§6).
+    /// The genesis trust root: workspace ID and founding administrator keys.
     genesis: Genesis,
     /// Our ed25519 secret seed — signs ACL ops and unseals key envelopes.
     seed: [u8; 32],
@@ -192,7 +192,7 @@ pub fn derive_project_key(name: &str) -> String {
 /// Found a fresh workspace in `store` — the `lait init` path, and the ONLY
 /// place a workspace comes into existence on this machine besides
 /// [`join_workspace_store`]. Mints the genesis with `me` as founding admin
-/// (S§6), creates the catalog carrying the display `name`, seals the epoch-0
+/// creates the catalog carrying the display `name`, seals the epoch-0
 /// workspace key to ourselves, and seeds the first project (named after the
 /// workspace, key derived) so `lait new` works immediately. Errors if the store
 /// already holds a workspace. Returns the workspace id and the seeded project.
@@ -450,7 +450,7 @@ fn persist_space_recovery(store: &Store, secret: &[u8; 32]) -> Result<()> {
     .context("write space-recovery.key")
 }
 
-/// Bootstrap a store from a join ticket — the `lait join` path (A§6/A§10).
+/// Bootstrap a store from a join ticket: the `lait join` path.
 /// Writes the ticket's genesis (the host is the founding admin whose signed ACL
 /// the joiner validates against) and **empty** catalog/membership docs, so
 /// importing the founder's ops adopts identical container ids (see
@@ -485,7 +485,7 @@ pub fn join_workspace_store(
     store.save_catalog(&CatalogDoc::empty(Some(store.peer_id())))?;
     // Seed the verified founding inception so the actor plane roots correctly
     // from the first replay, before any sync. The seed is committed through
-    // `apply` like every other write (contract §5/§6) — `save_membership`
+    // `apply` like every other write; `save_membership`
     // exports, and an export implicitly commits whatever is pending, so a bare
     // stage here would seal the joiner's trust root into an anonymous,
     // tier-less change. The actor claim is the inception's own author (the
@@ -502,7 +502,7 @@ impl Tracker {
     /// Open the tracker over an **initialized** store — a missing catalog or
     /// genesis is an error, never a founding event (workspaces are born only in
     /// [`found_workspace`] / [`join_workspace_store`]). Performs the **load-time
-    /// head recompute** (S§3.2): heads and rows are recomputed from the real
+    /// head recompute**: heads and rows are recomputed from the real
     /// issue-doc frontiers, never trusted from disk, so a crash between an issue
     /// commit and its row mirror self-heals.
     pub fn open(
@@ -566,7 +566,7 @@ impl Tracker {
     }
 
     /// Rebuild the keyring: unseal every **authorized** epoch's envelope
-    /// addressed to our device (A§11 lazy revocation — we keep older keys so
+    /// addressed to our device. Lazy revocation retains older keys so
     /// already-synced content stays readable). Called after any membership
     /// change/import.
     ///
@@ -608,7 +608,7 @@ impl Tracker {
     /// Encrypt a sync payload with the active-epoch key (id-tagged).
     ///
     /// Two distinct "no key" cases, and only ONE may pass through in clear:
-    /// - **No epochs exist at all** — a genuine keyless single-node P0 workspace
+    /// - **No epochs exist at all** — a genuine keyless single-node workspace
     ///   that holds no protected content: pass through.
     /// - **An active epoch exists but we lack its key** — the mid-seal window
     ///   (a freshly added or recovered device awaiting self-heal). We may hold
@@ -628,14 +628,14 @@ impl Tracker {
     /// Decrypt a sync payload using the epoch id tag + our keyring. `None` if we
     /// lack that epoch's key — the blind-relay / non-member outcome: a non-member
     /// (empty keyring) or a removed member (missing the new epoch) learns nothing
-    /// and simply imports nothing (A§11).
+    /// and simply imports nothing.
     fn decrypt_payload(&self, blob: &[u8]) -> Option<Vec<u8>> {
         let (id, ct) = split_epoch(blob)?;
         let key = self.keyring.get(&id)?;
         crypto::aead_decrypt(key, ct)
     }
 
-    /// Load-time invariant (S§3.2): recompute every head/row from the real issue
+    /// Load-time invariant: recompute every head and row from the real issue
     /// docs. Lazily caches each issue doc.
     fn recompute_all_rows(&mut self) -> Result<()> {
         let mut changed = false;
@@ -749,7 +749,7 @@ impl Tracker {
 
     /// Handle a tracker request. Returns the response plus an optional dirty-set
     /// (present only when a commit happened — never on error, so a doorbell never
-    /// rings for a rejected write; UI.md §4.3).
+    /// rings for a rejected write).
     pub fn handle(&mut self, req: Request) -> (Response, Option<DirtySet>) {
         // View-only enforcement. A member with no Write/Admin grant (a viewer)
         // is sealed the key and reads freely, but holds no content authority, so
@@ -973,7 +973,7 @@ impl Tracker {
                 }
             }
         }
-        // Labels resolve-or-create (first use = creation, UI.md §2.2) — but the
+        // Labels resolve or create on first use, but the
         // whole batch is validated before anything is minted, so a bad input
         // later in the list can't leave stray labels behind.
         if let Some(l) = labels.iter().find(|l| self.invalid_label_input(l)) {
@@ -1107,7 +1107,7 @@ impl Tracker {
                 });
             }
             if let Some(d) = &description {
-                // Spliced into the RGA text (contract §3.1). Bodies are too big
+                // Spliced into the RGA text. Bodies are too big
                 // for the activity row — record the transition, elide the values.
                 issue.set_description(d)?;
                 changes.push(FieldChange {
@@ -1118,7 +1118,7 @@ impl Tracker {
             }
             issue.apply(&ctx);
         }
-        // completion policy (S§5.7): entering a done-category status removes the
+        // Entering a done-category status removes the issue from active boards.
         // doc from the board list; reopening re-inserts it at the top.
         if let Some((from, to)) = &status_transition {
             let from_done = self.is_done_status(from);
@@ -1139,9 +1139,9 @@ impl Tracker {
         Ok((Response::Ref { reff }, Some(dirty)))
     }
 
-    /// One work-state transition (UI.md §2 `start`/`done`/`stop`): the fields a
+    /// One `start`, `done`, or `stop` work-state transition: the fields a
     /// single human intent moves — status by workflow *category* plus the
-    /// viewer's assignment — in ONE Loro commit = one activity row (S§7.1).
+    /// viewer's assignment, in one Loro commit and one activity row.
     /// Returns a fresh `Response::Issue` snapshot (the CLI derives the git
     /// branch name from the title); a no-op (already there) returns the
     /// snapshot with no commit, no activity, no doorbell.
@@ -1220,7 +1220,7 @@ impl Tracker {
             }
             issue.apply(&ctx);
         }
-        // completion policy (S§5.7): entering a done-category status removes the
+        // Entering a done-category status removes the issue from active boards.
         // doc from the board list; leaving one re-inserts it at the top.
         {
             let (from, to) = &status_transition;
@@ -1284,7 +1284,7 @@ impl Tracker {
                 .ok_or_else(|| anyhow!("issue has no project"))?
         };
 
-        // 1. project membership is truth (S§5.5): write Issue.projectId first.
+        // Project membership is authoritative: write Issue.projectId first.
         let effective_project = if let Some(np) = &new_project {
             if np.id != old_project {
                 let issue = self.issues.get(&doc_id).unwrap();
@@ -1402,7 +1402,7 @@ impl Tracker {
             Err(resp) => return Ok((resp, None)),
         };
         // Adds create the label on first use (labels are vocabulary, not
-        // ceremony — UI.md §2.2); removals still error on unknown (removing a
+        // ceremony); removals still error on unknown (removing a
         // label that never existed is a typo, not intent). Everything that can
         // fail is validated BEFORE anything is created (validate-then-commit).
         if let Some(l) = add.iter().find(|l| self.invalid_label_input(l)) {
@@ -1487,7 +1487,7 @@ impl Tracker {
     }
 
     /// Delete or restore an issue — now a **signed content-authority op**
-    /// (contract §3.4): agents cannot delete, every delete is attributable and
+    /// Agents cannot delete; every deletion is attributable and
     /// reversible, and the catalog tombstone flag becomes a *cache* of the
     /// authz-plane replay. Human members only (an agent holds the key but no
     /// content authority).
@@ -1563,7 +1563,7 @@ impl Tracker {
     }
 
     /// The materialized content-authority state (deterministic replay of the
-    /// encrypted authz DAG against membership, contract §3.4). Roots on the
+    /// encrypted authorization DAG against membership). Roots on the
     /// **effective** genesis for the same reason [`Self::acl_state`] does: after
     /// a break-glass `Recover`, content authority must follow the recovered
     /// admins, not the superseded birth root.
@@ -1611,7 +1611,7 @@ impl Tracker {
         Ok(changed)
     }
 
-    /// Add or remove an issue link (contract §3.2 `edges`). `relates` is
+    /// Add or remove an issue link in `edges`. `relates` is
     /// symmetric and canonicalized by sorted endpoints so one edge represents it.
     fn issue_link(
         &mut self,
@@ -1676,9 +1676,9 @@ impl Tracker {
         Ok((Response::Ref { reff: canonical }, Some(dirty)))
     }
 
-    /// Set or clear an issue's parent in the sub-issue hierarchy (contract
-    /// §3.2 `subs` — a tree-move CRDT, so concurrent conflicting parents can
-    /// never converge to a cycle).
+    /// Set or clear an issue's parent in the sub-issue hierarchy. The `subs`
+    /// tree-move CRDT prevents conflicting concurrent moves from converging to
+    /// a cycle.
     fn issue_parent(
         &mut self,
         reff: String,
@@ -1954,7 +1954,7 @@ impl Tracker {
             .find(|w| w.category == cat)
     }
 
-    /// Viewer-aware assignee summary (UI.md §5.1): "you", "you +2", "ab", "".
+    /// Viewer-aware assignee summary: "you", "you +2", "ab", or "".
     /// Actor-keyed: any of an actor's devices renders as "you".
     fn assignee_summary(&self, assignees: &[ActorId]) -> String {
         if assignees.is_empty() {
@@ -2026,7 +2026,7 @@ impl Tracker {
             .map(|r| self.project_row(&r))
             .collect();
         // label filter requires the issue doc's labels (not cached in the row);
-        // apply it against loaded docs. (P0: all docs local.)
+        // apply it against the locally loaded documents.
         if let Some(lid) = &label_filter {
             rows.retain(|row| {
                 self.issues
@@ -2040,10 +2040,10 @@ impl Tracker {
         Ok(Response::List { rows })
     }
 
-    /// Build the board (UI.md §5.1) applying the S§5.5 render rule:
+    /// Build the board, deduplicating its ordering projection:
     /// rows whose `projectId == P`, in `boards[P]` order, deduplicated,
     /// belonging-but-unlisted appended, listed-but-not-belonging ignored; the
-    /// Done column via the append rule ordered by wall-clock desc (S§5.7).
+    /// The done column uses append order sorted by descending wall-clock time.
     fn board(&self, project: Option<String>, project_hint: Option<String>) -> Result<Response> {
         let project_dto = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
             Ok(pr) => pr,
@@ -2065,7 +2065,7 @@ impl Tracker {
             let mut rows: Vec<Row> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             if state.category == StatusCategory::Done {
-                // append rule (S§5.7): belonging rows in this done state, ordered
+                // Append matching rows in this done state, ordered
                 // by wall-clock desc (they've left the board movable list).
                 let mut done: Vec<&RowMeta> = rows_by_doc
                     .values()
@@ -2138,7 +2138,7 @@ impl Tracker {
         let issue = match self.issue(&doc_id)? {
             Some(i) => i,
             None => {
-                // provisional: only the row is known (post-P1, UI.md §3.3).
+                // Provisional: only the catalog row is known until sync completes.
                 let row = row.ok_or_else(|| anyhow!("no such issue"))?;
                 return Ok(Response::Issue(Box::new(IssueView {
                     schema_version: SCHEMA_VERSION,
@@ -2207,7 +2207,7 @@ impl Tracker {
         Ok(Response::Issue(Box::new(view)))
     }
 
-    /// The issue's history, derived from the **oplog on disk** (contract §5):
+    /// The issue's history, derived from the **oplog on disk**:
     /// durable across daemon restarts, field-level, attributed (advisory) for
     /// remote changes, with DAG-derived collision flags. The per-session
     /// activity ring stays what it is — the workspace feed's batch cursor.
@@ -2305,7 +2305,7 @@ impl Tracker {
         self.activity_seq
     }
 
-    // ---- P1 sync (A§8 catalog-first). The network layer (node/sync) calls these
+    // ---- catalog-first peer sync; the network layer calls these ----
     // under the tracker lock; all QUIC IO happens outside the lock. ----
 
     /// The workspace id as a string (sync handshake guard).
@@ -2318,14 +2318,14 @@ impl Tracker {
         self.catalog.oplog_vv_bytes()
     }
 
-    /// The catalog head digest, wire form (gossip announce, A§8).
+    /// The wire-form catalog head digest used in gossip announcements.
     pub fn catalog_head_bytes(&self) -> Vec<u8> {
         self.catalog.head_hash()
     }
 
     /// A combined sync head over catalog + membership (the gossip announce
     /// trigger). A membership-only change (e.g. `member add`, which doesn't touch
-    /// the catalog) still moves this head so peers pull and receive it (A§8/§11).
+    /// the catalog) still moves this head so peers pull and receive it.
     pub fn sync_head_bytes(&self) -> Vec<u8> {
         let mut h = blake3::Hasher::new();
         h.update(&self.catalog.head_bytes());
@@ -2333,7 +2333,7 @@ impl Tracker {
         h.finalize().as_bytes().to_vec()
     }
 
-    // ---- membership sync (plaintext, A§11 two-protocol split) ----
+    // ---- plaintext membership sync, separate from encrypted content sync ----
 
     /// The membership doc's oplog VV, wire-encoded.
     pub fn membership_vv_bytes(&self) -> Vec<u8> {
@@ -2369,7 +2369,7 @@ impl Tracker {
         Ok(())
     }
 
-    // ---- membership / ACL operations (P3, S§6, A§11) ----
+    // ---- membership and authorization operations ----
 
     /// The genesis as seen *after* any break-glass recovery: `founding_actors` is
     /// the space plane's effective root (`lait/space/1`), not the immutable birth
@@ -2387,7 +2387,7 @@ impl Tracker {
     }
 
     /// The materialized ACL state (deterministic replay from the *effective* root
-    /// over the actor plane + the signed ACL ops, S§6 / lait/actor/1). Seeding
+    /// over the actor plane and signed ACL operations (`lait/actor/1`). Seeding
     /// from the recovery-aware root is the one integration point of the space
     /// plane: after a threshold `Recover`, replay roots on the recovered admins.
     pub fn acl_state(&self) -> AclState {
@@ -2485,7 +2485,7 @@ impl Tracker {
             .actor_of_device(dev)
             .is_some_and(|a| self.acl_state().is_member(a))
     }
-    /// Members (actor, grants, is_me) for the members view (UI.md §8). "is_me"
+    /// Members (actor, grants, and `is_me`) for the members view. `is_me`
     /// is true when this device speaks for the actor.
     pub fn members(&self) -> Vec<(ActorId, Vec<Grant>, bool)> {
         let mine = self.my_actor();
@@ -2547,7 +2547,7 @@ impl Tracker {
     }
 
     /// Add (or re-grant) a member by actor and seal them the workspace key
-    /// (S§6, A§11). Admin-only. The target actor's inception must already be
+    /// Administrator-only. The target actor's inception must already be
     /// known locally (the enrollment path imports it first via `redeem_invite`).
     pub fn member_add(
         &mut self,
@@ -2774,7 +2774,7 @@ impl Tracker {
     }
 
     /// Remove a member (signed RemoveMember op) and **rotate the workspace key**
-    /// (lazy revocation, A§3 non-goal 2): a new epoch sealed only to the remaining
+    /// using lazy revocation: a new epoch is sealed only to the remaining
     /// members' devices, so the removed actor cannot read *future* content.
     /// Admin-only.
     pub fn member_remove(&mut self, actor: &ActorId) -> (Response, Option<DirtySet>) {
@@ -3927,13 +3927,13 @@ impl Tracker {
     ///
     /// Two checks, and the second is only available to some nodes:
     ///
-    /// Both halves are now checkable by every node, holder or not (C0b):
+    /// Both halves are checkable by every node, whether or not it holds a share:
     ///
     /// - **The key must commit to the standing commitment.** A hash comparison
     ///   against `RootState.recovery_commit`; always worked.
-    /// - **The arrangement must match the standing configuration.** C0 put the
+    /// - **The arrangement must match the standing configuration.** Rotation records the
     ///   configuration id on the space plane, so `RootState.configuration` gives
-    ///   it to every replica by replay. Before C0, a non-holder could not learn
+    ///   it for every replica through replay. Without that replicated arrangement, a non-holder could not learn
     ///   the arrangement and acceptance fell back to key-alone — sound only while
     ///   `RotateKey` always changed the key. `Reshare` breaks that, which is why
     ///   the gap had to close before same-key transitions exist.
@@ -5146,7 +5146,7 @@ impl Tracker {
             return Ok(false);
         }
         // The arrangement operating the new key is the candidate ceremony's own
-        // configuration — committed on the space plane by the Rotate (C0), so
+        // configuration, committed on the space plane by the rotation, so
         // every replica (holder or not) learns the standing arrangement by
         // replay. Deterministic from the accepted proposal, so all group holders
         // sign byte-identical rotate ops.
@@ -5358,9 +5358,9 @@ impl Tracker {
         self.agent_add_by_actor(&actor)
     }
 
-    /// The membership audit log — the signed ACL DAG replayed into a rendered,
-    /// causally-ordered list of who did what, with each op's verdict (contract
-    /// §3.4). Cryptographic provenance, distinct from the advisory activity feed.
+    /// The membership audit log: the signed ACL DAG replayed into a rendered,
+    /// causally ordered list of operations and their verdicts. This provides
+    /// cryptographic provenance, unlike the advisory activity feed.
     fn member_log_response(&self) -> Response {
         let (_state, audit) = acl::replay_with_audit(
             &self.effective_genesis(),
@@ -5409,7 +5409,7 @@ impl Tracker {
         self.agent_add_by_actor(&agent_actor)
     }
 
-    /// Sponsor an already-known agent actor (contract §3.4): sign `AddAgent` and
+    /// Sponsor an already-known agent actor: sign `AddAgent` and
     /// seal it the workspace key. Any human member may sponsor; the agent holds
     /// no membership or content authority, and its standing dies with the
     /// sponsor. The agent's inception must already be present (it self-incepts
@@ -5932,7 +5932,7 @@ impl Tracker {
     }
 
     /// **Provider side.** Export the catalog ops a puller at `peer_vv` lacks,
-    /// **encrypted** with the current workspace key (blind-relay envelope, A§11).
+    /// **encrypted** with the current workspace key in a blind-relay envelope.
     pub fn export_catalog_from(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
         Ok(self.encrypt_payload(self.catalog.export_from_bytes(peer_vv)?))
     }
@@ -5952,11 +5952,11 @@ impl Tracker {
     }
 
     /// **Puller side.** Import the provider's catalog update, recompute rows for
-    /// docs we hold (writer-direction on import, S§3.1), and return the set of
+    /// documents we hold, recompute their projections, and return the set of
     /// issue docs we must fetch: those we lack, or whose catalog `head` no longer
-    /// matches our local issue-doc head (A§8 "the rows whose head moved").
+    /// matches our local issue-document head.
     pub fn import_catalog_and_compute_needs(&mut self, update: &[u8]) -> Result<Vec<DocNeed>> {
-        // Decrypt the blind-relay envelope (A§11). A non-member (no key) can't
+        // A non-member has no key and cannot decrypt the blind-relay envelope.
         // read the catalog and simply learns nothing — the E2EE outcome.
         let Some(update) = self.decrypt_payload(update) else {
             return Ok(Vec::new());
@@ -5969,7 +5969,7 @@ impl Tracker {
             // its *real* head against the just-imported catalog row.
             let held = self.issue(&doc_id)?.is_some();
             if held {
-                // Writer-direction self-heal (S§3.1): the imported catalog's
+                // Writer-direction self-heal: the imported catalog's
                 // `head`/row fields LWW-merged to a peer's value, but OUR issue
                 // doc is the truth for our row — recompute it from the issue doc.
                 let issue = self.issues.get(&doc_id).unwrap();
@@ -6002,7 +6002,7 @@ impl Tracker {
             self.catalog.apply(&OpCtx::structure("row_heal", &self.me));
         }
         // A peer's imported catalog may carry new signed tombstone/restore ops
-        // in the encrypted authz DAG (contract §3.4). Reconcile the cached
+        // in the encrypted authorization DAG. Reconcile the cached
         // tombstone flags to the replay so a remote delete/restore takes effect.
         self.reconcile_tombstones()?;
         // Incremental alias upkeep after a catalog reconcile: reconcile every doc
@@ -6018,10 +6018,10 @@ impl Tracker {
 
     /// **Puller side.** Import a fetched issue-doc update (creating the doc if
     /// new), persist it, and recompute its catalog row from the issue doc
-    /// (writer-direction, S§3.1). Returns a dirty-set for a coalesced doorbell.
+    /// using writer-direction projection. Returns a dirty set for a coalesced doorbell.
     ///
     /// The activity row and the inbox are derived from the **oplog diff** around
-    /// the import (contract §5): field-level changes, exactly-the-new comments
+    /// the import: field-level changes, exactly the new comments
     /// (wherever they merged in the list — CRDT-positional, not index
     /// arithmetic), the DAG concurrency flag, and the incoming changes' advisory
     /// actor claims (their commit messages travel with the ops).
@@ -6029,12 +6029,12 @@ impl Tracker {
         let Some(id) = DocId::parse(doc_id) else {
             return Ok(None);
         };
-        // Decrypt the blind-relay envelope (A§11); a non-member can't read it.
+        // A non-member has no key and cannot decrypt the blind-relay envelope.
         let Some(bytes) = self.decrypt_payload(bytes) else {
             return Ok(None);
         };
         // Viewer-relative pre-import state for the inbox's assigned/status
-        // entries (S§8.1): "addressed to you" is a state transition, never
+        // entries: "addressed to you" is a state transition, never
         // trusted attribution. `None` ⇒ the doc is new to this node.
         let prior = self.issues.get(&id).map(|i| {
             let mine = self.my_actor().is_some_and(|a| i.assignees().contains(&a));
@@ -6066,7 +6066,7 @@ impl Tracker {
         self.store.save_catalog(&self.catalog)?;
         // Incremental upkeep for the one fetched doc (new or updated), O(log N).
         self.aliases.reconcile_doc(&self.catalog, &id);
-        // a synced doc advances the activity feed (pulled, not streamed, S§7.5).
+        // A synced document advances the activity feed by pull, never by streamed rows.
         let reff = self.aliases.canonical_for(&id);
         // Attribute the row to the incoming ops' committing **device** when it
         // is unambiguous — deliberately not resolved to an actor. This is a
@@ -6494,7 +6494,7 @@ mod tests {
     #[test]
     fn validate_then_commit_rejects_before_any_change() {
         // A rejected write returns Error, rings NO doorbell, and changes nothing
-        // (UI.md §4.3 — makes an optimistic rollback race-free).
+        // making an optimistic rollback race-free.
         let mut n = new_node();
         with_project(&mut n.tracker);
         let reff = new_issue(&mut n.tracker, "fix login");
@@ -6530,7 +6530,7 @@ mod tests {
 
     #[test]
     fn one_request_is_one_activity_row_even_multi_field() {
-        // S§7.1: a single IssueEdit moving several fields is ONE activity row.
+        // A single IssueEdit moving several fields produces one activity row.
         let mut n = new_node();
         with_project(&mut n.tracker);
         let reff = new_issue(&mut n.tracker, "t");
@@ -6559,7 +6559,7 @@ mod tests {
 
     #[test]
     fn writer_direction_row_follows_issue_doc() {
-        // S§3.1: the DocMeta row is recomputed from the issue doc on every edit.
+        // The DocMeta row is recomputed from the issue document on every edit.
         let mut n = new_node();
         with_project(&mut n.tracker);
         let reff = new_issue(&mut n.tracker, "orig");
@@ -6588,7 +6588,7 @@ mod tests {
 
     #[test]
     fn load_time_head_recompute_self_heals_stale_row() {
-        // S§3.2: a crash between the issue commit and the head mirror leaves a
+        // A crash between the issue commit and the head mirror leaves a
         // stale head; on reopen the tracker recomputes it from the real issue
         // frontiers. Simulate by editing the issue doc + saving it WITHOUT
         // updating the catalog row, then reopening.
@@ -6628,7 +6628,7 @@ mod tests {
 
     #[test]
     fn project_move_is_single_membership_with_self_healing_boards() {
-        // S§5.5: Issue.projectId is the single source of membership; board lists
+        // Issue.projectId is the single source of project membership; board lists
         // self-heal. Moving A from ENG to OPS leaves it in exactly one board.
         let mut n = new_node();
         with_project(&mut n.tracker);
@@ -7557,7 +7557,7 @@ mod tests {
         );
         assert_eq!(after.recovery_commit, b_after.recovery_commit);
 
-        // C0: the standing ARRANGEMENT is on the plane, not just the key. Both
+        // The standing arrangement is replicated on the space plane, not just the key. Both
         // replicas agree on it, it is no longer `Single`, and it is the exact
         // 2-of-2 configuration the elevation built — learnable by replay without
         // holding a share.
@@ -7594,7 +7594,7 @@ mod tests {
         );
     }
 
-    /// §1.3. Content-derived transcript ids make concurrency visible: two holders
+    /// Content-derived transcript ids make concurrency visible: two holders
     /// independently requesting the same recovery author different nodes, so they
     /// open different transcripts and commitments would split across both.
     /// Holders converge on the lowest id.
@@ -7790,7 +7790,7 @@ mod tests {
         );
     }
 
-    /// §5. A share protected under a different Windows account is *present*, not
+    /// A share protected under a different Windows account is *present*, not
     /// absent — the holder exists and cannot act. Break-glass recovery must say
     /// which of those it is, because for an N-of-N group it is the difference
     /// between a degraded holder and an unrecoverable workspace.
@@ -8104,7 +8104,7 @@ mod tests {
         );
     }
 
-    /// C0b: acceptance now checks the arrangement against the ON-PLANE standing
+    /// Acceptance checks the arrangement against the replicated standing
     /// configuration, so a proposal naming the correct key but the wrong
     /// configuration is rejected — the case the old key-alone acceptance let
     /// through, and the one that had to close before same-key transitions.
@@ -8650,7 +8650,7 @@ mod tests {
         );
     }
 
-    /// Finding 2: the backup must be *restorable*, not merely preserved.
+    /// A custody backup must be restorable, not merely preserved.
     ///
     /// Simulates the case the whole custody design exists for: a holder loses
     /// its local material (account or machine gone) and comes back with the
@@ -8700,8 +8700,8 @@ mod tests {
         // say which group it belongs to after losing the ability to sign for it.
         std::fs::remove_file(b.tracker.dkg_path(&dkg, "share")).unwrap();
 
-        // Finding 3: the loss is reported as Missing, not as "not a holder",
-        // and the arrangement's real shape survives the loss.
+        // Report the lost share as missing rather than claiming this device is
+        // not a holder; the arrangement's real shape must survive the loss.
         let st = b.tracker.recovery_status();
         assert_eq!(
             st.local_custody,
@@ -8785,7 +8785,7 @@ mod tests {
         );
     }
 
-    /// Finding 4: a rotation whose new arrangement excludes too many current
+    /// A rotation whose new arrangement excludes too many current
     /// holders can never be installed, because only a participant of the new
     /// ceremony can derive the key the current group must sign for.
     ///
@@ -9153,7 +9153,7 @@ mod tests {
             .map(|id| id.to_hex())
             .expect("B posted a recovery request");
 
-        // SECURITY (C1): A auto-drives ceremonies on every import — but it must NOT
+        // SECURITY: ceremony automation runs on every import, but it must not
         // co-sign B's UNSOLICITED request. Sync the request to A and spin the
         // ceremony; nothing recovers, because A has given no local consent. Were
         // this to auto-sign, any member could re-root the workspace to itself.
@@ -9547,7 +9547,7 @@ mod tests {
 
     #[test]
     fn completion_leaves_board_list_but_stays_in_docs() {
-        // S§5.7: a done issue is removed from boards[proj] but stays in docs and
+        // A done issue is removed from boards[proj] but stays in docs and
         // renders in the Done column via the append rule.
         let mut n = new_node();
         with_project(&mut n.tracker);
@@ -9771,7 +9771,7 @@ mod tests {
         assert!(dirty.is_none(), "no-op start must not ring");
         assert_eq!(n.tracker.activity_high_water(), before + 1);
 
-        // done: status only (assignee kept), board list emptied (S§5.7).
+        // Done changes status only, keeps the assignee, and empties the board list.
         let (resp, _) = n.tracker.handle(Request::IssueDone { reff: reff.clone() });
         let v = match resp {
             Response::Issue(v) => v,
@@ -9931,7 +9931,7 @@ mod tests {
 
     #[test]
     fn history_survives_daemon_restart() {
-        // The contract §5 headline: `lait history` is derived from the oplog on
+        // `lait history` is derived from the oplog on
         // disk, not a per-session ring — a fresh tracker over the same store
         // (the daemon-restart case, which idle-shutdown makes the NORMAL case)
         // returns the full feed with kinds, actors, timestamps and transitions.
@@ -9982,7 +9982,7 @@ mod tests {
 
     #[test]
     fn synced_rows_carry_field_changes_actor_and_collision() {
-        // Contract §5 + A§9: a remote change arrives with field-level changes
+        // A remote change arrives with field-level changes
         // and its (advisory) actor, and a genuinely concurrent import raises
         // the DAG collision flag — the compensating control for LWW fields.
         let mut a = new_node();

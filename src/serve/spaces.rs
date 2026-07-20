@@ -271,7 +271,7 @@ impl Supervisor {
         // Bounded: a lagging tab must not let the daemon's dirty-set pin memory.
         // A dropped frame is recoverable by construction — the receiver sees
         // `Lagged`, and the contract for that is the same `reset` rebaseline the
-        // TUI already performs on an epoch change (UI.md §4.1).
+        // Every subscription consumer rebaselines after an epoch change.
         let (doorbells, _) = broadcast::channel(256);
         Self {
             identity,
@@ -464,7 +464,7 @@ impl Supervisor {
             // notices a dead pump when something asks it to attach, and the thing
             // that would ask is a re-read triggered by a doorbell that is never
             // coming. A `reset` is precisely "your position is invalid, rebaseline
-            // from a fresh snapshot" (UI.md §4.1) — so the client re-reads, the
+            // from a fresh snapshot, so the client re-reads while the
             // re-read attaches, and attaching revives the stream. The loop closes
             // itself without this task knowing anything about repair.
             let _ = tx.send(SpaceDoorbell {

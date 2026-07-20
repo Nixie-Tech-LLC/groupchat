@@ -1,4 +1,4 @@
-//! P1 end-to-end: two real nodes converge live over iroh P2P (A§8), no central
+//! End-to-end peer sync: two real nodes converge live over iroh P2P, with no central
 //! server. Pre-spawns two `lait` daemons on distinct `LAIT_HOME`s and
 //! drives them **directly over the Layer-B control channel** (`control::request`)
 //! — never shelling out to the CLI, so a captured child process can't inherit a
@@ -269,7 +269,7 @@ fn two_nodes_converge_over_iroh() {
         "B: connect"
     );
 
-    // Workspace data is E2EE (P3): B can't read until A adds it to the ACL and
+    // Workspace data is end-to-end encrypted: B cannot read until A authorizes it and
     // seals it the workspace key. Rather than blind-sleep, wait until B has
     // actually connected to A (a real sync opportunity) — a positive proxy that's
     // both faster and more rigorous than a fixed pause — plus a small settling
@@ -351,7 +351,7 @@ fn two_nodes_converge_over_iroh() {
         "B→A: A did not converge to B's issue over P2P sync"
     );
 
-    // Lazy revocation (P3): A removes B (rotating the key), then files new
+    // Lazy revocation: A removes B (rotating the key), then files new
     // content. B keeps what it already synced but must NOT be able to read the
     // post-removal issue (encrypted under an epoch key B never receives).
     let b_id2 = match req(&b.home, Request::Id) {

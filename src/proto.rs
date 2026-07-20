@@ -150,8 +150,8 @@ impl SignedInvite {
 }
 
 /// The application-level payload carried inside a signed gossip message. Scoped
-/// to announce + presence; the tracker's data sync rides its own per-doc streams
-/// (see `docs/ARCHITECTURE.md` §8), not this gossip payload.
+/// to announcements and presence; document synchronization uses separate
+/// per-document streams rather than this gossip payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     /// Announce/refresh our nickname.
@@ -178,7 +178,7 @@ pub enum Payload {
         incept: Option<crate::actor::SignedEvent>,
     },
     /// Periodic liveness heartbeat for presence tracking. `state` carries the
-    /// three-state input-driven presence (online/away, UI.md §4.5).
+    /// three-state input-driven presence (online or away).
     ///
     /// NOTE: postcard is not self-describing, so `#[serde(default)]` does NOT make
     /// this field forward-compatible on the wire — a pre-`state` peer sends a
@@ -194,7 +194,7 @@ pub enum Payload {
     /// Graceful "going offline" notice, broadcast on shutdown so peers can mark
     /// us offline immediately instead of waiting for the heartbeat to lapse.
     Bye { nick: String },
-    /// "My catalog head moved" — the P1 sync trigger (A§8). A peer that sees a
+    /// "My catalog head moved": the peer-sync trigger. A peer that sees a
     /// head different from what it holds pulls from us over the sync ALPN.
     Announce {
         workspace: String,
@@ -202,7 +202,7 @@ pub enum Payload {
     },
 }
 
-/// Three-state presence carried on the wire (UI.md §4.5). Offline is conveyed by
+/// Three-state presence carried on the wire. Offline is conveyed by
 /// `Bye`/heartbeat lapse, not this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -264,7 +264,7 @@ impl SignedMessage {
 
 /// A compact, base32-encoded invite to join a workspace. It carries only what a
 /// joiner cannot derive on its own: the workspace id (the topic is
-/// `topic_for_workspace(workspace)` and the genesis trust anchor, A§6/A§10),
+/// `topic_for_workspace(workspace)` and the genesis trust anchor),
 /// the workspace's display name (so the joiner sees what they're joining before
 /// the catalog arrives), the host's endpoint id, and the host's nick (for
 /// one-step `connect`). We deliberately do NOT ship relay/socket addresses —

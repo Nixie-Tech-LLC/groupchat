@@ -46,8 +46,9 @@ superseded alternatives are not normative. Exact Rust APIs live in rustdoc and
 the source; these documents describe behavior and invariants rather than
 duplicating every type definition.
 
-New references should use filenames and section names. Legacy `A§`, `S§`, and
-`U§` shorthand remains in source comments until that commentary is updated.
+Source comments state invariants locally and link canonical documents by filename
+and topic when more context is necessary. They do not rely on movable section
+numbers or historical review labels.
 
 ## Operate and release
 

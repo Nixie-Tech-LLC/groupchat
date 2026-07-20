@@ -1,4 +1,4 @@
-//! Seed registry end-to-end (ARCHITECTURE §10, client half): a node already
+//! Seed-registry end-to-end: a node already
 //! bound to a workspace that pins an always-on seed with `seed add <ticket>`
 //! must (1) connect and backfill the workspace's history via the pin, and
 //! (2) on a later cold restart — with the opportunistic `peers.json` bootstrap
@@ -7,9 +7,9 @@
 //! is bootstrapped via `lait join` first, and a foreign-workspace ticket is an
 //! error, covered below.)
 //!
-//! This is the property that distinguishes an explicit seed pin from the DUR-1
+//! This distinguishes an explicit seed pin from the learned restart
 //! opportunistic peer cache: deleting `peers.json` before the restart removes the
-//! DUR-1 path, so if B still converges it can only be via its seed pin.
+//! restart path, so if B still converges it can only be through its seed pin.
 //!
 //! Like `restart_reconnect.rs` this drives the real iroh stack over the Layer-B
 //! control channel; convergence timing over discovery/relay is variable, so the
@@ -261,7 +261,7 @@ fn seed_pin_backfills_then_survives_restart() {
         "B: seed add"
     );
 
-    // Grant B membership (mirrors the P1 sync path in restart_reconnect).
+    // Grant B membership, mirroring the peer-sync path in restart_reconnect.
     let b_id = id_of(&b_home);
     assert!(
         matches!(

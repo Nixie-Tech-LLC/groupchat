@@ -1,4 +1,4 @@
-//! Interactive `lait members` selector (UI.md §8) — an **inline** picker, not a
+//! Interactive `lait members` selector: an **inline** picker, not a
 //! full-screen TUI. Run bare in a terminal, `lait members` renders a small,
 //! arrow-key list *in place* below the prompt (ratatui's inline viewport — no
 //! alternate screen, scrollback preserved): pending join requests on top
@@ -13,7 +13,7 @@
 //!   * **q / esc** — quit
 //!
 //! Approving is key-first: you confirm the authenticated key out-of-band, never
-//! the self-asserted nick (UI.md §8). Admin-only actions are hidden unless this
+//! the self-asserted nickname. Administrator-only actions are hidden unless this
 //! node is an admin.
 //!
 //! Like every other surface, this is a Layer-B client over the daemon control
@@ -270,7 +270,7 @@ impl App {
 }
 
 /// Entry point for a bare, interactive `lait members`. Auto-spawns the daemon
-/// (like the CLI/TUI), snapshots the roster, and runs the inline picker; the
+/// like other local CLI flows, snapshots the roster, and runs the inline picker; the
 /// terminal (raw mode + viewport) is always restored before returning.
 pub async fn run(home: &Path) -> Result<()> {
     ensure_daemon(home).await?;

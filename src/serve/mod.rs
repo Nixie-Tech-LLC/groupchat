@@ -287,7 +287,7 @@ struct RpcQuery {
 ///
 /// One endpoint rather than a REST surface, because the REST surface would be a
 /// second, hand-maintained projection of a façade that is *already* the stable,
-/// versioned, hand-maintained projection (S§7). Two of those drift; the viewer
+/// versioned, hand-maintained projection. Two separate projections drift; the viewer
 /// branch is the proof — it still calls `projects new --key`, a shape that stopped
 /// existing. This cannot drift: it is the same enum the CLI and MCP send.
 ///
@@ -386,7 +386,7 @@ async fn rpc(
 /// Carries dirty *flags*, never state — the browser re-reads the authoritative
 /// projection for each dirty scope, as required by the shared subscription contract. A
 /// `Lagged` receiver is surfaced rather than hidden: the client's response is the
-/// same rebaseline it already performs for `reset`/epoch changes (UI.md §4.1), so
+/// same rebaseline it already performs for reset or epoch changes, so
 /// dropping frames under load is recoverable by construction.
 async fn events(
     State(app): State<Arc<App>>,

@@ -2,11 +2,11 @@
 //! the cross-platform local IPC channel (a Unix-domain socket on unix, a named
 //! pipe on Windows; see [`control_name`]). One request → one response, plus the
 //! streaming [`Request::Subscribe`] mode that writes [`Doorbell`] frames until
-//! the client disconnects (S§7.5, UI.md §4.1).
+//! the client disconnects.
 //!
 //! This is an **imperative façade over a declarative CRDT**: a stable, versioned,
-//! hand-maintained projection of Layer A (S§1), never an auto-dump. `Ref`s and
-//! `UserRef`s arrive as plain strings and are resolved **daemon-side** (UI.md §3).
+//! hand-maintained projection of durable state, never an automatic dump. `Ref`s
+//! and `UserRef`s arrive as plain strings and are resolved **daemon-side**.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -85,7 +85,7 @@ pub fn control_name(home: &Path) -> Result<Name<'static>> {
     }
 }
 
-/// A board position for `IssueMove` (UI.md §5.1 `--top/--bottom/--before/--after`).
+/// A board position for `IssueMove` (`--top`, `--bottom`, `--before`, or `--after`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "at", rename_all = "snake_case")]
 pub enum BoardPos {
@@ -95,7 +95,7 @@ pub enum BoardPos {
     After { reff: String },
 }
 
-/// List/board filter (UI.md §2.1).
+/// List and board filter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Filter {
     #[serde(default)]
@@ -104,7 +104,7 @@ pub struct Filter {
     pub status: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
-    /// Include done + tombstoned rows (UI.md §2.2).
+    /// Include done and tombstoned rows.
     #[serde(default)]
     pub all: bool,
 }
@@ -141,7 +141,7 @@ pub enum Request {
         status: Option<String>,
         #[serde(default)]
         priority: Option<String>,
-        /// Full-buffer description replace (P0, UI.md §5.3 — the client holds
+        /// Full-buffer description replacement; the client holds
         /// no `LoroText` cursor; the daemon applies it as a text update).
         #[serde(default)]
         description: Option<String>,
@@ -174,12 +174,12 @@ pub enum Request {
         reff: String,
     },
     /// Restore a deleted issue — a signed content-authority op that clears the
-    /// tombstone (contract §3.4). Restore-wins over a concurrent delete.
+    /// tombstone. Restore wins over a concurrent delete.
     IssueRestore {
         reff: String,
     },
     /// Link two issues (`blocks` | `relates` | `duplicates`) — an add-wins edge
-    /// in the catalog structure doc (contract §3.2).
+    /// in the catalog structure document.
     IssueLink {
         reff: String,
         kind: String,
@@ -192,7 +192,7 @@ pub enum Request {
     },
     /// Set (or clear, with `parent: None`) an issue's parent in the sub-issue
     /// hierarchy — a tree-move CRDT, so concurrent conflicting parents can
-    /// never converge to a cycle (contract §3.2).
+    /// never converge to a cycle.
     IssueParent {
         reff: String,
         #[serde(default)]
@@ -202,7 +202,7 @@ pub enum Request {
     IssueGraph {
         reff: String,
     },
-    /// Work-state verbs (UI.md §2): each is ONE commit = one activity row,
+    /// Work-state verbs: each is one commit and one activity row,
     /// bundling the fields a single human intent moves. Targets are picked by
     /// workflow *category* (first Active / Done / Backlog state), so they track
     /// whatever the workspace's column set is. They return `Response::Issue`
@@ -252,14 +252,14 @@ pub enum Request {
         #[serde(default)]
         since: u64,
     },
-    /// The durable, addressed-to-you inbox (S§8.1 `inbox.json`): remote
+    /// The durable, addressed-to-you inbox (`inbox.json`): remote
     /// assignments/comments/status moves on your work, derived at import time.
     /// `clear` stamps the read watermark after listing.
     Inbox {
         #[serde(default)]
         clear: bool,
     },
-    // ---- membership / ACL (P3, S§6) ----
+    // ---- membership and authorization ----
     MemberAdd {
         who: String,
         #[serde(default)]
@@ -271,7 +271,7 @@ pub enum Request {
     MemberRemove {
         who: String,
     },
-    /// Sponsor an agent keypair (contract §3.4). Any human member may sponsor;
+    /// Sponsor an agent keypair. Any human member may sponsor;
     /// the agent is sealed the workspace key but holds no membership or content
     /// authority, and its standing dies with the sponsor.
     AgentAdd {
@@ -352,7 +352,7 @@ pub enum Request {
     /// The membership audit log: the signed ACL DAG replayed in causal order
     /// with each op's authorization verdict (cryptographic provenance).
     MemberLog,
-    /// List pending join requests (announced joiners not yet members, UI.md §8).
+    /// List announced joiners that are not yet members.
     MemberRequests,
     /// Approve a pending join request **by id-prefix / key** — sugar over
     /// `MemberAdd` scoped to the pending set. The joiner's self-asserted nick is
@@ -376,7 +376,7 @@ pub enum Request {
         since: u64,
     },
 
-    // ---- transport / presence (kept from the skeleton; the P1 surface) ----
+    // ---- transport / presence ----
     Status,
     /// Guided-join verifier (`docs/UI.md`, joining): project live
     /// node state into an ordered list of onboarding gates so a stalled joiner
@@ -409,7 +409,7 @@ pub enum Request {
     Connect {
         ticket: String,
     },
-    /// Pin an always-on seed peer (A§10). `arg` is a room ticket (adopt the
+    /// Pin an always-on seed peer. `arg` is a room ticket (adopt the
     /// workspace + backfill) or a bare endpoint id (pin only). Sticky across
     /// restarts; grants no trust.
     SeedAdd {
@@ -421,7 +421,7 @@ pub enum Request {
     SeedRemove {
         who: String,
     },
-    /// Presence/system event log (P1 transport surface).
+    /// Presence and transport event log.
     Log {
         since: u64,
     },
@@ -450,7 +450,7 @@ fn default_true() -> bool {
 }
 
 /// A response from the daemon. A snapshot at a version — there is
-/// **no CAS token** (S§7.2). Internally tagged by `kind` (not `status`, which
+/// **no CAS token**. Internally tagged by `kind` (not `status`, which
 /// would collide with `IssueView.status` when the `Issue` variant is flattened).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -468,7 +468,7 @@ pub enum Response {
     Ok {
         message: Option<String>,
     },
-    /// A write echoes the resolved canonical handle (UI.md §2.2).
+    /// A write echoes the resolved canonical handle.
     Ref {
         reff: String,
     },
@@ -502,15 +502,15 @@ pub enum Response {
     MemberLog {
         entries: Vec<MemberLogEntry>,
     },
-    /// Pending join requests (announced joiners not yet members, UI.md §8).
+    /// Pending join requests: announced joiners that are not yet members.
     JoinRequests {
         requests: Vec<JoinRequestDto>,
     },
-    /// Pinned seeds ("remotes") and their reachability (A§10).
+    /// Pinned seeds ("remotes") and their reachability.
     Seeds {
         seeds: Vec<SeedDto>,
     },
-    /// A ref resolved to many candidates — a first-class outcome (UI.md §3.2) —
+    /// A ref resolved to many candidates, represented as a first-class outcome,
     /// or, when `near_miss_for` is set, matched **nothing** and these are the
     /// closest handles to what was typed.
     Candidates {
@@ -550,7 +550,7 @@ pub enum Response {
     },
 }
 
-/// Classifies a [`Response::Error`] so the process exit code (UI.md §2.3) is
+/// Classifies a [`Response::Error`] so the process exit code is
 /// derived from a **typed kind**, never by string-matching the human message.
 /// `NotFound` (a ref / registry entry didn't resolve) maps to exit `2` alongside
 /// the ambiguous [`Response::Candidates`] outcome; everything else is a plain
@@ -573,7 +573,7 @@ impl Response {
             error_kind: ErrorKind::Error,
         }
     }
-    /// A ref / registry lookup that resolved to **nothing** (exit `2`, UI.md §3.2).
+    /// A ref or registry lookup that resolved to **nothing** (exit `2`).
     pub fn not_found(msg: impl Into<String>) -> Self {
         Response::Error {
             message: msg.into(),
@@ -582,30 +582,30 @@ impl Response {
     }
 }
 
-/// The streamed frame — the repeated reply to [`Request::Subscribe`] (S§7.5).
-/// A **batched, project-keyed dirty-set**, never state (UI.md §4.2). The client
+/// The streamed frame: the repeated reply to [`Request::Subscribe`].
+/// A **batched, project-keyed dirty-set**, never state. The client
 /// re-reads the authoritative projection for each dirty scope; it never patches
 /// from a doorbell.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Doorbell {
-    /// Per-daemon-boot nonce; a change ⇒ restart ⇒ treat as `Reset` (UI.md §4.1).
+    /// Per-daemon-boot nonce; a change means restart and requires a `Reset`.
     pub epoch: u64,
-    /// Per-session cursor (S§2). Never persisted.
+    /// Per-session cursor. Never persisted.
     pub seq: u64,
-    /// `true` ⇒ ignore the rest and rebaseline from a fresh snapshot (S§7.5).
+    /// `true` means ignore the rest and rebaseline from a fresh snapshot.
     pub reset: bool,
     /// Issue-row plane: which docs (by project) moved. Re-read these rows.
     pub dirty_by_project: HashMap<String, Vec<String>>,
-    /// Catalog-structure plane (UI.md §4.2).
+    /// Catalog-structure changes.
     pub dirty_catalog: Vec<CatalogScope>,
-    /// New feed rows exist — pull via `Activity{since}` (S§7.5). Never streamed.
+    /// New feed rows exist; pull via `Activity{since}`. Rows are never streamed.
     pub activity_advanced: bool,
-    /// New presence/join rows exist — pull via `Log{since}` (S§7.5). Never
+    /// New presence or join rows exist; pull via `Log{since}`. Rows are never
     /// streamed: like every other plane this is a dirty *flag*, not the events.
     /// The presence plane rings independently of the tracker dirty-set, so a
     /// peer coming online wakes a subscriber even when no doc moved.
     /// `default` so a frame from a pre-plane daemon (stale across `lait update`)
-    /// still decodes (S§9 rule 1: fields are add-only, absent ⇒ default).
+    /// still decodes because fields are add-only and absence means default.
     #[serde(default)]
     pub presence_advanced: bool,
 }
@@ -621,7 +621,7 @@ pub enum CatalogScope {
     Boards { project: String },
 }
 
-/// A presence/system log entry kept in the daemon's ring buffer (P1 transport).
+/// A presence or transport log entry kept in the daemon's ring buffer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
@@ -644,7 +644,7 @@ pub enum EventKind {
 pub struct PresenceEntry {
     pub id: String,
     pub nick: String,
-    /// Three-state presence (UI.md §4.5): `online` | `away` | `offline`.
+    /// Three-state presence: `online`, `away`, or `offline`.
     pub state: String,
     pub online: bool,
     pub last_seen_secs: u64,
@@ -663,7 +663,7 @@ pub struct StatusInfo {
     pub projects: usize,
     /// This node's standing in the workspace ACL: `admin` | `member` | `pending`.
     /// `pending` means we joined from an invite but an admin hasn't approved us
-    /// yet — we can't decrypt the board (UI.md §8). Lets `status` tell a joiner
+    /// yet, so we cannot decrypt the board. Lets `status` tell a joiner
     /// the truth instead of implying the join already succeeded.
     #[serde(default)]
     pub membership: String,
@@ -852,7 +852,7 @@ async fn exchange_raw(stream: Stream, req: &Request) -> Result<String> {
 }
 
 /// A live dirty-notification subscription — the client side of [`Request::Subscribe`]
-/// stream (UI.md §4.1). Holds the whole duplex stream (never split, so nothing
+/// stream. Holds the whole duplex stream (never split, so nothing
 /// leaks); the subscribe verb is write-once, then read-many.
 pub struct Subscription {
     reader: BufReader<Stream>,
@@ -875,7 +875,7 @@ impl Subscription {
     }
 }
 
-/// Open a streaming [`Request::Subscribe`] connection (UI.md §4.1).
+/// Open a streaming [`Request::Subscribe`] connection.
 pub async fn subscribe(home: &Path, since: u64) -> Result<Subscription> {
     let name = control_name(home)?;
     let mut stream = Stream::connect(name).await.context("connect to daemon")?;

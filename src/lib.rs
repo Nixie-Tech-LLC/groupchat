@@ -18,7 +18,7 @@
 //!     Loro documents are the single source of truth for all merge semantics.
 //!   * **Layer B — control protocol** ([`control`], [`dto`]): a stable, versioned,
 //!     hand-maintained projection of Layer A over the local socket. Never a dump.
-//!   * **Layer C — wire/sync** ([`proto`], and P1 `sync`): opaque Loro bytes plus
+//!   * **Peer wire and sync** ([`proto`] and `sync`): opaque Loro bytes plus
 //!     the minimum framing to route them over iroh.
 
 pub mod app;

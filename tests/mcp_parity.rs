@@ -1,6 +1,6 @@
 //! Guards parity between the versioned DTO contract and the MCP surface.
 //!
-//! The MCP tools (A§12) return the **same** versioned Layer-B `Response` DTO the
+//! The MCP tools return the **same** versioned control `Response` DTO the
 //! CLI `--json` emits, so agent and human surfaces never drift. These tests are
 //! the "check" half of "generate/check, don't hand-maintain twice": they fail
 //! the build gate if a tracker `Request` is added without a corresponding MCP

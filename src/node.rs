@@ -3,16 +3,16 @@
 //! CLI, web, and MCP clients drive.
 //!
 //! The iroh transport (signed-gossip room for announce/presence, a liveness
-//! probe ALPN, the daemon/control plumbing) is the P1 networking substrate. The
-//! P0 tracker rides on top: the daemon is the **only** owner of the Loro docs
-//! (UI.md §1), and every surface is a thin Layer-B client of it.
+//! probe ALPN, and daemon/control plumbing) is the networking substrate. The
+//! tracker rides on top: the daemon is the **only** owner of the Loro docs, and
+//! every local interface is a control client.
 //!
-//! **Doorbells (S§7.5, UI.md §4.1–§4.2).** A mutation produces a
+//! **Doorbells.** A mutation produces a
 //! [`crate::tracker::DirtySet`]; the daemon stamps it with a per-boot `epoch` and
 //! a per-session `seq`, pushes it onto a bounded ring, and wakes every parked
 //! [`Request::Subscribe`] stream. `seq` is never persisted; the first frame of
 //! every Subscribe is a `Reset`, which unifies first-connect / reconnect /
-//! restart / ring-overrun into one rebaseline path (UI.md §4.1).
+//! restart or ring overrun into one rebaseline path.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -71,14 +71,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the daemon coalesces pending durable-store mutations into a single
-/// git commit (A§6). git is inspectability, not durability (every write is
+/// git commit. Git provides inspectability, not durability (every write is
 /// fsync'd), so a slow cadence keeps `git add -A` off the edit hot path while
 /// still snapshotting history within a few seconds.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const PRUNE_WINDOW: Duration = Duration::from_secs(600);
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(30 * 60);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-/// Bound on the doorbell ring — holds the last ~1000 *batches* (UI.md §4.2).
+/// Bound on the doorbell ring: the last ~1000 batches.
 const DOORBELL_RING: usize = 1000;
 
 fn now_secs() -> u64 {
@@ -136,7 +136,7 @@ fn peers_path(home: &Path) -> PathBuf {
 }
 
 /// Load the persisted set of previously-seen peer endpoints, to seed the gossip
-/// bootstrap on (re)start (DUR-1). iroh discovery resolves a dialable address
+/// bootstrap on restart. Iroh discovery resolves a dialable address
 /// from each `EndpointId`, so the ids alone are enough to reconnect — a fresh
 /// daemon no longer re-enters the mesh with an empty bootstrap set and waits
 /// passively to be re-announced to. Our own id is filtered out.
@@ -157,12 +157,12 @@ fn save_known_peers(home: &Path, peers: &[EndpointId]) {
 }
 
 /// A pinned always-on **seed** peer — the client-side half of the seed role
-/// (ARCHITECTURE §10). Unlike the opportunistic `peers.json` bootstrap set
-/// (DUR-1), these pins are **explicit and sticky**: they always seed the gossip
+/// Unlike the opportunistic `peers.json` bootstrap set
+/// these learned peers, pins are **explicit and sticky**: they always seed the gossip
 /// bootstrap and are eagerly pulled on startup, so a client converges through
 /// its seed even when no other peer is online. A pin grants **no trust** — the
 /// seed is a bootstrap/backfill anchor only; every signed op is still validated
-/// against the genesis keys carried in the ticket (A§6/A§10).
+/// against the genesis keys carried in the ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedRecord {
     pub id: EndpointId,
@@ -281,7 +281,7 @@ fn upsert_alias(home: &Path, key: &str, name: &str) {
 
 /// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
 /// `--json` render them through the same disambiguation path as issue refs
-/// (UI.md §3.2): `reff` = short key, `key_alias` = nick (if any), `title` = full
+/// `reff` is the short key, `key_alias` the optional nickname, and `title` the full
 /// key so the caller can copy an unambiguous value.
 fn user_candidates(cands: &[KnownUser]) -> Vec<Candidate> {
     cands
@@ -300,7 +300,7 @@ pub struct Peer {
     pub nick: String,
     pub last_seen: Instant,
     pub presence: PeerState,
-    /// Advertised three-state presence: `true` ⇒ up but AFK (UI.md §4.5). Only
+    /// Advertised three-state presence: `true` means reachable but away. Only
     /// meaningful while `presence.is_online()`.
     pub away: bool,
 }
@@ -315,7 +315,7 @@ impl ProtocolHandler for PresencePing {
     }
 }
 
-/// Accepts the P1 sync ALPN and serves a peer's catalog-first **pull**
+/// Accepts the sync ALPN and serves a peer's catalog-first **pull**
 /// ([`crate::sync::serve`]). A pull never mutates our state, so this is
 /// read-only and rings no doorbell.
 #[derive(Clone)]
@@ -379,7 +379,7 @@ fn open_bound_invite(
     Some(invite)
 }
 
-/// Append-only-ish ring buffer of presence/system events (P1 transport surface).
+/// Bounded ring buffer of presence and transport events.
 #[derive(Debug, Default)]
 pub struct EventLog {
     seq: u64,
@@ -439,7 +439,7 @@ impl DoorbellRing {
 /// `cursor` has fallen off the back of the ring, so the next frame it needs
 /// (`cursor + 1`) is older than the oldest one still retained. When
 /// `cursor + 1 == oldest` the ring still holds the exact next frame, so no reset
-/// (S§7.5, UI.md §4.1). Pure and side-effect-free so the ring-overrun invariant
+/// Pure and side-effect-free so the ring-overrun invariant
 /// is unit-testable without driving the async socket loop.
 fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
     cursor + 1 < oldest
@@ -483,9 +483,9 @@ pub struct Node {
     active_conns: AtomicU64,
     last_active: Mutex<Instant>,
     idle_window: Duration,
-    /// The Loro-CRDT tracker core (P0). The daemon is its only owner.
+    /// The Loro-CRDT tracker core. The daemon is its only owner.
     tracker: Arc<Mutex<Tracker>>,
-    /// The doorbell ring + its wake source (S§7.5).
+    /// The doorbell ring and its wake source.
     doorbell: Arc<Mutex<DoorbellRing>>,
     doorbell_notify: Arc<Notify>,
     /// Peers we currently have an in-flight sync pull to (dedupes announce storms).
@@ -495,7 +495,7 @@ pub struct Node {
     /// membership doc when an admin actually admits (redeem/approve), so an
     /// unauthenticated peer cannot grow the shared container (amplification DoS).
     pending_incepts: Arc<Mutex<HashMap<UserId, crate::actor::SignedEvent>>>,
-    /// This node's home dir — used to persist the bootstrap peer set (DUR-1).
+    /// This node's home dir, used to persist the bootstrap peer set across restarts.
     home: PathBuf,
 }
 
@@ -660,7 +660,7 @@ impl Node {
         match payload {
             Payload::Hello { nick } => {
                 self.touch(from, Some(nick));
-                // a peer just showed up — pull to backfill from it (A§10 bootstrap).
+                // A newly visible peer may have state we missed; pull to backfill.
                 self.clone().trigger_pull(from);
             }
             Payload::Presence { nick, state } => {
@@ -718,7 +718,7 @@ impl Node {
                     (t.workspace_str(), t.sync_head_bytes())
                 };
                 // Only pull when the peer's catalog head differs from ours — the
-                // A§8 trigger. Same head ⇒ nothing to do (storm suppression).
+                // An unchanged catalog head suppresses redundant pull storms.
                 if workspace == our_ws && catalog_head != our_head {
                     self.clone().trigger_pull(from);
                 }
@@ -726,7 +726,7 @@ impl Node {
         }
     }
 
-    /// Spawn a deduped sync pull from a peer (A§8). At most one in-flight pull
+    /// Spawn a deduplicated sync pull from a peer. At most one in-flight pull
     /// per peer; on success (something changed) ring a doorbell and re-announce
     /// so peers that are behind us pull in turn.
     fn trigger_pull(self: Arc<Self>, peer: EndpointId) {
@@ -749,7 +749,7 @@ impl Node {
                     }
                     // We successfully reached this peer — persist it immediately so
                     // even a short-lived daemon (up for less than a heartbeat) can
-                    // bootstrap from it on the next start (DUR-1).
+                    // bootstrap from it on the next start.
                     self.persist_known_peers();
                 }
                 Err(e) => tracing::debug!("pull from {peer} failed: {e:#}"),
@@ -783,7 +783,7 @@ impl Node {
     }
 
     /// Snapshot the peers we currently know (excluding ourselves) and persist
-    /// them as the next start's gossip bootstrap set (DUR-1). Best-effort.
+    /// them as the next start's gossip bootstrap set. Best-effort.
     fn persist_known_peers(&self) {
         let peers: Vec<EndpointId> = {
             let p = self.shared.presence.lock().unwrap();
@@ -797,7 +797,7 @@ impl Node {
         }
     }
 
-    /// Our own presence state (UI.md §4.5): `away` when no client input within
+    /// Our presence state: `away` when no client input arrives within
     /// the engagement window, else `online`. Input is tracked via `last_active`.
     fn my_presence_state(&self) -> crate::proto::PresenceState {
         const ENGAGED: Duration = Duration::from_secs(60);
@@ -887,7 +887,7 @@ impl Node {
     }
 
     /// The honest post-`join` message. A join only *requests* access: until an
-    /// admin approves us we hold ciphertext and aren't on the board (UI.md §8).
+    /// an admin approves us, we hold ciphertext and cannot read the board.
     /// So we tell the joiner the truth and point at the one next step, instead of
     /// implying success. If we resolved to an already-member (a re-join), say so.
     fn join_message(&self, ticket: &WorkspaceTicket) -> String {
@@ -918,7 +918,7 @@ impl Node {
         }
     }
 
-    /// Pin a seed (A§10). Accepts two forms: a full `WorkspaceTicket` for the
+    /// Pin a seed. Accepts two forms: a full `WorkspaceTicket` for the
     /// workspace this store is bound to (connect + backfill — the primary path),
     /// or a bare endpoint id (pin only, for a peer we already share a workspace
     /// with). A ticket for a *foreign* workspace is an error — join it first.
@@ -1011,8 +1011,8 @@ impl Node {
                     }
                     Event::NeighborUp(id) => {
                         self.touch(id, None);
-                        // mesh formed with this peer — pull to converge (A§8) and
-                        // persist it right away for restart bootstrap (DUR-1).
+                        // The mesh formed with this peer: pull to converge and
+                        // persist it immediately for restart bootstrap.
                         self.clone().trigger_pull(id);
                         self.persist_known_peers();
                     }
@@ -1041,17 +1041,17 @@ impl Node {
                 tracing::debug!("heartbeat broadcast failed: {e}");
             }
             // Piggyback a catalog-head announce on the heartbeat so a peer that
-            // missed a live announce still converges within a heartbeat (A§8).
+            // A peer that missed a live announcement still converges within a heartbeat.
             let _ = self.broadcast_announce().await;
             // Persist the peers we currently know so the next start bootstraps
-            // from them instead of waiting to be re-announced to (DUR-1).
+            // from them instead of waiting to be re-announced.
             self.persist_known_peers();
         }
     }
 
     /// Periodically coalesce pending durable-store mutations into a single git
     /// commit, keeping `git add -A` (a subprocess whose cost grows with the
-    /// tree) off every edit's hot path (A§6). git is inspectability only —
+    /// tree) off every edit's hot path. Git is inspectability only:
     /// durability is the per-write fsync — so a late or missed checkpoint never
     /// risks data; at worst the working tree is briefly uncommitted and the next
     /// tick tidies it.
@@ -1131,7 +1131,7 @@ impl Node {
         }
     }
 
-    /// Our own key as a [`UserId`] (the endpoint id is the ed25519 key, S§2).
+    /// Our key as a [`UserId`]; the endpoint ID is the Ed25519 key.
     fn my_userid(&self) -> UserId {
         UserId::from_key_string(self.shared.my_id.to_string())
     }
@@ -1188,7 +1188,7 @@ impl Node {
         }
     }
 
-    /// Assemble the user-ref resolution directory (UI.md §3.1). Keys are gathered
+    /// Assemble the user-reference resolution directory. Keys are gathered
     /// from every place we've seen one — our own id, the live presence map, recent
     /// join requests, and the signed ACL members — so any of them resolves by
     /// `@me` / full key / id-prefix. **Names come only from the local alias store**
@@ -1233,7 +1233,7 @@ impl Node {
 
     /// Pending join requests: announced joiners (`EventKind::Join`) who are not
     /// yet ACL members. Newest-first, deduped by key. Ephemeral — bounded by the
-    /// event ring, never persisted (UI.md §8).
+    /// event ring and is never persisted.
     fn pending_join_requests(&self) -> Vec<JoinRequestDto> {
         // A joiner's announced id is a *device* key; it is "already a member" if
         // that device speaks for a member actor.
@@ -1357,7 +1357,7 @@ impl Node {
     /// (never across an await).
     /// Dispatch a tracker request; ring a local doorbell for any dirty-set and
     /// return `(response, did_change)`. A change means our catalog head moved, so
-    /// the caller announces it for P2P propagation (A§8).
+    /// the caller announces it for peer propagation.
     fn dispatch_tracker(&self, req: Request) -> (Response, bool) {
         let (resp, dirty) = {
             let mut t = self.tracker.lock().unwrap();
@@ -1378,7 +1378,7 @@ impl Node {
             Err(resp) => return Ok(resp),
         };
         match req {
-            // ---- tracker (P0) ----
+            // ---- tracker ----
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }
             | Request::IssueMove { .. }
@@ -1420,7 +1420,7 @@ impl Node {
             | Request::SpaceRecover => {
                 let (resp, changed) = self.dispatch_tracker(req);
                 if changed {
-                    // our catalog head moved — announce so peers pull (A§8).
+                    // Announce a changed catalog head so peers pull.
                     let me = self.clone();
                     tokio::spawn(async move { me.broadcast_announce().await.ok() });
                 }
@@ -1815,7 +1815,7 @@ impl Node {
                     .iter()
                     .map(|(id, p)| {
                         let online = p.presence.is_online();
-                        // three-state (UI.md §4.5): reachable-and-engaged =
+                        // Three-state presence: reachable and engaged means
                         // online; reachable-but-AFK = away; unreachable = offline.
                         let state = if !online {
                             "offline"
@@ -1938,7 +1938,7 @@ impl Node {
 
     /// Whether this node belongs to a shared workspace it should stay online to
     /// serve (DUR-3). True if it currently tracks any peer, or has ever persisted
-    /// one (DUR-1 `peers.json`) — i.e. it has meshed with someone at least once.
+    /// one in `peers.json`, meaning it has meshed with someone at least once.
     /// A node that has never met a peer is solo/ephemeral and may idle out.
     fn is_mesh_member(&self) -> bool {
         if self
@@ -1998,7 +1998,7 @@ impl Node {
         let _ = write_line(write_half, &resp).await;
     }
 
-    /// The streaming Subscribe loop (S§7.5, UI.md §4.1): emit a `Reset` first
+    /// The streaming subscription loop: emit a `Reset` first
     /// frame that rebaselines the client to the current `seq`, then push every
     /// new doorbell until the client hangs up or the daemon stops. Because the
     /// first frame is always `Reset`, first-connect / reconnect / restart /
@@ -2096,7 +2096,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     let settings = Settings::load(Some(&home));
     let nick = settings.nick();
 
-    // Tracker core (P0): open the git-backed store. The store must already be
+    // Tracker core: open the git-backed store. The store must already be
     // initialized (`lait init` / `lait join`) — a daemon never founds a
     // workspace as a side effect of starting.
     let store = Store::open(&home)?;
@@ -2179,8 +2179,8 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     // network name, so a cold boot can never subscribe to the wrong topic.
     let topic = crate::proto::topic_for_workspace(&tracker.lock().unwrap().workspace_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
-    // rejoins the mesh instead of waiting to be re-announced to (DUR-1), unioned
-    // with the explicit, sticky seed pins (A§10) so a restart always dials its
+    // rejoins the mesh instead of waiting to be re-announced, unioned with the
+    // explicit, sticky seed pins so a restart always dials its
     // always-on seeds even when no ordinary peer was seen last run.
     let pinned_seeds = seed_ids(&home, my_id);
     let mut bootstrap = load_bootstrap_peers(&home, my_id);
@@ -2248,7 +2248,7 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
     .ok();
 
     // Eagerly backfill from every pinned seed on startup — don't wait for a
-    // gossip NeighborUp. This is what makes a seed a cold-start anchor (A§10): a
+    // gossip NeighborUp. This makes a seed a cold-start anchor: a
     // fresh or long-offline client converges through its seed immediately.
     for id in pinned_seeds {
         node.clone().trigger_pull(id);
@@ -2382,7 +2382,7 @@ mod tests {
         assert!(!should_idle_shutdown(0, Duration::from_secs(600), w, true));
     }
 
-    // Doorbell/Reset control-plane invariant (S§7.5, UI.md §4.1): a Subscribe
+    // Doorbell/reset invariant: a subscription
     // stream rebaselines with a `Reset` exactly when its cursor has fallen off
     // the back of the ring, and never otherwise.
     #[test]
@@ -2407,7 +2407,7 @@ mod tests {
         assert!(subscribe_should_reset(oldest - 2, oldest));
     }
 
-    // DUR-1: the bootstrap peer set round-trips through disk and never seeds the
+    // The bootstrap peer set round-trips through disk and never seeds the
     // node with itself (dialing your own id is pointless and could self-loop).
     #[test]
     fn bootstrap_peers_persist_and_filter_self() {
@@ -2429,7 +2429,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The pinned-seed registry (A§10 client half): upsert is id-keyed (no
+    // The pinned-seed registry is ID-keyed (no
     // duplicates), bootstrap ids drop self, and removal matches id or nick.
     #[test]
     fn seeds_upsert_dedup_and_remove() {

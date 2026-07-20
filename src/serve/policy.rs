@@ -9,7 +9,7 @@ use crate::control::Request;
 
 /// Whether `req` only reads.
 ///
-/// An **allowlist**, and the direction matters. `Request` is add-only (S§9 rule 1),
+/// An **allowlist**, and the direction matters. `Request` fields are add-only,
 /// so a verb added after this was written must default to "not a read" — refused
 /// for an identity that isn't ours — rather than quietly inherit permission. The
 /// match is exhaustive rather than `_ => false` for the same reason: a new variant

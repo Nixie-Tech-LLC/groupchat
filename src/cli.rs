@@ -3,7 +3,7 @@
 //! CLI and MCP are Layer-B clients of the daemon (`docs/UI.md`); the web
 //! application uses the same contract through its loopback adapter. This module
 //! renders `Response` snapshots for a human shell, or the versioned
-//! `--json` DTO for scripts/agents (UI.md §2.3). Exit codes: `0` ok · `1`
+//! `--json` DTO for scripts/agents. Exit codes: `0` ok · `1`
 //! usage/error · `2` ref not found / ambiguous · `3` daemon unreachable.
 
 use std::{
@@ -52,7 +52,7 @@ impl Default for Out {
 /// so classifying is opt-in and nothing has to be reclassified at once.
 #[derive(Debug)]
 pub struct CliError {
-    /// The documented exit code (UI.md §2.3) this failure means.
+    /// The documented exit code for this failure.
     pub code: i32,
     pub message: String,
 }
@@ -85,7 +85,7 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-/// The exit code a client-side error means (UI.md §2.3). Split from
+/// The exit code represented by a client-side error. Split from
 /// [`report_error`] so the mapping is testable without a process to exit —
 /// `ExitCode` is deliberately opaque and can't be read back.
 ///
@@ -649,7 +649,7 @@ pub async fn client(home: &Path, req: Request) -> Result<Response> {
         .map_err(|e| CliError::unreachable(format!("{e:#}")).into())
 }
 
-/// Run a request, print the response, and exit with the right code (UI.md §2.3).
+/// Run a request, print the response, and exit with the corresponding code.
 pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
     match client(home, req).await {
         Ok(resp) => {
@@ -668,7 +668,7 @@ pub async fn run(home: &Path, req: Request, out: Out) -> Result<()> {
     }
 }
 
-/// Emit a bare text value honouring the `--json` contract (UI.md §2.3): the
+/// Emit a bare text value while honoring the `--json` contract: the
 /// `Response::Text` DTO under `--json`, else the raw string. For client-side
 /// commands (`id`, `invite`) that don't round-trip a daemon `Response` but must
 /// still emit a parseable DTO under `--json` instead of leaking plain text.
@@ -826,7 +826,7 @@ fn workstate_line(v: &crate::dto::IssueView) -> String {
 
 /// A git branch name for an issue: lowercased `KEY-n` + a hyphenated title slug
 /// (≤40 chars of slug). Predictable by design — `done`/`show` infer the issue
-/// back out of it, and so do agents (UI.md §2.2).
+/// back out of it, and so do agents.
 fn branch_name_for(v: &crate::dto::IssueView) -> String {
     let handle = v
         .key_alias
@@ -1542,7 +1542,7 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
     }
 }
 
-/// Exit code from the typed error kind (UI.md §2.3), not from the message text.
+/// Exit code from the typed error kind, not from the message text.
 fn exit_code_for_kind(kind: ErrorKind) -> i32 {
     match kind {
         ErrorKind::NotFound => 2,
@@ -1985,16 +1985,16 @@ fn desktop_notify(e: &Event) {
 /// Parks on a streaming [`Request::Subscribe`] and treats the doorbell purely as
 /// a **wake signal**: a frame carries a dirty *flag*, never the events, so each
 /// `presence_advanced` ring is followed by a `Log{since}` re-read for the
-/// authoritative rows (UI.md §4.2).
+/// authoritative rows.
 ///
 /// Two cursors are in play and they are **not** interchangeable: `cursor` is an
 /// `EventLog` seq (what `Log{since}` filters on), while the doorbell carries its
 /// own per-session `seq`. We never compare them. The doorbell's `epoch` is the
 /// one field that matters here — a change means the daemon restarted, which
-/// resets the `EventLog` seq to 0 (S§2), voiding our cursor. Rebaselining to 0
+/// resets the `EventLog` sequence to 0, voiding our cursor. Rebaselining to 0
 /// on an epoch change is what keeps `watch` from going deaf across a restart:
 /// the old `Wait` poll loop held its stale high-water and silently matched
-/// nothing forever (S§7.5).
+/// nothing forever.
 pub async fn watch(
     home: &Path,
     since: Option<u64>,
@@ -2077,7 +2077,7 @@ mod tests {
 
     #[test]
     fn client_side_exit_codes_come_from_the_type_not_the_prose() {
-        // Classified errors carry their documented code (UI.md §2.3)...
+        // Classified errors carry their documented code.
         assert_eq!(
             exit_code_for_error(&CliError::not_found("no space matches 'x'").into()),
             2,
