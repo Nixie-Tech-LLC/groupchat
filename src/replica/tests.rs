@@ -1,5 +1,6 @@
 use super::*;
 use crate::control::CatalogScope;
+use crate::control::{Request, Response};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Drive a command that must succeed, yielding its value and what it committed.
@@ -4239,32 +4240,6 @@ fn into_dirty_yields_the_report_alone() {
     );
 }
 
-#[test]
-fn a_successful_read_announces_nothing() {
-    let (resp, dirty) = Replica::respond_read(Ok(7), |n| Response::Ok {
-        message: Some(n.to_string()),
-    });
-    assert!(matches!(resp, Response::Ok { message } if message.as_deref() == Some("7")));
-    assert!(
-        dirty.is_none(),
-        "a read has no persistence effect to report"
-    );
-}
-
-#[test]
-fn a_refused_read_renders_its_error_and_announces_nothing() {
-    let refusal: ReplicaResult<u8> = Err(ReplicaError::NotFound(NotFound::Project {
-        named: "web".into(),
-    }));
-    let (resp, dirty) = Replica::respond_read(refusal, |_| unreachable!("not the Ok arm"));
-    // NotFound is the one family the control plane reports as such: exit 2,
-    // so a script can tell "absent" from "refused" without reading prose.
-    assert!(matches!(&resp, Response::Error { message, error_kind }
-            if message == "no project matches 'web'"
-                && *error_kind == crate::control::ErrorKind::NotFound));
-    assert!(dirty.is_none());
-}
-
 // ---- the read surface's refusals, pinned exactly ----
 //
 // Stage 2 moved every project read off `Response` and onto typed results, so
@@ -4466,30 +4441,6 @@ fn the_mutation_refusals_read_exactly_as_before() {
     for (error, expected) in cases {
         assert_eq!(error.to_string(), expected);
     }
-}
-
-#[test]
-fn the_two_not_found_families_score_exit_two() {
-    // NotFound is the one family the control plane reports as absent rather
-    // than refused, and scripts branch on that.
-    for error in [
-        ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
-        ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
-            reff: "ENG-1".into(),
-            kind: "blocks".into(),
-            target: "ENG-2".into(),
-        }))),
-    ] {
-        let (_, kind) = refusal(Replica::error_response(error));
-        assert_eq!(kind, crate::control::ErrorKind::NotFound);
-    }
-    // The link *kind* being unknown is a bad argument, not an absence.
-    let (_, kind) = refusal(Replica::error_response(ReplicaError::Invalid(
-        Invalid::LinkKind {
-            value: "causes".into(),
-        },
-    )));
-    assert_eq!(kind, crate::control::ErrorKind::Error);
 }
 
 #[test]
@@ -4897,109 +4848,3 @@ fn the_device_projections_render_as_text() {
 }
 
 // ---- a recovery that lands but does not finish ----
-
-#[test]
-fn a_re_root_that_cannot_re_key_still_reports_the_re_root() {
-    // The shape this guards: `space_recover_solo` commits the re-root, then
-    // bootstraps a fresh content key. That second step used to be able to fail
-    // into an error with no dirty set — denying a change that was already
-    // durable and, because `ring_doorbell` never fires, leaving every
-    // subscriber unaware the space had been re-rooted at all.
-    //
-    // The outcome type no longer has room for that: the re-root is `Installed`
-    // either way, and a failed re-key rides along as data the adapter reports.
-    let done = SpaceRecovered {
-        root: ActorId::from_incept_hash(&"a".repeat(64)),
-        rekey_failed: Some(anyhow!("epoch store is read-only")),
-    };
-    let (resp, dirty) = Replica::respond(
-        Ok(Change::committed(
-            SpaceRecovery::Installed(done),
-            DirtySet::catalog(CatalogScope::Acl),
-        )),
-        Replica::space_recovery_response,
-    );
-    assert!(
-        dirty.is_some(),
-        "a landed re-root rings, whatever happened after it"
-    );
-    let message = match resp {
-        Response::Ok { message } => message.unwrap_or_default(),
-        other => panic!("a committed re-root is not an error: {other:?}"),
-    };
-    assert!(
-        message.contains("recovered the space") && message.contains("re-keying failed"),
-        "says both what landed and what did not: {message}"
-    );
-    assert!(
-        message.contains("still readable under the old key"),
-        "names the consequence the operator has to act on: {message}"
-    );
-}
-
-#[test]
-fn a_group_recovery_reports_a_share_it_could_not_add() {
-    // Same shape on the group path: once the signing request is on the board it
-    // is durable and visible to the other holders, so a local failure to
-    // contribute must not erase it.
-    let (resp, dirty) = Replica::respond(
-        Ok(Change::committed(
-            SpaceRecovery::Pending {
-                session: crate::dkg::TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
-                incomplete: Some(anyhow!("share file is unreadable")),
-            },
-            DirtySet::catalog(CatalogScope::Acl),
-        )),
-        Replica::space_recovery_response,
-    );
-    assert!(dirty.is_some(), "the open request rings");
-    let message = match resp {
-        Response::Ok { message } => message.unwrap_or_default(),
-        other => panic!("an open ceremony is not an error: {other:?}"),
-    };
-    assert!(
-        message.contains("group recovery under way"),
-        "the request stands: {message}"
-    );
-    assert!(
-        message.contains("could not add its own share")
-            && message.contains("other holders can still complete it"),
-        "says what this device failed to do without implying the ceremony died: {message}"
-    );
-}
-
-#[test]
-fn an_elevation_that_cannot_finish_still_reports_its_proposal() {
-    // `space_elevate_cmd` posts the proposal, then attaches an authorization —
-    // signing it outright with a solo key, or opening a request for the standing
-    // group. Every step after the post used to be able to fail into an error
-    // with no dirty set, discarding a proposal that was already on the board and
-    // that the other participants would see on their next sync. The old code
-    // also swallowed the ceremony drive entirely (`let _ = self.dkg_advance()`).
-    let (resp, dirty) = Replica::respond(
-        Ok(Change::committed(
-            Elevation {
-                k: 2,
-                n: 3,
-                proposal: crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap(),
-                grant_request: None,
-                incomplete: Some(anyhow!("recovery key disappeared mid-elevation")),
-            },
-            DirtySet::catalog(CatalogScope::Acl),
-        )),
-        Replica::elevation_response,
-    );
-    assert!(dirty.is_some(), "a posted proposal rings");
-    let message = match resp {
-        Response::Ok { message } => message.unwrap_or_default(),
-        other => panic!("a posted proposal is not an error: {other:?}"),
-    };
-    assert!(
-        message.contains("proposed a 2-of-3 recovery arrangement"),
-        "names what landed: {message}"
-    );
-    assert!(
-        message.contains("recovery key disappeared") && message.contains("the proposal stands"),
-        "says what failed without implying the proposal is gone: {message}"
-    );
-}

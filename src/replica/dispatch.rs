@@ -1,6 +1,7 @@
 //! Dispatch and resolution helpers (see `mutate` for the validate-then-commit invariant).
 
 use super::*;
+use crate::control::{Request, Response};
 
 impl Replica {
     // ---- dispatch ----
@@ -309,7 +310,7 @@ impl Replica {
     /// The `Err` arm hard-codes `None`: a refused command has nothing to
     /// announce. [`Change`] makes that unrepresentable on the way in, and this
     /// makes it unrepresentable on the way out.
-    pub(super) fn respond<T>(
+    fn respond<T>(
         result: ChangeResult<T>,
         into_response: impl FnOnce(T) -> Response,
     ) -> (Response, Option<DirtySet>) {
@@ -347,10 +348,7 @@ impl Replica {
     /// than errors — but a re-root whose re-key failed, or a ceremony this
     /// device could not contribute to, must say so plainly. Silence there reads
     /// as success and leaves a degraded space looking healthy.
-    // `pub(super)` only so the post-commit regression tests can drive it with an
-    // injected failure that is otherwise unreachable from `handle`. Narrowed
-    // with the other adapter helpers in the structural-lock stage.
-    pub(super) fn space_recovery_response(r: SpaceRecovery) -> Response {
+    fn space_recovery_response(r: SpaceRecovery) -> Response {
         let message = match r {
             SpaceRecovery::Installed(done) => {
                 let head = format!("recovered the space — root reset to {}", done.root.short());
@@ -384,8 +382,8 @@ impl Replica {
 
     /// An elevation always reports a posted proposal, then what still has to
     /// happen to it — a group authorization, or a step this device could not
-    /// finish. `pub(super)` for the same reason as the recovery renderer.
-    pub(super) fn elevation_response(e: Elevation) -> Response {
+    /// finish.
+    fn elevation_response(e: Elevation) -> Response {
         let Elevation {
             k,
             n,
@@ -598,7 +596,7 @@ impl Replica {
     /// `Change::unchanged` in reach and could manufacture a commit report for
     /// something that never wrote. Separating them reserves `unchanged` for
     /// command branches that provably wrote nothing.
-    pub(super) fn respond_read<T>(
+    fn respond_read<T>(
         result: ReplicaResult<T>,
         into_response: impl FnOnce(T) -> Response,
     ) -> (Response, Option<DirtySet>) {
@@ -610,7 +608,7 @@ impl Replica {
 
     /// Render a domain failure. `NotFound` is the only family the control plane
     /// reports as such — scripts read the kind, people read the message.
-    pub(super) fn error_response(e: ReplicaError) -> Response {
+    fn error_response(e: ReplicaError) -> Response {
         match e {
             // A ref that named several issues, or none but with near misses, is
             // answered with the list rather than a refusal: the useful reply to
@@ -704,5 +702,184 @@ impl Replica {
                 }))
             }
         }
+    }
+}
+
+/// Adapter tests.
+///
+/// These live beside the adapter rather than in `replica::tests` because they
+/// drive `respond`, `respond_read`, and the renderers directly — the helpers
+/// that are private to this boundary. Several assert failures that `handle`
+/// cannot reach, which is exactly why they must be injected here.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::ErrorKind;
+
+    /// The message and kind of a refusal, or a panic naming what came back.
+    fn refusal(resp: Response) -> (String, ErrorKind) {
+        match resp {
+            Response::Error {
+                message,
+                error_kind,
+            } => (message, error_kind),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_read_announces_nothing() {
+        let (resp, dirty) = Replica::respond_read(Ok(7), |n| Response::Ok {
+            message: Some(n.to_string()),
+        });
+        assert!(matches!(resp, Response::Ok { message } if message.as_deref() == Some("7")));
+        assert!(
+            dirty.is_none(),
+            "a read has no persistence effect to report"
+        );
+    }
+
+    #[test]
+    fn a_refused_read_renders_its_error_and_announces_nothing() {
+        let refusal: ReplicaResult<u8> = Err(ReplicaError::NotFound(NotFound::Project {
+            named: "web".into(),
+        }));
+        let (resp, dirty) = Replica::respond_read(refusal, |_| unreachable!("not the Ok arm"));
+        // NotFound is the one family the control plane reports as such: exit 2,
+        // so a script can tell "absent" from "refused" without reading prose.
+        assert!(matches!(&resp, Response::Error { message, error_kind }
+                if message == "no project matches 'web'"
+                    && *error_kind == crate::control::ErrorKind::NotFound));
+        assert!(dirty.is_none());
+    }
+
+    #[test]
+    fn the_two_not_found_families_score_exit_two() {
+        // NotFound is the one family the control plane reports as absent rather
+        // than refused, and scripts branch on that.
+        for error in [
+            ReplicaError::NotFound(NotFound::Member { named: "ab".into() }),
+            ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
+                reff: "ENG-1".into(),
+                kind: "blocks".into(),
+                target: "ENG-2".into(),
+            }))),
+        ] {
+            let (_, kind) = refusal(Replica::error_response(error));
+            assert_eq!(kind, crate::control::ErrorKind::NotFound);
+        }
+        // The link *kind* being unknown is a bad argument, not an absence.
+        let (_, kind) = refusal(Replica::error_response(ReplicaError::Invalid(
+            Invalid::LinkKind {
+                value: "causes".into(),
+            },
+        )));
+        assert_eq!(kind, crate::control::ErrorKind::Error);
+    }
+
+    #[test]
+    fn a_re_root_that_cannot_re_key_still_reports_the_re_root() {
+        // The shape this guards: `space_recover_solo` commits the re-root, then
+        // bootstraps a fresh content key. That second step used to be able to fail
+        // into an error with no dirty set — denying a change that was already
+        // durable and, because `ring_doorbell` never fires, leaving every
+        // subscriber unaware the space had been re-rooted at all.
+        //
+        // The outcome type no longer has room for that: the re-root is `Installed`
+        // either way, and a failed re-key rides along as data the adapter reports.
+        let done = SpaceRecovered {
+            root: ActorId::from_incept_hash(&"a".repeat(64)),
+            rekey_failed: Some(anyhow!("epoch store is read-only")),
+        };
+        let (resp, dirty) = Replica::respond(
+            Ok(Change::committed(
+                SpaceRecovery::Installed(done),
+                DirtySet::catalog(CatalogScope::Acl),
+            )),
+            Replica::space_recovery_response,
+        );
+        assert!(
+            dirty.is_some(),
+            "a landed re-root rings, whatever happened after it"
+        );
+        let message = match resp {
+            Response::Ok { message } => message.unwrap_or_default(),
+            other => panic!("a committed re-root is not an error: {other:?}"),
+        };
+        assert!(
+            message.contains("recovered the space") && message.contains("re-keying failed"),
+            "says both what landed and what did not: {message}"
+        );
+        assert!(
+            message.contains("still readable under the old key"),
+            "names the consequence the operator has to act on: {message}"
+        );
+    }
+
+    #[test]
+    fn a_group_recovery_reports_a_share_it_could_not_add() {
+        // Same shape on the group path: once the signing request is on the board it
+        // is durable and visible to the other holders, so a local failure to
+        // contribute must not erase it.
+        let (resp, dirty) = Replica::respond(
+            Ok(Change::committed(
+                SpaceRecovery::Pending {
+                    session: crate::dkg::TranscriptId::parse_hex(&"b".repeat(64)).unwrap(),
+                    incomplete: Some(anyhow!("share file is unreadable")),
+                },
+                DirtySet::catalog(CatalogScope::Acl),
+            )),
+            Replica::space_recovery_response,
+        );
+        assert!(dirty.is_some(), "the open request rings");
+        let message = match resp {
+            Response::Ok { message } => message.unwrap_or_default(),
+            other => panic!("an open ceremony is not an error: {other:?}"),
+        };
+        assert!(
+            message.contains("group recovery under way"),
+            "the request stands: {message}"
+        );
+        assert!(
+            message.contains("could not add its own share")
+                && message.contains("other holders can still complete it"),
+            "says what this device failed to do without implying the ceremony died: {message}"
+        );
+    }
+
+    #[test]
+    fn an_elevation_that_cannot_finish_still_reports_its_proposal() {
+        // `space_elevate_cmd` posts the proposal, then attaches an authorization —
+        // signing it outright with a solo key, or opening a request for the standing
+        // group. Every step after the post used to be able to fail into an error
+        // with no dirty set, discarding a proposal that was already on the board and
+        // that the other participants would see on their next sync. The old code
+        // also swallowed the ceremony drive entirely (`let _ = self.dkg_advance()`).
+        let (resp, dirty) = Replica::respond(
+            Ok(Change::committed(
+                Elevation {
+                    k: 2,
+                    n: 3,
+                    proposal: crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap(),
+                    grant_request: None,
+                    incomplete: Some(anyhow!("recovery key disappeared mid-elevation")),
+                },
+                DirtySet::catalog(CatalogScope::Acl),
+            )),
+            Replica::elevation_response,
+        );
+        assert!(dirty.is_some(), "a posted proposal rings");
+        let message = match resp {
+            Response::Ok { message } => message.unwrap_or_default(),
+            other => panic!("a posted proposal is not an error: {other:?}"),
+        };
+        assert!(
+            message.contains("proposed a 2-of-3 recovery arrangement"),
+            "names what landed: {message}"
+        );
+        assert!(
+            message.contains("recovery key disappeared") && message.contains("the proposal stands"),
+            "says what failed without implying the proposal is gone: {message}"
+        );
     }
 }

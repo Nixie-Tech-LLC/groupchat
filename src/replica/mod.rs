@@ -12,7 +12,12 @@ use crate::acl::{self, AclAction, AclOp, AclState, Grant, SignedOp};
 use crate::actor::{self, ActorPlane};
 use crate::authz;
 use crate::catalog::{CatalogDoc, RowMeta};
-use crate::control::{BoardPos, CatalogScope, Filter, Request, Response};
+// `Filter`, `BoardPos`, and `CatalogScope` are request *input* types that the
+// domain legitimately takes as parameters — they carry no rendering concern.
+// `Request` and `Response` are the control protocol itself, and are imported by
+// `dispatch` alone, so the boundary holds by name resolution and not only by the
+// CI guard.
+use crate::control::{BoardPos, CatalogScope, Filter};
 use crate::crypto::{self, SpaceKey};
 use crate::dto::{
     ActivityEvent, BoardColumn, BoardView, FieldChange, GraphView, IssueView, LabelDto, LinkDto,

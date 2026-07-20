@@ -248,7 +248,7 @@ impl Replica {
     /// verifies one signature either way — the threshold is invisible here).
     ///
     /// The private `bootstrap_root_epoch_if_needed` helper performs the re-key.
-    pub fn space_recover_cmd(&mut self) -> ChangeResult<SpaceRecovery> {
+    pub(crate) fn space_recover_cmd(&mut self) -> ChangeResult<SpaceRecovery> {
         let cur = crate::space::replay(
             &self.genesis,
             &self.space_id,
@@ -465,7 +465,7 @@ impl Replica {
     /// the holder has verified out-of-band that `session` re-roots the space to
     /// the agreed party, and records local intent so their share is contributed to
     /// exactly that op (and no other request on the board).
-    pub fn space_recover_approve_cmd(
+    pub(crate) fn space_recover_approve_cmd(
         &mut self,
         session_hex: String,
         expect: Vec<String>,
@@ -738,7 +738,7 @@ impl Replica {
     /// `cofounders` (their device keys) + this device. Only the holder of the
     /// current recovery key may elevate (they install the result). Posts the DKG
     /// proposal and this node's first round, then the ceremony advances on sync.
-    pub fn space_elevate_cmd(
+    pub(crate) fn space_elevate_cmd(
         &mut self,
         cofounders: Vec<String>,
         k: u16,
@@ -953,7 +953,7 @@ impl Replica {
     /// must actually be for that one. Approving a session blind would mean
     /// lending a share to whatever configuration happened to be proposed —
     /// including one that hands the next authority to someone else.
-    pub fn space_elevate_approve_cmd(
+    pub(crate) fn space_elevate_approve_cmd(
         &mut self,
         session_hex: String,
         expect_proposal: String,
@@ -1236,7 +1236,7 @@ impl Replica {
     /// package is read back from disk and opened through the **portable** slot
     /// specifically, never the local convenience path, before anything is
     /// attested.
-    pub fn space_custody_export_cmd(
+    pub(crate) fn space_custody_export_cmd(
         &mut self,
         path: String,
         passphrase: String,
@@ -1402,7 +1402,7 @@ impl Replica {
     /// common case for running this by mistake is a working device, and
     /// overwriting good material with an older package would turn a typo into
     /// the loss it exists to prevent.
-    pub fn space_custody_import_cmd(
+    pub(crate) fn space_custody_import_cmd(
         &mut self,
         path: String,
         passphrase: String,
