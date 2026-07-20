@@ -725,6 +725,86 @@ mod tests {
         );
     }
 
+    /// C5: generate every small policy up to a leaf/depth bound and exhaustively
+    /// check each — the MSP admits a witness for a subset iff the boolean policy
+    /// does. Far stronger than five hand-picked shapes: it covers plain and
+    /// nested gates, every threshold, and repeated principals across distinct
+    /// branches, over the whole bounded space.
+    fn generate_policies(pool: &[u8], max_depth: u8) -> Vec<OwnershipPolicy> {
+        let mut out: Vec<OwnershipPolicy> = pool.iter().map(|&n| key(n)).collect();
+        if max_depth == 0 {
+            return out;
+        }
+        let sub = generate_policies(pool, max_depth - 1);
+        // Threshold gates over size-2 and size-3 ordered combinations of subs.
+        for i in 0..sub.len() {
+            for j in 0..sub.len() {
+                if j == i {
+                    continue;
+                }
+                for k in 1..=2u16 {
+                    out.push(OwnershipPolicy::Threshold {
+                        k,
+                        members: vec![sub[i].clone(), sub[j].clone()],
+                    });
+                }
+                for l in 0..sub.len() {
+                    if l == i || l == j || l <= j {
+                        continue;
+                    }
+                    for k in 1..=3u16 {
+                        out.push(OwnershipPolicy::Threshold {
+                            k,
+                            members: vec![sub[i].clone(), sub[j].clone(), sub[l].clone()],
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn generated_small_policies_all_satisfy_the_msp_property() {
+        let policies = generate_policies(&[1, 2, 3], 2);
+        let mut seen = BTreeSet::new();
+        let mut checked = 0;
+        for o in policies {
+            let Ok(canon) = o.canonicalize() else {
+                continue;
+            };
+            if !seen.insert(canon.id()) {
+                continue; // dedup by canonical identity
+            }
+            let exp = expand(&canon, &resolver()).unwrap();
+            if exp.leaves().len() > 12 {
+                continue;
+            }
+            exhaustive_check_canon(&canon, &exp);
+            checked += 1;
+        }
+        assert!(checked > 40, "generated a broad policy space: {checked}");
+    }
+
+    fn exhaustive_check_canon(_canon: &crate::policy::CanonicalPolicy, exp: &Expansion) {
+        let compiled = compile(exp).unwrap();
+        let leaves: Vec<LeafId> = exp.tree().leaves().into_iter().cloned().collect();
+        let n = leaves.len();
+        for mask in 0u32..(1u32 << n) {
+            let subset: Vec<LeafId> = (0..n)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| leaves[i].clone())
+                .collect();
+            let present: BTreeSet<LeafId> = subset.iter().cloned().collect();
+            let boolean = satisfied(exp.tree(), &present);
+            let witness = compiled.reconstruct(&subset);
+            assert_eq!(witness.is_some(), boolean);
+            if let Some(w) = witness {
+                assert!(compiled.verify_witness(&w));
+            }
+        }
+    }
+
     #[test]
     fn compilation_is_deterministic_and_committed() {
         let (a, _) = compile_policy(OwnershipPolicy::Threshold {
