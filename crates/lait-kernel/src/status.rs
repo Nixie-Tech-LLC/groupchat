@@ -5,10 +5,10 @@
 //! custodian holds a usable, backed share. This module is the topology-independent
 //! layer above them (§30):
 //!
-//! - [`CustodyLedger`] collects generation-bound acks and answers *which leaves
-//!   are backed* at a given `(configuration, generation)` — ignoring stale acks
-//!   (an earlier generation, a different configuration), so old-share backing
-//!   never counts toward a newer arrangement.
+//! - [`CustodyLedger`] collects transition-bound acks and answers *which leaves
+//!   are backed* for a given `(transition, configuration, generation)` — ignoring
+//!   acks from another transition or a stale configuration/generation, so neither
+//!   old-share backing nor a concurrent transition's acks count toward this one.
 //! - [`status`] projects the compiled access structure against **durability**
 //!   (the ledger) and **availability** (a session-bound readiness set), keeping
 //!   the two apart: is the key recoverable in principle from the backups on
@@ -29,11 +29,13 @@ use std::collections::BTreeSet;
 use crate::authority::{AuthorityConfigurationId, FrostThresholdConfig, LeafId};
 use crate::compile::StructurallyValidatedCompiledPolicy;
 use crate::policy::OwnershipPolicy;
-use crate::transition::CustodyAck;
+use crate::transition::{CustodyAck, TransitionId};
 
 /// A grow-only log of custody attestations. Backing is answered per
-/// `(configuration, generation)`, so a leaf backed under an old generation does
-/// not count once the arrangement moves on.
+/// `(transition, configuration, generation)`: a `CustodyAck` is bound to the
+/// exact transition that requested it, so two concurrent transitions on the same
+/// configuration and generation can never pool acknowledgments — neither could
+/// otherwise complete, yet the ledger would report enough durability for one.
 #[derive(Debug, Clone, Default)]
 pub struct CustodyLedger {
     acks: Vec<CustodyAck>,
@@ -45,22 +47,28 @@ impl CustodyLedger {
     }
 
     /// Record an attestation. Idempotent: a repeat for the same
-    /// `(configuration, generation, leaf)` adds nothing to the backed set.
+    /// `(transition, configuration, generation, leaf)` adds nothing to the set.
     pub fn record(&mut self, ack: CustodyAck) {
         self.acks.push(ack);
     }
 
-    /// The leaves backed at exactly this configuration and share generation.
-    /// Stale acks — a different configuration or an earlier/later generation —
-    /// are excluded.
+    /// The leaves backed for exactly this transition, at this configuration and
+    /// share generation. An ack from a different transition — even one targeting
+    /// the same configuration and generation — is excluded, as are stale
+    /// configuration/generation acks.
     pub fn backed_leaves(
         &self,
+        transition: TransitionId,
         configuration: &AuthorityConfigurationId,
         generation: u64,
     ) -> BTreeSet<LeafId> {
         self.acks
             .iter()
-            .filter(|a| a.configuration == *configuration && a.share_generation == generation)
+            .filter(|a| {
+                a.transition == transition
+                    && a.configuration == *configuration
+                    && a.share_generation == generation
+            })
             .map(|a| a.leaf.clone())
             .collect()
     }
@@ -78,10 +86,13 @@ impl CustodyLedger {
 /// impossible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryStatus {
+    /// The transition this status is computed for. Custody counts only when bound
+    /// to this exact transition, so concurrent transitions never share backing.
+    pub transition: TransitionId,
     pub configuration: AuthorityConfigurationId,
     pub generation: u64,
-    /// Configured leaves with a qualifying custody ack at this generation — a
-    /// usable share exists somewhere. Sorted.
+    /// Configured leaves with a qualifying custody ack for this transition and
+    /// generation — a usable share exists somewhere. Sorted.
     pub durable: Vec<LeafId>,
     /// Durable leaves whose holder also provided fresh, session-bound readiness —
     /// usable *and* reachable now. Sorted. A subset of `durable`.
@@ -111,13 +122,14 @@ pub struct RecoveryStatus {
 /// lean on.
 pub fn status(
     compiled: &StructurallyValidatedCompiledPolicy,
+    transition: TransitionId,
     configuration: AuthorityConfigurationId,
     generation: u64,
     ledger: &CustodyLedger,
     available_now: &BTreeSet<LeafId>,
 ) -> RecoveryStatus {
     let configured: BTreeSet<&LeafId> = compiled.leaves().iter().collect();
-    let durable_set = ledger.backed_leaves(&configuration, generation);
+    let durable_set = ledger.backed_leaves(transition, &configuration, generation);
 
     let durable: Vec<LeafId> = compiled
         .leaves()
@@ -154,6 +166,7 @@ pub fn status(
     }
 
     RecoveryStatus {
+        transition,
         configuration,
         generation,
         durable,
@@ -215,18 +228,25 @@ mod tests {
     fn config() -> AuthorityConfigurationId {
         AuthorityConfigurationId::single()
     }
-    fn ack(leaf: &LeafId, generation: u64) -> CustodyAck {
+    fn tid(byte: u8) -> TransitionId {
+        TransitionId::parse_hex(&data_encoding::HEXLOWER.encode(&[byte; 32])).unwrap()
+    }
+    /// The default transition used by most tests.
+    fn t0() -> TransitionId {
+        tid(0)
+    }
+    fn ack_for(transition: TransitionId, leaf: &LeafId, generation: u64) -> CustodyAck {
         CustodyAck {
-            transition: crate::transition::TransitionId::parse_hex(
-                &data_encoding::HEXLOWER.encode(&[0u8; 32]),
-            )
-            .unwrap(),
+            transition,
             configuration: config(),
             share_generation: generation,
             leaf: leaf.clone(),
             public_share_commitment: [0u8; 32],
             package_commitment: [0u8; 32],
         }
+    }
+    fn ack(leaf: &LeafId, generation: u64) -> CustodyAck {
+        ack_for(t0(), leaf, generation)
     }
 
     /// A readiness set from the given leaves.
@@ -244,7 +264,7 @@ mod tests {
         for l in &leaves {
             ledger.record(ack(l, 0));
         }
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves));
         assert!(s.durable_qualifies && s.recoverable_now);
         assert!(!s.durability_at_risk);
         assert!(!s.degraded, "every configured leaf is durable");
@@ -265,7 +285,7 @@ mod tests {
             ledger.record(ack(l, 0));
         }
         // Only leaf 0 is available; the other two withhold / are offline.
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..1]));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves[0..1]));
         assert!(s.durable_qualifies, "backups can still recover the key");
         assert!(!s.durability_at_risk, "nothing was lost");
         assert!(!s.recoverable_now, "cannot act with one reachable holder");
@@ -286,7 +306,7 @@ mod tests {
         let mut ledger = CustodyLedger::new();
         ledger.record(ack(&leaves[0], 0));
         // leaves 1 and 2 never acknowledged; all three are "reachable".
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves));
         assert!(!s.durable_qualifies && s.durability_at_risk);
         assert!(!s.recoverable_now);
         assert_eq!(s.durable.len(), 1);
@@ -302,7 +322,7 @@ mod tests {
         // Two of three durable and available: 2-of-3 recoverable, but a branch is down.
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..2]));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves[0..2]));
         assert!(s.recoverable_now);
         assert!(s.degraded, "not all leaves durable");
         assert_eq!(s.durable.len(), 2);
@@ -319,12 +339,43 @@ mod tests {
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[1], 0));
         // Query generation 1 (e.g. after a refresh): no backing counts.
-        let s = status(&c, config(), 1, &ledger, &avail(&leaves));
+        let s = status(&c, t0(), config(), 1, &ledger, &avail(&leaves));
         assert!(
             s.durability_at_risk,
             "old-generation backing does not carry over"
         );
         assert!(s.durable.is_empty());
+    }
+
+    #[test]
+    fn concurrent_transitions_cannot_pool_custody() {
+        // Same configuration and generation, two racing transitions. Each backs
+        // half of a qualified set. Neither may borrow the other's acks.
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let ta = tid(0xAA);
+        let tb = tid(0xBB);
+        let mut ledger = CustodyLedger::new();
+        // Transition A backs leaf 0; transition B backs leaf 1 — pooled, that
+        // would be a qualified 2-of-3, but they belong to different transitions.
+        ledger.record(ack_for(ta, &leaves[0], 0));
+        ledger.record(ack_for(tb, &leaves[1], 0));
+
+        let sa = status(&c, ta, config(), 0, &ledger, &avail(&leaves));
+        let sb = status(&c, tb, config(), 0, &ledger, &avail(&leaves));
+        // Each transition sees only its own single ack — neither qualifies.
+        assert_eq!(sa.durable, vec![leaves[0].clone()]);
+        assert_eq!(sb.durable, vec![leaves[1].clone()]);
+        assert!(sa.durability_at_risk && sb.durability_at_risk);
+
+        // Adding A's second leaf completes A alone, and still not B.
+        ledger.record(ack_for(ta, &leaves[1], 0));
+        let sa2 = status(&c, ta, config(), 0, &ledger, &avail(&leaves));
+        let sb2 = status(&c, tb, config(), 0, &ledger, &avail(&leaves));
+        assert!(sa2.recoverable_now, "A now has its own qualified set");
+        assert!(sb2.durability_at_risk, "B still has only one ack");
     }
 
     #[test]
@@ -344,7 +395,7 @@ mod tests {
             .id();
         ledger.record(other);
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves));
         assert_eq!(
             s.durable.len(),
             1,
@@ -363,7 +414,7 @@ mod tests {
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[0], 0)); // duplicate
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..2]));
+        let s = status(&c, t0(), config(), 0, &ledger, &avail(&leaves[0..2]));
         assert_eq!(
             s.durable.len(),
             2,

@@ -12,8 +12,10 @@
 //! This module defines the bytes the old authority signs ([`InstallationTerms`]),
 //! and — given a set of *signed* installations — decides which one wins and
 //! projects the outcome ([`resolve`]). Selection verifies each signature under
-//! `Y₁` and picks the smallest transition id among the authorized ones, so every
-//! replica converges without coordination. The signature itself is an ordinary
+//! `Y₁` and picks the smallest `(transition id, installation identity)` among the
+//! authorized ones — resolving even two conflicting terms for one transition
+//! deterministically — so every replica converges without coordination. The
+//! signature itself is an ordinary
 //! [`crate::gaccess`] signature under `Y₁`, so a solo old key (1-of-1), a flat
 //! FROST old key (k-of-n) and a general-policy old key all install a successor
 //! the same way.
@@ -28,6 +30,8 @@
 //! before an installation is signed, and they live above this module. The
 //! partition-tolerant agreement and liveness layer around all of this is the
 //! reviewed deliverable. Wired into nothing.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::authority::{AuthorityConfigurationId, LeafId};
 use crate::gaccess::{self, KeyShares, Signature};
@@ -97,6 +101,15 @@ impl InstallationTerms {
     /// The transition these terms install.
     pub fn transition(&self) -> TransitionId {
         self.transition
+    }
+
+    /// A canonical identity for *these exact terms* — the hash of the signed
+    /// message. Two term sets that differ in any bound field (successor key,
+    /// configuration, transcript commitment, activation rule) have distinct
+    /// identities even when they name the same transition, so equivocation within
+    /// a transition is detectable rather than silently collapsed to the id.
+    pub fn identity(&self) -> [u8; 32] {
+        *blake3::hash(&self.message()).as_bytes()
     }
 
     /// The canonical, domain-separated message the old authority signs. Every
@@ -186,39 +199,98 @@ pub fn project_installed(
     Some(out)
 }
 
+/// The outcome of resolving a race among signed installations.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    /// The exact winning installation — the successor terms *and* their old-side
+    /// signature, so the caller knows precisely which key/config/transcript won,
+    /// not merely which transition.
+    pub winner: SignedInstallation,
+    /// The transition-level projection: the winner's transition is
+    /// [`TransitionState::Activated`], every other racing transition
+    /// [`TransitionState::Superseded`]. Deterministic, sorted by transition id.
+    pub projection: Vec<(TransitionId, TransitionState)>,
+    /// Transitions for which the old authority signed **more than one** distinct
+    /// installation (equivocation). Sorted. A resolution is still produced — one
+    /// exact identity is selected deterministically — but the caller is told, so
+    /// it can flag the equivocating old authority.
+    pub equivocations: Vec<TransitionId>,
+}
+
 /// Decide a race among concurrent signed installations and project the outcome.
 ///
+/// Resolution is over *installation identity* ([`InstallationTerms::identity`]),
+/// not merely transition id: if the old authority signed two different successor
+/// terms for one transition, they are distinct candidates, the transition is
+/// reported in [`Resolution::equivocations`], and one is still selected
+/// deterministically rather than silently collapsed.
+///
 /// Each installation is verified under `old_public_key`; ones whose signature
-/// does not check are excluded entirely (an unauthorized installation cannot
-/// win). Among the *valid* ones, the winner is selected deterministically — the
-/// smallest transition id, which is content-addressed, so every replica agrees
-/// without coordination. The result activates the winner and supersedes the
-/// other valid candidates.
+/// does not check are excluded entirely. Among the valid ones the winner is the
+/// smallest `(transition id, identity)` — both content-addressed, so every
+/// replica agrees without coordination, and the tiebreak resolves equivocation
+/// deterministically. The winner's transition is activated and the other racing
+/// transitions superseded.
 ///
 /// Returns `None` if no installation is valid — there is then no authorized
 /// successor, and the arrangement stays put rather than entering an ambiguous
-/// state. Invalid installations do not appear in the projection at all.
+/// state.
 ///
 /// Scope: this decides *which authorized installation wins*. It does **not**
 /// validate candidate possession evidence, the custody acks, or transition
 /// readiness — those are the C4/D6 acceptance checks that must pass *before* an
-/// installation is signed, and they live above this module.
+/// installation is signed, and they live above this module. The selection rule
+/// here — smallest `(transition id, identity)` — must be the *same* rule the
+/// space plane applies at replay; keeping them identical is an integration
+/// obligation, not something this module can enforce alone.
 pub fn resolve(
     old_public_key: &[u8; 32],
     installations: &[SignedInstallation],
-) -> Option<Vec<(TransitionId, TransitionState)>> {
-    // Keep only authorized installations, deduped by transition.
-    let mut valid: Vec<TransitionId> = Vec::new();
-    for si in installations {
-        if verify_installation(old_public_key, &si.terms, &si.signature) {
-            let t = si.terms.transition();
-            if !valid.contains(&t) {
-                valid.push(t);
-            }
-        }
+) -> Option<Resolution> {
+    // Authorized installations, paired with their canonical identity.
+    let valid: Vec<(&SignedInstallation, [u8; 32])> = installations
+        .iter()
+        .filter(|si| verify_installation(old_public_key, &si.terms, &si.signature))
+        .map(|si| (si, si.terms.identity()))
+        .collect();
+    if valid.is_empty() {
+        return None;
     }
-    let winner = *valid.iter().min_by_key(|t| t.to_hex())?;
-    project_installed(&valid, winner)
+
+    // Distinct installation identities per transition; >1 ⇒ equivocation.
+    let mut by_transition: BTreeMap<TransitionId, BTreeSet<[u8; 32]>> = BTreeMap::new();
+    for (si, id) in &valid {
+        by_transition
+            .entry(si.terms.transition())
+            .or_default()
+            .insert(*id);
+    }
+    let equivocations: Vec<TransitionId> = by_transition
+        .iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(t, _)| *t)
+        .collect();
+
+    // Deterministic winner: smallest (transition id, identity).
+    let winner = valid
+        .iter()
+        .min_by(|a, b| {
+            a.0.terms
+                .transition()
+                .to_hex()
+                .cmp(&b.0.terms.transition().to_hex())
+                .then(a.1.cmp(&b.1))
+        })
+        .map(|(si, _)| (*si).clone())
+        .expect("valid is non-empty");
+
+    let transitions: Vec<TransitionId> = by_transition.keys().copied().collect();
+    let projection = project_installed(&transitions, winner.terms.transition())?;
+    Some(Resolution {
+        winner,
+        projection,
+        equivocations,
+    })
 }
 
 #[cfg(test)]
@@ -461,15 +533,25 @@ mod tests {
 
         let resolved = resolve(&old_key.public_key(), &[inst_b.clone(), inst_a.clone()])
             .expect("an authorized installation exists");
-        // Smallest transition id (a) wins regardless of input order.
+        // Smallest transition id (a) wins regardless of input order, and the
+        // exact winning terms are returned.
+        assert_eq!(
+            resolved.winner.terms.transition(),
+            a,
+            "min transition id wins"
+        );
+        assert_eq!(resolved.winner.terms, inst_a.terms);
+        assert!(resolved.equivocations.is_empty());
         let activated: Vec<_> = resolved
+            .projection
             .iter()
             .filter(|(_, s)| *s == TransitionState::Activated)
             .map(|(t, _)| *t)
             .collect();
-        assert_eq!(activated, vec![a], "min transition id wins");
+        assert_eq!(activated, vec![a]);
         assert_eq!(
             resolved
+                .projection
                 .iter()
                 .filter(|(_, s)| *s == TransitionState::Superseded)
                 .count(),
@@ -495,13 +577,54 @@ mod tests {
 
         let resolved = resolve(&old_key.public_key(), &[forged, inst_b]).expect("b is authorized");
         // The forged a does not win despite its smaller id, and does not appear.
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0], (b, TransitionState::Activated));
+        assert_eq!(resolved.winner.terms.transition(), b);
+        assert_eq!(resolved.projection.len(), 1);
+        assert_eq!(resolved.projection[0], (b, TransitionState::Activated));
 
         // With no valid installation, there is no successor — not an ambiguous one.
         let mut all_forged = signed_installation(&old_c, &old_key, &signers, a, 40);
         all_forged.signature.z[0] ^= 1;
-        assert_eq!(resolve(&old_key.public_key(), &[all_forged]), None);
+        assert!(resolve(&old_key.public_key(), &[all_forged]).is_none());
+    }
+
+    #[test]
+    fn resolve_flags_equivocation_within_a_transition_and_still_decides() {
+        let (old_c, old_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old_key = dkg(&old_c, &old_leaves);
+        let signers = vec![old_leaves[0].clone(), old_leaves[1].clone()];
+
+        // The old authority signs TWO different successors for the SAME transition
+        // — an equivocation the caller must be told about.
+        let t = tid(0x05);
+        let inst1 = signed_installation(&old_c, &old_key, &signers, t, 40);
+        let inst2 = signed_installation(&old_c, &old_key, &signers, t, 41);
+        assert_ne!(
+            inst1.terms.identity(),
+            inst2.terms.identity(),
+            "distinct successor terms have distinct identities"
+        );
+
+        let resolved =
+            resolve(&old_key.public_key(), &[inst1.clone(), inst2.clone()]).expect("both valid");
+        // The equivocating transition is surfaced.
+        assert_eq!(resolved.equivocations, vec![t]);
+        // A single winner is still chosen deterministically — the smaller identity,
+        // independent of input order.
+        let expected_terms = if inst1.terms.identity() <= inst2.terms.identity() {
+            inst1.terms.clone()
+        } else {
+            inst2.terms.clone()
+        };
+        assert_eq!(resolved.winner.terms, expected_terms);
+        let reordered = resolve(&old_key.public_key(), &[inst2, inst1])
+            .expect("both valid")
+            .winner;
+        assert_eq!(reordered.terms, expected_terms, "order-independent");
+        // One transition in the race ⇒ it is the activated one.
+        assert_eq!(resolved.projection, vec![(t, TransitionState::Activated)]);
     }
 
     #[test]

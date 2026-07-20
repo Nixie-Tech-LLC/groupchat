@@ -75,6 +75,9 @@ pub enum DkgError {
     /// Two contributions claim the same dealer. Contributor identity is a set;
     /// a repeat would change the aggregate without adding a distinct dealer.
     DuplicateDealer { dealer: LeafId },
+    /// The aggregate public key is the identity — the contributions' secrets
+    /// cancelled to zero. No signature verifies under it; refuse to mint it.
+    DegenerateKey,
 }
 
 /// One contributor's dealing: Feldman commitments to its `ρ^(p)`, and the
@@ -277,6 +280,13 @@ pub fn aggregate(
         .map(|c| c.commitments[0])
         .fold(EdwardsPoint::identity(), |a, b| a + b);
 
+    // Individually valid contributions can still cancel to Y = identity (a zero
+    // group secret) — a rushing final contributor can force it. D1 would refuse
+    // to verify under such a key; reject it here rather than mint an unusable one.
+    if public == EdwardsPoint::identity() {
+        return Err(DkgError::DegenerateKey);
+    }
+
     // s_i = Σ_p s_i^(p), and the aggregate column commitments for S_i.
     let agg_commitments: Vec<EdwardsPoint> = (0..cols)
         .map(|j| {
@@ -436,6 +446,32 @@ mod tests {
             Err(DkgError::DuplicateDealer {
                 dealer: leaves[0].clone(),
             })
+        );
+    }
+
+    #[test]
+    fn contributions_cancelling_to_an_identity_key_are_rejected() {
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        // Dealer 0 contributes ρ; dealer 1 contributes −ρ. Each is individually
+        // Feldman-valid, but Σ C_0 = C_0 + (−C_0) = identity.
+        let a = contribute(&c, leaves[0].clone());
+        let negated = Contribution {
+            dealer: leaves[1].clone(),
+            commitments: a.commitments.iter().map(|p| -p).collect(),
+            shares: a.shares.iter().map(|(l, s)| (l.clone(), -s)).collect(),
+        };
+        // Both pass per-leaf verification.
+        for leaf in &leaves {
+            assert!(verify_share(&c, leaf, &a));
+            assert!(verify_share(&c, leaf, &negated));
+        }
+        assert_eq!(
+            aggregate(&c, &[a, negated]),
+            Err(DkgError::DegenerateKey),
+            "a zero group key must be refused"
         );
     }
 
