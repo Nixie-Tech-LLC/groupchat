@@ -1584,7 +1584,7 @@ impl Tracker {
         let mut changed = Vec::new();
         for doc_id in self.catalog.doc_ids() {
             if !authz.governs(&doc_id) {
-                continue; // legacy docs keep their pre-CRAIT flag untouched
+                continue; // Documents outside the authorization DAG keep their legacy flag.
             }
             let want = authz.is_tombstoned(&doc_id);
             let have = self
@@ -2349,8 +2349,8 @@ impl Tracker {
         self.membership.import(update)?;
         self.store.save_membership(&self.membership)?;
         self.refresh_keyring();
-        // Propagate any key we now hold to our own actor's other devices (SEAL-2
-        // backstop for a device the rotating author hadn't seen).
+        // Propagate newly held keys to sibling devices that the rotating author
+        // may not have seen.
         self.heal_member_device_envelopes()?;
         // Two admins removing different members concurrently can leave the active
         // epoch sealed to a since-removed actor after merge; re-seal to the true
@@ -2527,8 +2527,8 @@ impl Tracker {
         ))
     }
 
-    /// Seal every key-epoch we hold to **every device** of `actor` — the
-    /// self-healing sealing fan-out (SEAL-1/SEAL-2): reaching one live device is
+    /// Seal every key epoch we hold to **every device** of `actor`. Reaching one
+    /// live device is
     /// enough for that actor to propagate the key to its siblings, but we seal
     /// all devices we can see for immediacy. The actor's inception must already
     /// be present (callers import it first).
@@ -5514,7 +5514,7 @@ impl Tracker {
 
     /// Add a device to our actor from its consent blob (hex-encoded
     /// [`actor::DeviceBinding`] from `device accept`), authored by this device,
-    /// and **seal every held epoch to it** so it can decrypt immediately (SEAL-1).
+    /// and seal every held epoch to it so it can decrypt immediately.
     fn device_add_cmd(&mut self, consent_hex: String) -> (Response, Option<DirtySet>) {
         let Some(actor) = self.my_actor() else {
             return (Response::err("this device has no actor identity"), None);
@@ -5790,7 +5790,7 @@ impl Tracker {
         Ok(())
     }
 
-    /// Self-heal (SEAL-2), generalized across the whole membership: seal every
+    /// Repair missing envelopes across the membership by sealing every
     /// epoch key we hold to any device of any *current member actor* that still
     /// lacks an envelope. Admin-ungated and safe — we only ever re-seal keys we
     /// already hold, and only to devices of actors who are entitled to the
@@ -5799,7 +5799,7 @@ impl Tracker {
     ///
     /// This is the backstop that lets any key-holding peer re-provision:
     /// - a *sibling* device added or reinstated after a rotation whose author
-    ///   didn't yet see it (`seal to ≥1 device` suffices — SEAL-1), and
+    ///   did not yet see it (reaching one device is sufficient), and
     /// - a *fresh recovery device* that reset an actor's key set and therefore
     ///   holds no key of its own; the first synced key-holder re-seals to it.
     fn heal_member_device_envelopes(&mut self) -> Result<()> {
@@ -6925,7 +6925,7 @@ mod tests {
 
     #[test]
     fn single_use_invite_admits_exactly_one_actor_under_concurrency() {
-        // 5b regression: two admins concurrently redeem the SAME single-use
+        // Two admins concurrently redeem the same single-use
         // invite for different actors; after merge exactly one is admitted, and
         // both replicas agree (nonce bound into the op + deterministic dedup).
         let mut a = new_node(); // founder/admin
@@ -6967,7 +6967,7 @@ mod tests {
 
     #[test]
     fn concurrent_rotations_converge_and_fence() {
-        // 5a regression: two admins remove *different* members concurrently, each
+        // Two admins remove different members concurrently, each
         // rotating the key. Content-addressed epochs + the heal on merge must
         // converge (both admins read post-heal content) and fence both removed
         // members — no split-brain undecryptable key.
@@ -7690,7 +7690,7 @@ mod tests {
         assert_ne!(chosen, low);
     }
 
-    /// D5 regression. A FROST nonce may produce a share for exactly one signing
+    /// A FROST nonce may produce a share for exactly one signing
     /// package. Producing shares for two under one nonce gives two equations in
     /// one unknown and yields the holder's signing share — so if the package has
     /// moved since we committed, the signer must refuse rather than sign.
@@ -8866,7 +8866,7 @@ mod tests {
         );
     }
 
-    /// F1 regression, the headline one. A rogue proposal carries a perfectly
+    /// A rogue proposal carries a perfectly
     /// valid *device* signature — authentication was never the missing piece.
     /// Without an authorization from the recovery authority, no honest node may
     /// spend a single DKG round on it, because acting on it is what would
@@ -10171,7 +10171,7 @@ mod tests {
 
     #[test]
     fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
-        // CRAIT (contract §3.4) end to end through the real sync path:
+        // Exercise signed authorization operations through the real sync path:
         //  - a member's signed delete propagates to a peer (tombstone is a
         //    cache of the authz replay, reconciled on import),
         //  - a sponsored agent cannot delete (no content authority),

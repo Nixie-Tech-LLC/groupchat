@@ -29,8 +29,8 @@
 //!   hash), so consent binds the **whole inception core**: `(workspace ‖
 //!   binding nonce ‖ incept nonce ‖ sorted device keys ‖ recovery commit)`.
 //!   Binding the full core is what stops a device's consent being replayed
-//!   into a *different* inception (different device set / recovery) that reuses
-//!   the incept nonce — the F2 hole.
+//!   into a *different* inception (different device set or recovery commitment)
+//!   that reuses the incept nonce.
 //! - For `AddDevice`/`Recover` consent binds `(workspace ‖ binding nonce ‖
 //!   actor id)`, and replay enforces the nonce is **single-use per actor**, so
 //!   an old consent cannot be replayed to re-add a device after its revocation.
@@ -184,8 +184,8 @@ pub fn sign_event(
 pub enum ConsentCtx<'a> {
     /// Consent to appear in an `Incept`: the actor id does not exist yet, so
     /// bind the **whole inception core** — a consent minted for one device set
-    /// and recovery commitment cannot be replayed into a different inception that
-    /// reuses the incept nonce (the F2 hole).
+    /// and recovery commitment cannot be replayed into a different inception,
+    /// even when it reuses the incept nonce.
     Incept {
         incept_nonce: &'a [u8; 16],
         /// The inception's device keys (any order — hashed sorted).
@@ -849,9 +849,9 @@ mod tests {
 
     #[test]
     fn incept_consent_not_replayable_into_a_different_device_set() {
-        // F2 regression: device 2's Incept consent (for the {1,2} set) must not
-        // verify inside an attacker's inception with a different device set,
-        // even reusing the same incept nonce.
+        // Device 2's consent to the {1,2} inception must not verify in an
+        // attacker's inception with a different device set, even when it reuses
+        // the same inception nonce.
         let w = ws();
         let nonce = [5u8; 16];
         let victim_keys = vec![device(1), device(2)];

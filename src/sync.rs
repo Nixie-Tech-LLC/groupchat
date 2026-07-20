@@ -37,7 +37,7 @@ pub const SYNC_ALPN: &[u8] = b"lait/sync/1";
 /// version. Peers outside `[MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION]` are
 /// refused with a clear diagnostic instead of failing to decode silently.
 ///
-/// **v2 (CRAIT, contract §3.4):** the catalog gained the encrypted `authz`
+/// **v2:** the catalog gained the encrypted `authz`
 /// signed-op DAG and membership gained the `AddAgent` op kind. A v1 node drops
 /// op kinds it can't decode, which diverges its membership ancestor closure —
 /// and thus its key-sealing recipient set — from a v2 node's, splitting E2EE.
@@ -295,11 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn v1_peers_are_refused_the_crait_flag_day() {
-        // CRAIT (contract §3.4) added the encrypted `authz` DAG and the
-        // `AddAgent` op kind; a v1 node drops op kinds it can't decode, which
-        // diverges its membership ancestor closure and splits E2EE. v2 refuses
-        // v1 outright — the deliberate flag day (module docs).
+    fn v1_peers_are_refused_after_authorization_protocol_change() {
+        // The encrypted `authz` DAG and `AddAgent` operation changed membership
+        // ancestry and therefore the key-sealing recipient set. A v1 node drops
+        // operation kinds it cannot decode and would split E2EE, so v2 refuses
+        // v1 outright.
         // v1 is out of the window (MIN_SUPPORTED_PROTOCOL == 2) — the flag day.
         let err = check_sync_protocol(1).unwrap_err().to_string();
         assert!(
