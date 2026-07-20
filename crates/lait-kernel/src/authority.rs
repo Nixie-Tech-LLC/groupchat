@@ -42,8 +42,8 @@ pub enum AuthorityScheme {
     Single,
     /// Flat K-of-N FROST over a participant list (RFC 9591).
     FrostThreshold,
-    /// A compiled ownership policy over a general access structure. Reserved;
-    /// Phase D.
+    /// A compiled ownership policy over a general access structure. Reserved
+    /// until the general-access backend is production-ready.
     GeneralAccess,
 }
 
@@ -86,7 +86,7 @@ impl AuthorityConfiguration {
             .flatten()
     }
 
-    /// A general-access configuration over a compiled ownership policy (Phase C/D).
+    /// A general-access configuration over a compiled ownership policy.
     pub fn general_access(config: &GeneralAccessConfig) -> Self {
         AuthorityConfiguration {
             version: 1,
@@ -125,8 +125,9 @@ impl AuthorityConfiguration {
             // Structural well-formedness only: the payload decodes and its leaf
             // set is nonempty and distinct. Whether the committed access
             // structure actually implements the named policy is a *semantic*
-            // check that needs the policy tree — `compile::verify_compilation` at
-            // C4 acceptance — not something derivable from the config alone.
+            // check that needs the policy tree — `compile::verify_compilation`
+            // during transition acceptance — not something derivable from the
+            // config alone.
             AuthorityScheme::GeneralAccess => self
                 .as_general_access()
                 .is_some_and(|c| c.is_structurally_well_formed()),
@@ -189,7 +190,7 @@ impl FrostThresholdConfig {
     }
 }
 
-/// A general-access authority (§3.2): the ownership policy, the exact compiler
+/// A general-access authority: the ownership policy, the exact compiler
 /// output that realizes it, and the immutable leaf snapshot.
 ///
 /// The three identities are all here, distinct: `policy` (the human rule),
@@ -222,7 +223,7 @@ impl GeneralAccessConfig {
 /// An ownership identity in a configuration.
 ///
 /// For flat FROST a principal is one device key, so principal and leaf coincide.
-/// They are separate types because Phase C lets a principal expand into a whole
+/// They are separate types because a principal can expand into a whole
 /// policy branch — a federated founder — at which point one principal owns
 /// several leaves and collapsing them would lose the distinction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -247,12 +248,12 @@ pub struct LeafId(String);
 
 impl LeafId {
     /// The leaf of a flat-FROST principal, where principal and leaf coincide.
-    /// General-access expansion (C2) instead mints per-occurrence leaf ids.
+    /// Principal-to-leaf expansion instead mints per-occurrence leaf ids.
     pub fn of_principal(p: &PrincipalId) -> Self {
         LeafId(p.0.clone())
     }
-    /// A leaf id from an opaque string (a content-addressed hex id minted by C2
-    /// expansion). Not validated — the caller owns the derivation.
+    /// A leaf id from an opaque string (a content-addressed hex id minted during
+    /// principal-to-leaf expansion). Not validated; the caller owns the derivation.
     pub fn from_string(s: String) -> Self {
         LeafId(s)
     }
@@ -301,7 +302,7 @@ pub enum AuthorityTransition {
         next_configuration: AuthorityConfigurationId,
         next_public_key: UserId,
     },
-    /// Reserved for Phase D.
+    /// Reserved until proactive same-key resharing is implemented.
     Reshare {
         authority: AuthorityId,
         next_configuration: AuthorityConfigurationId,

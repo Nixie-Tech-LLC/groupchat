@@ -130,7 +130,7 @@ macro_rules! prefixed_id {
 }
 
 prefixed_id!(
-    /// Workspace id — minted at `workspace init`, part of the genesis (A§6).
+    /// Workspace id — minted at `workspace init` and committed by genesis.
     WorkspaceId, "ws_"
 );
 

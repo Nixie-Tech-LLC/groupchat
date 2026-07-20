@@ -1,17 +1,19 @@
-//! E2EE primitives (P3, A§11). All pure-Rust (RustCrypto/dalek), no C toolchain,
+//! End-to-end encryption primitives. All pure Rust (RustCrypto/dalek), no C toolchain,
 //! no `aws-lc` — respecting the portability + supply-chain bans.
 //!
 //! - **AEAD**: ChaCha20-Poly1305 with the 32-byte workspace symmetric key. Sync
 //!   payloads (catalog + issue-doc `export()` bytes) are sealed with this, so a
 //!   blind relay or a non-member sees only ciphertext (the "encryption *is* the
-//!   access control" posture, A§11).
+//!   access control" posture).
 //! - **Sealed box**: an anonymous X25519 + AEAD box that distributes the
 //!   workspace key to a member addressed by their ed25519 `UserId`. The member's
 //!   ed25519 identity is converted to X25519 (libsodium's `*_to_curve25519`).
 //!
-//! > **Research-grade.** This implements a proven *design* by hand; it is
-//! > unaudited and must be independently reviewed before it carries truly
-//! > sensitive data (A§2, A§3 non-goal 1).
+//! # Security status
+//!
+//! This composition has not received an independent cryptographic audit. Do not
+//! treat it as suitable for high-sensitivity production data until that review
+//! is complete.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit},

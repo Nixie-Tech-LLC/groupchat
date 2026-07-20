@@ -1,4 +1,4 @@
-//! The workspace **genesis** — lait's root of trust (A§6, S§6), pure data.
+//! The workspace **genesis** — lait's root of trust, represented as pure data.
 //!
 //! This lives in the kernel, not the store: it is the seed that seeds every
 //! trust-plane replay ([`crate::acl`], [`crate::actor`], [`crate::space`],
@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ActorId, WorkspaceId};
 
-/// The workspace genesis — the root of trust (A§6, S§6). Distributed in the
+/// The workspace genesis — the root of trust. Distributed in the
 /// invite ticket; persisted as public data.
 ///
-/// Since the `lait/actor/1` cutover the founding principals are **actors**
-/// (self-certifying identities), not raw device keys: a founder's device signs
+/// Founding principals are **actors** (self-certifying identities), not raw
+/// device keys: a founder's device signs
 /// membership ops, but the genesis anchors trust in its *actor* so the founder
 /// can rotate devices without re-founding. The founder's inception event ships
 /// in the ticket and syncs in the membership doc; a replica validates it by

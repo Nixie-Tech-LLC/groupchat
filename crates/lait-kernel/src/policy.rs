@@ -1,4 +1,4 @@
-//! C1 — the ownership-policy grammar and its canonical identity.
+//! Ownership-policy grammar and canonical identity.
 //!
 //! A space's ownership rule is a **monotone** boolean formula over principals:
 //! "one lead", "all founders", "any 2 of these 3", "two from Team A and one from
@@ -9,8 +9,8 @@
 //!
 //! [`PolicyId`] is the **human ownership rule** and nothing else. It is *not* the
 //! compiler's `AccessStructureCommitment` (the exact linear-secret-sharing
-//! output, C3) nor the deployed `AuthorityConfigurationId` (the scheme + compiler
-//! version + expansion actually operating a key, C0). A compiler upgrade or a
+//! output) nor the deployed `AuthorityConfigurationId` (the scheme, compiler
+//! version, and expansion actually operating a key). A compiler upgrade or a
 //! custody change alters the deployed configuration without touching the human
 //! policy; conflating the three is how "the policy changed" checks start lying.
 //!
@@ -20,8 +20,9 @@
 //! write. [`CanonicalPolicy`] is the normal form: `Key` and `Threshold` only,
 //! and the *only* thing that hashes to a [`PolicyId`]. You cannot address a
 //! non-canonical policy, because the sole path to an id is
-//! [`OwnershipPolicy::canonicalize`] → [`CanonicalPolicy::id`]. C2 and C3 consume
-//! the canonical *structure*, so it is a value that travels, not a hashing detail.
+//! [`OwnershipPolicy::canonicalize`] → [`CanonicalPolicy::id`]. Expansion and
+//! compilation consume the canonical *structure*, so it is a value that travels,
+//! not a hashing detail.
 //!
 //! # Monotonicity is structural
 //!
@@ -39,13 +40,13 @@ const POLICY_DOMAIN: &[u8] = b"lait/space/1/policy/1";
 
 /// Consensus limits — **not** UI preferences. A policy valid on one node must be
 /// valid on all, so these are fixed constants checked during canonicalization. A
-/// compiler in C3 must materialize the access structure these bound, so raising
+/// the access-structure compiler must materialize what these bound, so raising
 /// them is a cross-implementation decision.
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_LEAVES: usize = 256;
 pub const MAX_ENCODED_BYTES: usize = 65536;
 
-/// The authoring surface for an ownership policy (§17).
+/// The authoring surface for an ownership policy.
 ///
 /// `AllOf` and `AnyOf` are sugar: they normalize to `Threshold{n}` and
 /// `Threshold{1}` respectively, so a policy written either way canonicalizes to
@@ -97,13 +98,13 @@ pub enum PolicyError {
     /// `k` exceeds the member count — unsatisfiable.
     Unsatisfiable { k: u16, members: usize },
     /// The same subtree appears twice in one gate. Repetition must not create
-    /// silent voting weight (§18): a principal that should count twice needs two
+    /// silent voting weight: a principal that should count twice needs two
     /// *distinct* occurrences, not a literal duplicate. A duplicate is a modeling
     /// error, so it is rejected rather than merged or boolean-reduced.
     ///
     /// Note the deliberate limit: a distinct occurrence means a *structurally
     /// different position* (a principal in two different branches gets
-    /// path-distinct leaves in C2). Two intentional identical sibling
+    /// path-distinct leaves during expansion). Two intentional identical sibling
     /// occurrences of one principal — "count me twice, right here" — cannot be
     /// expressed. Repeated sibling weight is unsupported by design; model it as
     /// separate principals if it is genuinely wanted.
@@ -220,7 +221,7 @@ fn normalize_gate(
         Gate::Fixed(_) => {}
     }
 
-    // Reject repeated identical members (§18: no silent weight from repetition).
+    // Reject repeated identical members: repetition must not create silent weight.
     // Sort by canonical encoding so identical subtrees are adjacent; a collapse
     // means a duplicate was present.
     members.sort_by_cached_key(|m| m.encode());
@@ -288,7 +289,7 @@ impl CanonicalPolicy {
 
     /// The principal at each leaf, in canonical order. The same principal may
     /// appear more than once when it occupies genuinely distinct positions
-    /// (different gates); those are separate *occurrences*, and C2 maps each to
+    /// (different gates); those are separate *occurrences*, and expansion maps each to
     /// its own leaf. Identical subtrees were already deduped, so no occurrence is
     /// a silent duplicate.
     pub fn leaves(&self) -> Vec<&PrincipalId> {
@@ -556,7 +557,7 @@ mod tests {
     }
 
     /// Known-answer vector: a fixed policy hashes to a fixed id. Pins the wire
-    /// form so a second implementation can check byte-compatibility (§19). If
+    /// form so a second implementation can check byte compatibility. If
     /// canonicalization or encoding changes, this changes — deliberately.
     #[test]
     fn known_answer_vector_is_stable() {

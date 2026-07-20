@@ -1,4 +1,4 @@
-//! D5 — refresh and repair, kept as two distinct protocols (§29).
+//! Share refresh and repair, kept as two distinct protocols.
 //!
 //! - **Refresh** ([`refresh`]) replaces every share while keeping the public key
 //!   *and the policy*. Each contributor deals a fresh sharing of **zero** over
@@ -9,7 +9,7 @@
 //!   recomputes `s_lost = Σ_j μ_j s_j`; pairwise masks hide each helper's term, so
 //!   the combiner learns only `s_lost` — never a helper's share, never `x`.
 //!
-//! Refresh keeps policy and key; D4 resharing changes the policy; D3 rotation
+//! Refresh keeps policy and key; resharing changes the policy; rotation
 //! changes the key. Three different operations, three modules.
 //!
 //! ## Refresh algebra
@@ -35,11 +35,11 @@
 //! m_j = μ_j s_j + Σ_{k≠j} r_{jk},   r_{jk} = −r_{kj}   ⇒   Σ_j m_j = Σ_j μ_j s_j = s_lost
 //! ```
 //!
-//! # ⚠ Review boundary — UNREVIEWED functional prototype
+//! # Security status
 //!
 //! The [`crate::gaccess`]/[`crate::gdkg`] boundaries carry over. Refresh's
 //! proactive guarantee is only as good as its erasure/epoch model — the same
-//! reviewed protocol D4 depends on; deleting old shares is an explicit operation
+//! requirement as proactive resharing; deleting old shares is an explicit operation
 //! this prototype does not perform. Repair's masking here is generated in one
 //! place to demonstrate the cancellation; the real protocol distributes the
 //! pairwise randomness over authenticated channels and defends against a

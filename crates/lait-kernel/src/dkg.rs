@@ -233,7 +233,8 @@ pub struct KeyCeremonyProposal {
 pub enum ProposedTransition {
     /// Create a new key under a new arrangement, replacing `current`.
     RotateKey { current: AuthorityId },
-    /// Redistribute the SAME key under a new arrangement. Reserved for Phase D:
+    /// Redistribute the same key under a new arrangement. Reserved until the
+    /// proactive resharing protocol is production-ready:
     /// same-key resharing needs a reviewed protocol that never reconstructs the
     /// secret, so accepting one here would promise something unimplemented.
     Reshare { authority: AuthorityId },
@@ -244,7 +245,7 @@ impl KeyCeremonyProposal {
     /// is well formed for a transition this phase implements.
     ///
     /// Returns `None` for a `Reshare` — the variant exists so the format does
-    /// not need changing when Phase D arrives, not so it can be honoured now.
+    /// not need changing when resharing is enabled, not so it can be honored now.
     pub fn frost_config(&self) -> Option<FrostThresholdConfig> {
         if !matches!(self.transition, ProposedTransition::RotateKey { .. }) {
             return None;
@@ -466,12 +467,10 @@ thread_local! {
 
 /// Verify and index the whole board in **one pass**.
 ///
-/// Replaces the per-session parse this used to do: callers previously decoded
-/// events *unverified* to discover sessions, then re-verified the entire board
-/// once per discovered session. That let unsigned events manufacture transcripts
-/// and made the work `transcripts × board` — both attacker-controlled. Here every
-/// event is verified exactly once and an event that fails is dropped before it
-/// can name anything.
+/// Events must be verified before they can identify a session; otherwise unsigned
+/// input could manufacture transcripts and amplify work to
+/// `transcripts × board`, with both dimensions attacker-controlled. Every event
+/// is verified exactly once and failures are dropped before they can name anything.
 ///
 /// Note this establishes *authenticity*, not *authorization*: a validly signed
 /// proposal from any device still lands here. Accepting it is
@@ -745,7 +744,7 @@ pub enum AccessWitness {
         participant_indices: Vec<u16>,
     },
     /// A qualified set under a compiled access structure, with the
-    /// reconstruction coefficients it implies. Reserved; Phase D.
+    /// reconstruction coefficients it implies. Reserved for general-access signing.
     LinearReconstruction {
         policy: [u8; 32],
         leaves: Vec<crate::authority::LeafId>,

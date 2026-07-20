@@ -4,8 +4,8 @@
 //!
 //! This crate lists **no scaffold** in its manifest — not Loro, not iroh — so a
 //! scaffold reference here does not compile. That absence *is* the boundary:
-//! "where lait starts and ends" is the dependency edge, enforced by rustc rather
-//! than remembered by a reviewer. What lives here is pure over identity + signed
+//! "where lait starts and ends" is the dependency edge, enforced by rustc. What
+//! lives here is pure over identity + signed
 //! bytes:
 //!
 //! - [`ids`] — self-certifying identity types (a `UserId` *is* an ed25519 key).

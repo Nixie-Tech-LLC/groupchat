@@ -14,28 +14,21 @@
 //! author observed (`asof`); validation replays membership *up to that frontier*
 //! and requires the author to hold **content-write standing** then — `can_write`
 //! (Admin or Write grant). A grant-less viewer and an agent are both sealed the
-//! key but hold no content authority (contract §3.4), so neither can tombstone.
+//! key but hold no content authority, so neither can tombstone.
 //! Offboarding therefore never resurrects a departed teammate's legitimate
 //! deletes.
 //!
-//! **Why self-declared `asof` is safe here — the ban-evasion hole and its
-//! fence.** Matrix found at-position authorization alone insufficient: a banned
-//! user can craft *new* events that reference pre-ban auth state, so Matrix
-//! adds a "soft-fail" gate against *current* membership (suppress, don't
-//! reject, to stay convergent — server-server API §"Soft failure"). lait faces
-//! the same hole: a removed member could sign a *new* tombstone embedding a
-//! pre-removal `asof`.
-//!
-//! Our fence is the **E2EE epoch**, which Matrix (unencrypted) does not have.
+//! **Why self-declared `asof` is safe here.** At-position authorization alone
+//! would let a removed member sign a *new* tombstone against a pre-removal
+//! frontier. The **E2EE epoch** is the recency fence:
 //! Removal always rotates the workspace key (the app layer's `tracker::member_remove`
 //! → `rotate_key`); post-rotation a removed member cannot produce a payload any
 //! member will decrypt, so their forged tombstone never enters any member's
 //! catalog. The epoch plane is the recency anchor for the authority plane
 //! ("encryption is the access control", composed) — strictly stronger than a
-//! soft-fail heuristic, and it keeps replay a *pure, deterministic* function of
+//! and it keeps replay a *pure, deterministic* function of
 //! the op sets (a live current-membership gate would make two nodes at
-//! different sync points disagree — the exact non-determinism Matrix's
-//! state-reset saga came from). The residual window — a tombstone gossiped
+//! different sync points disagree). The residual window — a tombstone gossiped
 //! *concurrently* with the removal, before rotation propagates — is bounded by
 //! that concurrency and remediated with an explicit restore. `asof` head count
 //! is capped ([`MAX_ASOF`]) so the embedded frontier can't grow unbounded
@@ -44,7 +37,7 @@
 //! **Restore-wins.** Concurrent delete/restore of the same doc resolves to
 //! *visible* (a visible issue is recoverable; a hidden one is silent) — the
 //! same safety bias as membership's remove-wins, pointed at the safe side.
-//! Sequential ops resolve causally as usual. I-confluent throughout (§2.1).
+//! Sequential ops resolve causally as usual, preserving convergence.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -66,7 +59,7 @@ pub const MAX_ASOF: usize = 16;
 /// What a content-authority op does. Variants are **append-only** (postcard).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthzAction {
-    /// Set (or clear) an issue's deletion tombstone (S§5.6). The catalog row
+    /// Set (or clear) an issue's deletion tombstone. The catalog row
     /// flag becomes a *cache* of this plane's replay.
     Tombstone { doc: DocId, on: bool },
 }
@@ -227,7 +220,7 @@ pub fn replay(
         // ...and that actor must hold **content-write standing** at the op's
         // membership position (`can_write` = Admin or Write grant). This is the
         // cross-replica enforcement of the view-only member: a grant-less viewer
-        // — like an agent (§3.4) or a non-member-at-position — has no content
+        // — like an agent or a non-member-at-position — has no content
         // authority, so its tombstone is void on every replica, not merely
         // refused on the author's own node.
         let st = membership_at(&op.asof);
@@ -408,7 +401,7 @@ mod tests {
         assert!(!st.is_tombstoned(&d2), "a stranger's delete is void");
         assert!(
             !st.is_tombstoned(&d3),
-            "an agent holds no content authority (§3.4)"
+            "an agent holds no content authority"
         );
         assert!(st.governs(&d1) && !st.governs(&d2) && !st.governs(&d3));
     }

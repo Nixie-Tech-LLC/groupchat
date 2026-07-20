@@ -1,4 +1,4 @@
-//! D3 — rotation and disjoint handover.
+//! Authority rotation and disjoint handover.
 //!
 //! A rotation installs a **new, independent** authority: a fresh [`crate::gdkg`]
 //! run produces a new key `Y₂` unrelated to the old `Y₁`. Because the new key is
@@ -20,16 +20,16 @@
 //! FROST old key (k-of-n) and a general-policy old key all install a successor
 //! the same way.
 //!
-//! # ⚠ Review boundary — UNREVIEWED functional prototype
+//! # Security status
 //!
 //! The [`crate::gaccess`]/[`crate::gdkg`] boundaries carry over. **Scope:** this
 //! module binds and authorizes the *installation signature* and decides the race
 //! among authorized installations. It deliberately does **not** validate a
 //! candidate's possession evidence, its signing plan/witness, the custody acks,
-//! or transition readiness — those are the C4/D6 acceptance checks that must pass
+//! or transition readiness — candidate-evidence and custody-readiness checks must pass
 //! before an installation is signed, and they live above this module. The
-//! partition-tolerant agreement and liveness layer around all of this is the
-//! reviewed deliverable. Wired into nothing.
+//! partition-tolerant agreement and liveness layer is not implemented. This
+//! functional prototype is not wired into the workspace authority path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,8 +46,8 @@ const INSTALL_DOMAIN: &[u8] = b"lait/space/1/handover/1/install";
 /// leaves must have attested a usable share before activation).
 ///
 /// These are precisely the [`CandidateAuthority`] fields an old holder must
-/// verify (§27); [`InstallationTerms::for_candidate`] projects a C4 candidate
-/// record onto them, and `required_leaves` is the C4 activation rule.
+/// verify; [`InstallationTerms::for_candidate`] projects a candidate record onto
+/// them, and `required_leaves` is the activation rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallationTerms {
     transition: TransitionId,
@@ -81,7 +81,7 @@ impl InstallationTerms {
         }
     }
 
-    /// Project a completed C4 candidate record onto the terms the old authority
+    /// Project a completed candidate record onto the terms the old authority
     /// signs, paired with the activation custody rule for the transition.
     pub fn for_candidate(candidate: &CandidateAuthority, required_leaves: Vec<LeafId>) -> Self {
         Self::new(
@@ -238,7 +238,7 @@ pub struct Resolution {
 ///
 /// Scope: this decides *which authorized installation wins*. It does **not**
 /// validate candidate possession evidence, the custody acks, or transition
-/// readiness — those are the C4/D6 acceptance checks that must pass *before* an
+/// readiness — candidate-evidence and custody-readiness checks must pass *before* an
 /// installation is signed, and they live above this module. The selection rule
 /// here — smallest `(transition id, identity)` — must be the *same* rule the
 /// space plane applies at replay; keeping them identical is an integration
@@ -357,7 +357,7 @@ mod tests {
         sign_installation(old_key, &witness, &nonces, &commitments, terms).expect("sign install")
     }
 
-    /// The core D3 flow: an `old` authority installs a fresh `new` authority.
+    /// The core handover flow: an `old` authority installs a fresh `new` authority.
     /// Returns whether the installation verifies under the old key.
     fn handover(
         old_policy: OwnershipPolicy,
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn policy_to_wholly_disjoint_policy() {
-        // No shared holders at all — the whole point of D3.
+        // Rotation supports entirely disjoint old and new holder sets.
         let old_prins = [prin(1), prin(2), prin(3)];
         let new_prins = [prin(4), prin(5), prin(6)];
         assert!(old_prins.iter().all(|p| !new_prins.contains(p)));

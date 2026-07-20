@@ -1,4 +1,4 @@
-//! C3 — compiling a policy to a linear-secret-sharing access structure (§19).
+//! Compiling a policy to a linear-secret-sharing access structure.
 //!
 //! [`crate::expand`] gives a monotone tree over leaves. This module turns that
 //! tree into a **monotone span program**: a matrix `A` over the Ed25519 scalar
@@ -6,7 +6,7 @@
 //! (authorized by the policy) **iff** `e1` lies in the row-span of `S`'s rows —
 //! and only then can a reconstruction witness `λ` with `λ·A_S = e1` be found.
 //!
-//! The eventual DKG (Phase D) distributes shares `s_i = ⟨A_i, ρ⟩` for a random
+//! The general-access DKG distributes shares `s_i = ⟨A_i, ρ⟩` for a random
 //! `ρ` with secret `ρ_0`; a qualified set recovers the secret as `Σ λ_i s_i =
 //! ⟨Σ λ_i A_i, ρ⟩ = ⟨e1, ρ⟩ = ρ_0`. So getting this matrix right *is* getting the
 //! access control right. An unqualified set has no valid `λ`, so it can produce
@@ -30,17 +30,16 @@
 //! alone: [`verify_compilation`] **recompiles** the committed canonical policy's
 //! immutable [`Expansion`] and requires the result's [`AccessStructureCommitment`]
 //! to equal the advertised one. Only recompilation ties a matrix to the policy an
-//! authority approved. C4 acceptance MUST use `verify_compilation`; it must never
+//! authority approved. Transition acceptance MUST use `verify_compilation`; it must never
 //! treat a structurally-valid artifact as semantic proof.
 //!
-//! # The review boundary
+//! # Assurance boundary
 //!
 //! This is deterministic engineering, but its correctness *is* the access
 //! control, so it is validated the strongest way available: `compile` is checked
 //! against the boolean policy over **every** leaf subset — the MSP admits a
 //! witness for a subset iff the monotone formula does. That is not a substitute
-//! for the external cryptographic review the Phase D contract (§22) requires
-//! before this feeds a live signing protocol.
+//! for an external cryptographic review before this feeds a live signing protocol.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +57,7 @@ const COMMITMENT_DOMAIN: &[u8] = b"lait/space/1/policy/1/access-structure";
 pub const COMPILER_VERSION: u16 = 1;
 
 /// Consensus limits on the compiled artifact cryptography actually consumes.
-/// C1/C2 bound the policy and its expansion; these bound the matrix, so a large
+/// Policy and expansion limits bound the matrix, so a large
 /// but in-bounds expansion cannot become a solve/memory exhaustion path.
 pub const MAX_MATRIX_ROWS: usize = 512;
 pub const MAX_MATRIX_COLS: usize = 512;
@@ -108,7 +107,7 @@ pub struct CompiledPolicy {
 pub struct StructurallyValidatedCompiledPolicy(CompiledPolicy);
 
 /// The content-address of a compiled access structure — the second of the three
-/// identities (§17): the exact compiler output, distinct from the human
+/// identities: the exact compiler output, distinct from the human
 /// [`PolicyId`] and from the deployed `AuthorityConfigurationId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccessStructureCommitment([u8; 32]);
@@ -229,7 +228,7 @@ impl StructurallyValidatedCompiledPolicy {
         self.0.matrix.cols
     }
 
-    /// The content-address, over the whole committed structure (§19).
+    /// The content address over the whole committed structure.
     pub fn commitment(&self) -> AccessStructureCommitment {
         let mut h = blake3::Hasher::new();
         h.update(COMMITMENT_DOMAIN);
@@ -292,7 +291,7 @@ impl StructurallyValidatedCompiledPolicy {
     /// `helpers`' rows: `Σ_j μ_j · A_{helper_j} = A_lost`, or `None` if the lost
     /// row is not in the helpers' span.
     ///
-    /// D5 repair uses this: since `s_lost = ⟨A_lost, ρ⟩ = Σ_j μ_j ⟨A_{helper_j},
+    /// Share repair uses this: since `s_lost = ⟨A_lost, ρ⟩ = Σ_j μ_j ⟨A_{helper_j},
     /// ρ⟩ = Σ_j μ_j s_{helper_j}`, a helper set whose rows span the lost row can
     /// recompute its share as a linear combination of theirs. Note this is
     /// *strictly stronger* than the helpers merely being qualified: qualification
@@ -321,7 +320,7 @@ impl StructurallyValidatedCompiledPolicy {
     }
 
     /// Verify a witness against this structure. Requires, beyond the linear
-    /// equation, a single canonical interpretation (§19 finding 5): the witness
+    /// equation, giving the witness a single canonical interpretation:
     /// binds this exact commitment, its leaves are ours, strictly ordered by row
     /// index and unique, and every coefficient is a canonical nonzero scalar.
     /// Without those, a repeated leaf with split coefficients could satisfy the
@@ -356,7 +355,7 @@ impl StructurallyValidatedCompiledPolicy {
 
     /// Choose a qualified subset from the leaves that actually committed and
     /// return its witness, or `None` if the available set is not qualified.
-    /// Deterministic and reproduced by every signer (§19).
+    /// Deterministic and reproduced by every signer.
     pub fn select_signing_plan(&self, available: &[LeafId]) -> Option<ReconstructionWitness> {
         self.reconstruct(available)
     }
@@ -434,7 +433,7 @@ impl std::error::Error for VerifyError {}
 /// the approved canonical policy and immutable custody snapshot, then calls this,
 /// has an unbroken chain: policy → expansion → matrix → commitment.
 ///
-/// C4 acceptance uses this. A candidate configuration is accepted only when this
+/// Transition acceptance uses this. A candidate configuration is accepted only when this
 /// returns `Ok` for the approved policy's expansion and the candidate's advertised
 /// commitment.
 pub fn verify_compilation(
@@ -476,7 +475,7 @@ impl std::fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
-/// **The C4 acceptance invariant.** Accept a general-access configuration only
+/// **Transition acceptance invariant.** Accept a general-access configuration only
 /// when deterministic recompilation of its committed canonical policy and
 /// immutable expansion reproduces exactly its advertised access structure.
 ///
@@ -761,7 +760,7 @@ mod tests {
         );
     }
 
-    /// C5: generate every small policy up to a leaf/depth bound and exhaustively
+    /// Generate every small policy up to a leaf/depth bound and exhaustively
     /// check each — the MSP admits a witness for a subset iff the boolean policy
     /// does. Far stronger than five hand-picked shapes: it covers plain and
     /// nested gates, every threshold, and repeated principals across distinct

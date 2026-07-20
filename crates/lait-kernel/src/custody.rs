@@ -22,8 +22,8 @@
 //! The package binds itself to its context — workspace, authority, ceremony,
 //! principal and leaf — so a restored share cannot be silently reopened against
 //! the wrong workspace or mistaken for a different holder's. [`SharePayload`] is
-//! an enum rather than raw bytes so the same envelope carries a Phase D share
-//! without a format change.
+//! an enum rather than raw bytes so the same envelope can carry a general-access
+//! share without a format change.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ impl KeySlot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SharePayload {
     Frost(FrostSharePayload),
-    /// Reserved for Phase D.
+    /// Reserved for the general-access backend.
     GeneralAccess(Vec<u8>),
 }
 

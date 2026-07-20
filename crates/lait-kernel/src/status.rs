@@ -1,9 +1,9 @@
-//! D6 — custody ledger, recovery status, and migration.
+//! Custody ledger, recovery status, and migration.
 //!
-//! The cryptographic backends (D1–D5) all produce the same shape of public
+//! The signing, generation, handover, resharing, and refresh backends produce the same shape of public
 //! artifact: a per-leaf share and a generation-bound [`CustodyAck`] that a
 //! custodian holds a usable, backed share. This module is the topology-independent
-//! layer above them (§30):
+//! layer above them:
 //!
 //! - [`CustodyLedger`] collects transition-bound acks and answers *which leaves
 //!   are backed* for a given `(transition, configuration, generation)` — ignoring
@@ -75,7 +75,7 @@ impl CustodyLedger {
 }
 
 /// The readiness of a recovery arrangement — the kernel projection behind the
-/// tracker's status surface (§30).
+/// tracker's status surface.
 ///
 /// **Durability** (can recovery *ever* happen from the backups on record?) and
 /// **availability** (can it happen *right now* with holders that are reachable?)

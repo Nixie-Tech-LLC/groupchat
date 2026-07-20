@@ -1,8 +1,8 @@
-//! D2 — dealer-free general-access key generation.
+//! Dealer-free general-access key generation.
 //!
-//! D1 signs from shares a *trusted dealer* handed out. This module removes the
+//! [`crate::gaccess`] signs from shares a *trusted dealer* handed out. This module removes the
 //! dealer: the key is generated so that no single party ever holds the secret
-//! `x`, yet the resulting shares are the same MSP shares D1 signs with.
+//! `x`, yet the resulting shares have the same MSP form the signer consumes.
 //!
 //! Construction — Feldman-VSS-per-contributor, aggregated over the span program.
 //! Each contributor `p` samples its own distribution vector `ρ^(p) ∈ F^d`
@@ -24,31 +24,32 @@
 //! ```
 //!
 //! Because each contributor's sub-shares are MSP-consistent with `ρ^(p)`, the
-//! sum is MSP-consistent with `ρ = Σ_p ρ^(p)`: a qualified set's D1 witness
+//! sum is MSP-consistent with `ρ = Σ_p ρ^(p)`: a qualified set's reconstruction witness
 //! reconstructs `Σ λ_i s_i = x`, so the [`crate::gaccess`] signer produces a
 //! signature under `Y`. The `dkg_output_signs_under_gaccess` test closes that
 //! loop end to end.
 //!
-//! # ⚠ Review boundary — UNREVIEWED functional prototype
+//! # Security status
 //!
 //! Everything the [`crate::gaccess`] header says applies here, plus DKG-specific
-//! gaps this prototype does **not** address:
+//! gaps this functional prototype does **not** address:
 //!
 //! - **Public-key biasing.** This is a Pedersen/Feldman-style DKG. A rushing
 //!   adversary who chooses its contribution after seeing others' commitments can
 //!   bias the distribution of `Y` (Gennaro–Jarecki–Krawczyk–Rabin). The hardened
 //!   construction commits (hiding) before revealing; that round, and the
 //!   complaint/disqualification protocol that makes aborts identifiable, are the
-//!   reviewed D2 deliverable — not implemented here.
+//!   production protocol must include — not implemented here.
 //! - **Transport & authentication.** Sub-shares here are passed in-process. The
 //!   private per-leaf channel, its authentication, and encrypted-share dealing
 //!   are out of scope for the algebra.
 //! - **Qualified-contributor set.** This aggregates whatever honest
 //!   contributions it is given; agreeing on the accepted-contributor set under
-//!   partial failure is the reviewed protocol's job.
+//!   partial failure is outside this algebraic prototype.
 //!
-//! Wired into nothing. Exists to validate that dealer-free generation yields
-//! shares the general-access signer accepts.
+//! This module is not wired into the workspace authority path. It validates that
+//! dealer-free generation yields shares the general-access signer accepts; that
+//! functional result does not establish active-adversary security.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -181,7 +182,7 @@ impl GroupKey {
     }
 
     /// Assemble a group key from parts a *different* protocol has already
-    /// verified — same-key resharing (D4) and refresh/repair (D5) each establish
+    /// verified — same-key resharing and refresh/repair each establish
     /// share/commitment consistency their own way, then hand the result here.
     /// The DKG path is [`aggregate`], not this. Rejects any non-canonical or
     /// non-prime-order point encoding, a public key that is the identity (a
@@ -281,7 +282,7 @@ pub fn aggregate(
         .fold(EdwardsPoint::identity(), |a, b| a + b);
 
     // Individually valid contributions can still cancel to Y = identity (a zero
-    // group secret) — a rushing final contributor can force it. D1 would refuse
+    // group secret) — a rushing final contributor can force it. Signing would refuse
     // to verify under such a key; reject it here rather than mint an unusable one.
     if public == EdwardsPoint::identity() {
         return Err(DkgError::DegenerateKey);
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn dkg_output_signs_under_gaccess() {
-        // The money test: dealer-free shares sign a message via D1.
+        // Verify that dealer-free shares produce a valid general-access signature.
         let (c, leaves) = compiled(OwnershipPolicy::Threshold {
             k: 2,
             members: vec![key(1), key(2), key(3)],

@@ -1,6 +1,6 @@
-//! D1 — general-access Schnorr signing over a compiled access structure.
+//! General-access Schnorr signing over a compiled access structure.
 //!
-//! The access control from C3 is a monotone span program: a qualified leaf set
+//! The compiled access control is a monotone span program: a qualified leaf set
 //! `S` has reconstruction coefficients `λ` with `x = Σ_{i∈S} λ_i s_i`, where
 //! `s_i` is leaf `i`'s share of a secret scalar `x` and `Y = xG` is the public
 //! key. This module produces **one** Schnorr signature under `Y` from a qualified
@@ -14,29 +14,29 @@
 //! R = k·G,   so   z·G = R + c·Y.
 //! ```
 //!
-//! # ⚠ Review boundary — this is an UNREVIEWED functional prototype
+//! # Security status
 //!
-//! Per the Phase D contract (§22–§31), general-access signing is a *new
-//! protocol*, not "FROST with different coefficients", and D1 **ends with an
-//! external cryptographic review**. Passing the functional vectors here is
-//! necessary but **not** approval to deploy. Specifically NOT yet done:
+//! General-access signing is a new protocol, not "FROST with different
+//! coefficients." Passing the functional vectors here does not establish
+//! production readiness. The following protections are not yet implemented or
+//! independently reviewed:
 //!
 //! - **Active-adversary security.** The tests exercise honest execution. Corrupt
 //!   coordinators/signers, adaptive availability, transcript manipulation and
-//!   identifiable aborts are the review's subject, not covered here.
+//!   identifiable aborts are not covered here.
 //! - **Ed25519 wire compatibility.** This verifies under *this module's own*
 //!   Schnorr equation, not a standard Ed25519 verifier. RFC-9591-exact challenge,
 //!   cofactor and encoding — so the space plane's ed25519 verifier accepts the
-//!   output — is reviewed D-work, deliberately not faked here.
+//!   output — is deliberately not approximated here.
 //! - **Dealer-free generation.** Shares here come from a **test dealer**
-//!   ([`deal`]). The dealer-free VSS/DKG is D2, behind its own review gate.
+//!   ([`deal`]); [`crate::gdkg`] provides the isolated dealer-free prototype.
 //! - **Nonce lifecycle.** Single-use nonce enforcement rides the existing
 //!   [`crate::dkg::PendingNonce`] discipline at the ceremony layer; this module
 //!   provides the algebra, and nonce reuse across messages is a caller error the
 //!   plan-bound nonce record is responsible for preventing.
 //!
 //! Nothing here is wired into the tracker or the space plane. It exists to
-//! isolate and validate the signing/witness algebra ahead of that review.
+//! isolate and validate the signing/witness algebra. It is not production-ready.
 
 use std::collections::BTreeMap;
 
@@ -59,8 +59,8 @@ fn random_scalar() -> Scalar {
 }
 
 /// A test-only dealer's output: the secret, the public key, and each leaf's share
-/// consistent with the compiled access structure. **D1 uses dealer-generated
-/// shares by design** — the dealer-free equivalent is D2.
+/// consistent with the compiled access structure. This prototype uses
+/// dealer-generated shares by design; [`crate::gdkg`] is dealer-free.
 #[derive(Debug, Clone)]
 pub struct Dealing {
     secret: Scalar,
@@ -70,7 +70,7 @@ pub struct Dealing {
 
 /// What signing needs from a key: the group public key and the caller's own
 /// share of each leaf it operates. Deliberately does **not** expose the secret —
-/// dealer-free generation (D2) produces a value with no secret to expose, and
+/// dealer-free generation produces a value with no secret to expose, and
 /// signing must work identically whether the shares came from a test dealer or a
 /// real DKG.
 pub trait KeyShares {
@@ -82,7 +82,7 @@ pub trait KeyShares {
 
 impl Dealing {
     /// The dealt secret `x`. A real deployment never materializes this — it is
-    /// the very thing D2's dealer-free generation exists to avoid. Exposed here
+    /// the very thing dealer-free generation exists to avoid. Exposed here
     /// only so tests can check that qualified reconstruction recovers it.
     pub fn secret_for_test(&self) -> Scalar {
         self.secret
@@ -101,7 +101,7 @@ impl KeyShares for Dealing {
 /// Deal shares for `compiled`: sample a random distribution vector `ρ`, set the
 /// secret `x = ρ₀`, and give leaf `i` the share `⟨A_i, ρ⟩`.
 ///
-/// TEST DEALER ONLY. A trusted dealer holds `x`; the whole point of D2 is to
+/// TEST DEALER ONLY. A trusted dealer holds `x`; dealer-free generation exists to
 /// remove it. Used here to isolate signing correctness from DKG correctness.
 pub fn deal(compiled: &StructurallyValidatedCompiledPolicy) -> Dealing {
     let cols = compiled.cols();
@@ -266,7 +266,7 @@ pub fn sign_qualified<K: KeyShares>(
 /// Verify a signature under the general-access Schnorr equation `z·G = R + c·Y`.
 ///
 /// This is **this module's** verifier, not a standard Ed25519 verifier — see the
-/// review boundary in the module docs.
+/// security limitations in the module documentation.
 ///
 /// The public key `Y` and nonce `R` cross a trust boundary, so decompression
 /// alone is not enough: both are checked to be non-identity points of the

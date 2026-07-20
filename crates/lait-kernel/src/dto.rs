@@ -67,7 +67,7 @@ impl Priority {
         })
     }
 
-    /// One-letter board badge (UI.md §5.1: `·U/H/M/L·`).
+    /// One-letter board badge: `·U/H/M/L·`.
     pub fn badge(&self) -> &'static str {
         match self {
             Priority::None => "-",
@@ -118,7 +118,7 @@ pub struct WorkflowState {
     pub color: String,
 }
 
-/// The default workflow seeded into a fresh Catalog (UI.md §5.1 board columns).
+/// The default workflow seeded into a fresh catalog.
 pub fn default_workflow() -> Vec<WorkflowState> {
     vec![
         WorkflowState {
@@ -213,8 +213,7 @@ impl CorruptRecord {
 /// Deliberately **not** `Serialize`. A `Projected` cannot reach the wire; it has
 /// to be [`partition`]ed first, which is what guarantees a UI consumer can never
 /// receive a malformed record inside a field typed as a valid one. The invariant
-/// is structural, not a matter of discipline — exactly the argument the data
-/// contract's §6 collar makes about raw kernel handles.
+/// is structural rather than a matter of caller discipline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projected<T> {
     Valid(T),
@@ -276,7 +275,7 @@ pub struct LabelDto {
 /// not arrived is `provisional`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
-    /// Canonical short handle (`iss_3f9`), the collision-free id (S§5.4).
+    /// Canonical collision-free short handle, such as `iss_3f9`.
     pub reff: String,
     pub doc_id: DocId,
     pub project_id: ProjectId,
@@ -300,14 +299,14 @@ pub struct Row {
     pub provisional: bool,
 }
 
-/// A board column: an ordered slice of rows for one workflow state (UI.md §5.1).
+/// A board column: an ordered slice of rows for one workflow state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardColumn {
     pub state: WorkflowState,
     pub rows: Vec<Row>,
 }
 
-/// A rendered board — workflow states × ordered rows (UI.md §5.1).
+/// A rendered board: workflow states with their ordered rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardView {
     pub schema_version: u32,
@@ -332,7 +331,7 @@ pub struct CommentDto {
 }
 
 /// The full issue projection — populated by lazily loading the issue doc
-/// (UI.md §5.3). `provisional` when only the catalog row is known (§3.3).
+/// `provisional` is set when only the catalog row is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueView {
     pub schema_version: u32,
@@ -381,7 +380,7 @@ pub struct ActivityEvent {
     pub actor_nick: String,
     pub text: String,
     pub ts: u64,
-    /// Non-blocking LWW collision note (A§9): concurrent overwrite detected.
+    /// Non-blocking LWW collision note: a concurrent overwrite was detected.
     pub collision: bool,
 }
 
@@ -393,7 +392,7 @@ pub struct FieldChange {
     pub to: Option<String>,
 }
 
-/// One issue link projected for the graph view (contract §3.2). `direction`
+/// One issue link projected for the graph view. `direction`
 /// is relative to the requested issue: `out` = it names the other, `in` = the
 /// other names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,7 +419,7 @@ pub struct GraphView {
     pub blocked_by: Vec<Row>,
 }
 
-/// A disambiguation candidate when a ref resolves to many (UI.md §3.2).
+/// A disambiguation candidate when a reference resolves to multiple issues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub reff: String,
@@ -429,13 +428,13 @@ pub struct Candidate {
 }
 
 /// One inbox item — a remote change **addressed to you**, derived at sync-import
-/// time and persisted locally (S§8.1 `inbox.json`). Attribution-honest:
+/// time and persisted locally in `inbox.json`. Attribution remains conservative:
 /// `actor_nick` is present only for comments (the one in-doc field that carries
 /// a real author); assignment/status changes render actor-unknown rather than
 /// guessing (S non-goal 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxEntry {
-    /// Local receive time (unix secs) — the read-watermark axis (advisory, S§2).
+    /// Local receive time (Unix seconds), used as the advisory read-watermark axis.
     pub ts: u64,
     /// `assigned` | `comment` | `status`.
     pub kind: String,
@@ -454,15 +453,15 @@ pub struct InboxEntry {
     pub actor_nick: Option<String>,
 }
 
-/// A workspace member projection (P3 members view, UI.md §8). Roles come from the
+/// A workspace member projection. Roles come from the
 /// signed ACL graph — the only cryptographically-verified identity in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDto {
-    /// The member's **actor id** (`act_…`) since the lait/actor/1 cutover — a
-    /// self-certifying identity over a set of device keys, not a raw key. Kept
-    /// as `key` for wire/field stability across the CLI/TUI/viewer projections.
+    /// The member's **actor id** (`act_…`), a self-certifying identity over a set
+    /// of device keys rather than a raw key. Kept
+    /// as `key` for wire compatibility across client projections.
     pub key: String,
-    /// "admin" | "member" | "viewer" | "agent" (contract §3.4).
+    /// `admin` | `member` | `viewer` | `agent`.
     pub role: String,
     /// Whether this is us (this device speaks for the actor).
     pub me: bool,
@@ -476,8 +475,8 @@ pub struct MemberDto {
     pub alias: String,
 }
 
-/// One rendered row of the membership audit log (`lait members log`, contract
-/// §3.4): the signed ACL DAG replayed in causal order with each op's verdict.
+/// One rendered row of the membership audit log (`lait members log`): the signed
+/// ACL DAG replayed in causal order with each operation's verdict.
 /// This is **cryptographic provenance** (who was authorized to do what),
 /// distinct from the advisory activity feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,7 +499,7 @@ pub struct MemberLogEntry {
 
 /// A pending join request: someone who announced a join (via `connect`/`join`)
 /// and is not yet a member. Derived from the presence event log, not persisted —
-/// the request survives only as long as the daemon's event ring (UI.md §8).
+/// the request survives only as long as the daemon's event ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequestDto {
     /// The requester's ed25519 key (64-hex) — feed straight to `members approve`.
@@ -511,7 +510,7 @@ pub struct JoinRequestDto {
     pub ts: u64,
 }
 
-/// A pinned seed ("remote") projection for `seed ls` / `remote ls` (A§10). A seed
+/// A pinned seed ("remote") projection for `seed ls` / `remote ls`. A seed
 /// is a bootstrap + backfill anchor, never a trust authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedDto {

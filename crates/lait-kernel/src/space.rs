@@ -2,7 +2,7 @@
 //!
 //! Membership made *identity* self-certifying (`ActorId = H(inception)`); this
 //! does the same for the **workspace** one layer up, and gives its trust root a
-//! **break-glass recovery** path (W5).
+//! **break-glass recovery** path.
 //!
 //! # Self-certifying id
 //!
@@ -17,7 +17,7 @@
 //! `ws_id`, and `founder_actor = H(inception)`. A joiner given
 //! `{ws_id, salt, recovery_commit, founder_inception}` verifies the chain offline.
 //!
-//! # Root lifecycle (W5) — a single (rotating) recovery authority
+//! # Root lifecycle — a single rotating recovery authority
 //!
 //! `genesis.founding_actors` is only the *bootstrap* root: it seeds `acl::replay`.
 //! Ordinary governance (add/remove admins) rides the ACL. What the ACL cannot do
@@ -91,7 +91,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 /// A workspace-plane op. All are signed by the **current recovery key** (a solo
 /// key or a FROST group key); planned admin governance rides the ACL.
 ///
-/// # The standing-authority commitment (C0)
+/// # Standing-authority commitment
 ///
 /// The plane commits to the **complete** standing authority: its public key
 /// (via `recovery_commit`) and the *arrangement operating it* (via an opaque
@@ -99,8 +99,7 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
 /// carries a 32-byte commitment and stays blind to signing topology, exactly as
 /// it is blind to the threshold behind a group key. What the commitment buys is
 /// that **every replica, holder or not, learns the standing arrangement by
-/// replay** rather than by holding a share; before C0 the arrangement lived only
-/// in a holder's local acceptance records, so a non-holder could not learn it.
+/// replay** rather than by holding a share.
 ///
 /// A configuration id on a `Rotate`/`Reshare` is an *attestation by the current
 /// authority* about the next arrangement. The plane cannot verify it is truthful
@@ -124,11 +123,11 @@ pub enum SpaceOp {
     Rotate {
         new_recovery_key: UserId,
         gen: u32,
-        /// The arrangement operating the new key (C0). **Required.**
+        /// The arrangement operating the new key. **Required.**
         ///
         /// Postcard is positional and non-self-describing: a missing field does
         /// not default, it fails to decode. There is no wire migration from the
-        /// pre-C0 two-field `Rotate` — and none is needed, because no `Rotate`
+        /// earlier two-field `Rotate` — and none is needed, because no `Rotate`
         /// event is deployed. The only producer of a `Rotate` is the FROST
         /// elevation install path (unreleased ceremony/2); solo workspaces carry
         /// no space events beyond genesis, and genesis is `Single` by
@@ -142,7 +141,7 @@ pub enum SpaceOp {
     /// unchanged, only the configuration operating it changes.
     ///
     /// Defined here so replay can *represent* a same-key transition; the
-    /// off-plane authorization refuses to author one until D4's proactive
+    /// off-plane authorization refuses to author one until proactive
     /// resharing protocol exists (mirroring `ProposedTransition::Reshare`, which
     /// round-trips but is refused). The plane applying it is not the same as the
     /// product performing it.
@@ -191,7 +190,7 @@ pub struct RootState {
     pub root: Vec<ActorId>,
     /// The commitment to the current recovery key (rotated by each `Rotate`).
     pub recovery_commit: [u8; 32],
-    /// The **standing arrangement** operating the recovery key (C0). Genesis is
+    /// The **standing arrangement** operating the recovery key. Genesis is
     /// [`AuthorityConfigurationId::single`]; each `Rotate`/`Reshare` sets it. The
     /// plane never decodes it — it is the opaque commitment other layers read to
     /// learn the authority's topology without holding a share.
@@ -477,7 +476,7 @@ mod tests {
         );
     }
 
-    /// The pre-C0 `Rotate` had two fields `{new_recovery_key, gen}`. Postcard is
+    /// The earlier `Rotate` encoding had two fields `{new_recovery_key, gen}`. Postcard is
     /// positional and non-self-describing, so a field cannot be added compatibly
     /// — this pins that an old two-field encoding fails to decode as the new
     /// three-field `Rotate` rather than silently mis-reading `gen`'s bytes as a

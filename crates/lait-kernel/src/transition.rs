@@ -1,5 +1,5 @@
-//! C4 — authority transitions: candidate evidence, generation-bound custody, and
-//! the transition lifecycle as a deterministic projection (§21).
+//! Authority transitions: candidate evidence, generation-bound custody, and the
+//! transition lifecycle as a deterministic projection.
 //!
 //! A transition moves the recovery authority from one configuration to another.
 //! Its lifecycle is **not** a mutable state field — it is a pure projection over
@@ -7,7 +7,7 @@
 //! computes the same state and a liveness failure never leaves two plausible
 //! standing configurations.
 //!
-//! # The trust model (C4 decision)
+//! # Trust model
 //!
 //! Activation evidence is **generation-bound participant attestations plus a
 //! candidate-key possession signature** — not an unproven publicly-verifiable
@@ -34,7 +34,7 @@ use crate::sigdag::SignedNode;
 /// A transition's identity: the content-address of the signed node that **opens**
 /// it. Distinct from the proposal's transcript id, so refresh/repair/reshare
 /// against an unchanged configuration get distinct transition ids and never
-/// collide (D5).
+/// collide with one another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TransitionId([u8; 32]);
 
@@ -86,7 +86,7 @@ pub struct CandidateAuthority {
 }
 
 /// A custodian's generation-bound attestation that it holds and has backed up a
-/// usable share for one leaf (§4a).
+/// usable share for one leaf.
 ///
 /// Bound to the exact output generation — a ceremony-and-device marker is
 /// insufficient once refresh/repair/resharing can issue successive shares to the
@@ -107,7 +107,7 @@ pub struct CustodyAck {
 /// extensible so a future reviewed transcript proof slots in without a redesign.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateEvidence {
-    /// The C4 v1 model: possession + per-leaf custody attestations.
+    /// Version 1 evidence: possession plus per-leaf custody attestations.
     ParticipantAttestationsV1 {
         candidate: CandidateAuthority,
         custody: Vec<CustodyAck>,
@@ -162,7 +162,7 @@ impl TransitionEvent {
     }
 }
 
-/// The lifecycle state a transition projects to (§21).
+/// The lifecycle state a transition projects to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionState {
     /// Proposed, not yet authorized.
@@ -185,9 +185,9 @@ pub enum TransitionState {
 /// deterministic function, so every replica agrees.
 ///
 /// `required_leaves` is the set of leaves whose custody must be attested before
-/// `Ready`. For **initial authority creation** the reviewer's rule applies: pass
-/// *every configured leaf*, so an authority is never activated naming owners who
-/// never received usable shares. Later refresh/repair may pass a narrower set.
+/// `Ready`. **Initial authority creation requires every configured leaf**, so an
+/// authority is never activated while naming owners who never received usable
+/// shares. Later refresh or repair may pass a narrower set.
 ///
 /// Only custody acks matching the transition, its configuration, and
 /// `share_generation` count — a stale ack for an earlier generation does not.

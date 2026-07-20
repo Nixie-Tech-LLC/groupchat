@@ -1,8 +1,6 @@
-//! Membership & access control — the signed ACL op-graph (S§6), **actor-keyed**
-//! since the `lait/actor/1` cutover.
+//! Membership and access control through an **actor-keyed** signed ACL op-graph.
 //!
-//! **What changed at the cutover.** Ops used to bind a raw device key
-//! (`UserId`); a member *was* a key. Membership now binds an [`ActorId`] — a
+//! Membership binds an [`ActorId`] — a
 //! self-certifying identity over a self-managed set of device keys
 //! ([`crate::actor`]). Every op is still signed by exactly one device (the
 //! [`SignedNode`] envelope is unchanged), but authority resolves through one
@@ -47,7 +45,7 @@ pub type SignedOp = SignedNode;
 
 /// A capability grant. Variants are **append-only** (postcard positional) —
 /// this is the extensible carrier future capabilities ride (finer write
-/// scopes, service grants) without another op-shape cutover.
+/// scopes, service grants) without changing the operation shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Grant {
@@ -71,12 +69,12 @@ pub enum AclAction {
         actor: ActorId,
         grants: Vec<Grant>,
     },
-    /// Sponsor an agent actor (contract §3.4). The sponsor is the op's `by`
+    /// Sponsor an agent actor. The sponsor is the op's `by`
     /// actor; the agent's membership is derived, and dies, with them.
     AddAgent {
         actor: ActorId,
     },
-    /// Mint a workspace key-epoch (A§11). **Signed, and authorized only when its
+    /// Mint a workspace key epoch. **Signed, and authorized only when its
     /// author holds admin standing** — re-keying decides who reads future content
     /// (a membership-authority action), so the key lifecycle rides the exact trust
     /// boundary as add/remove-member: a departed member cannot mint itself
@@ -202,7 +200,7 @@ impl AclOp {
 }
 
 /// Sign an [`AclOp`] with the author's ed25519 device seed, given the current
-/// heads as parents (S§6). Same envelope bindings as every plane.
+/// heads as parents. Uses the same envelope bindings as every signed plane.
 pub fn sign_op(
     seed: &[u8; 32],
     op: &AclOp,
@@ -285,7 +283,7 @@ impl AclState {
             .get(a)
             .is_some_and(|g| g.contains(&Grant::Admin) || g.contains(&Grant::Write))
     }
-    /// Whether `a` is an agent principal (contract §3.4).
+    /// Whether `a` is an agent principal.
     pub fn is_agent(&self, a: &ActorId) -> bool {
         self.agents.contains_key(a)
     }
@@ -360,7 +358,7 @@ pub struct AuditEntry {
     pub authorized: bool,
 }
 
-/// Deterministically replay the signed op-graph from the genesis (S§6), given
+/// Deterministically replay the signed op-graph from genesis, given
 /// the actor plane's event set. Founding actors seed the admin set; each op is
 /// honored only if signature-valid, its author device belonged to its claimed
 /// actor at the declared frontier, and the actor held the required standing as
@@ -459,7 +457,7 @@ pub fn replay_with_audit(
         let by = &op.by;
         let bound = device_speaks_for(&so.author, by, &op.actor_asof);
 
-        // Agents may author NO membership op (contract §3.4).
+        // Agents have no membership authority, even when their signing device is bound.
         let ok = bound
             && !agents_now.contains_key(by)
             && match &op.action {
@@ -476,7 +474,7 @@ pub fn replay_with_audit(
                         && !humans.contains(actor)
                         && !agents_now.contains_key(actor)
                 }
-                // Minting a key-epoch requires **admin standing** (A§11):
+                // Minting a key epoch requires **admin standing**:
                 // re-keying decides who reads future content, a membership-
                 // authority action — so a viewer, plain writer, agent, or
                 // non-member cannot mint. This is the fence that stops an
@@ -599,7 +597,7 @@ pub fn replay_with_audit(
         }
     }
 
-    // ---- remove-wins override (S§6): an authorized remove not causally
+    // Remove-wins override: an authorized remove not causally
     // succeeded by an authorized (re-)add removes the actor even if a
     // concurrent add appeared later in topo order. AddAgent counts as an add.
     let subjects: BTreeSet<ActorId> = authorized

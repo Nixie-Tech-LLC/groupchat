@@ -1,4 +1,4 @@
-//! D4 — proactive same-key resharing.
+//! Proactive same-key resharing.
 //!
 //! ```text
 //! Policy P1, shares S1, public key Y   →  authorized resharing  →  Policy P2, shares S2, public key Y
@@ -29,20 +29,21 @@
 //! substitute a different sub-secret. The result is a fresh [`crate::gdkg::GroupKey`]
 //! under the same `Y`, holding new shares over the new leaves.
 //!
-//! # ⚠ Review boundary — UNREVIEWED functional prototype, and NOT revocation
+//! # Security status
 //!
 //! Beyond the [`crate::gaccess`]/[`crate::gdkg`] boundaries: resharing is **not
-//! a revocation mechanism** (§28). An old qualified coalition that kept its old
+//! a revocation mechanism**. An old qualified coalition that kept its old
 //! shares can still sign under the unchanged `Y`, and an ordinary Schnorr
 //! verifier cannot tell which sharing produced a signature — the
 //! `an_old_coalition_can_still_sign_after_resharing` test states this in code.
-//! A governance change that must *remove* an old capability uses D3 rotation, not
+//! A governance change that must *remove* an old capability uses key rotation, not
 //! this. Same-key resharing is legitimate only under an explicit proactive model
 //! (secure erasure of old shares, bounded mobile corruption, authenticated
 //! handoff) or a monotone change where every old qualified coalition stays
-//! authorized — a classification the doc assigns to Phase C and this prototype
-//! does not enforce. The epoch/erasure protocol (CHURP-style) is the reviewed
-//! deliverable; this is the share-transfer algebra. Wired into nothing.
+//! authorized — a classification this prototype does not enforce. A production
+//! protocol also needs an epoch and secure-erasure model (for example,
+//! CHURP-style); this module implements only the share-transfer algebra and is
+//! not wired into the workspace authority path.
 
 use std::collections::{BTreeMap, BTreeSet};
 

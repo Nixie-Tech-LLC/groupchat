@@ -1,6 +1,6 @@
-//! C2 — principal-to-leaf expansion (§18).
+//! Principal-to-leaf expansion.
 //!
-//! C1 gives a canonical policy over **principals** (ownership identities). Before
+//! [`crate::policy`] gives a canonical policy over **principals** (ownership identities). Before
 //! it can become a cryptographic access structure, each principal must expand to
 //! the **leaves** that actually hold shares:
 //!
@@ -8,7 +8,7 @@
 //! - a **Federated** principal expands into a whole sub-policy — a founder that
 //!   is itself a group — which inlines into the global tree rather than becoming
 //!   an opaque nested key. (Treating a founder's internal group as an opaque
-//!   leaf would need nested signing orchestration, a separate backend; §18.)
+//!   leaf would require nested signing orchestration and a separate backend.)
 //!
 //! # Immutable, configuration-bound
 //!
@@ -19,11 +19,11 @@
 //! # No silent weight; distinct occurrences get distinct leaves
 //!
 //! One principal may own several rows: if `a` occupies two *genuinely distinct*
-//! positions in the policy (C1 already rejected literal duplicates), each
+//! positions in the policy (canonicalization already rejected literal duplicates), each
 //! position expands to its own leaf with its own id. The leaf id is derived from
 //! the **occurrence path**, so two occurrences of one principal — or one device
 //! backing two leaves — never collapse. Additional weight thus requires distinct
-//! occurrences, exactly as §18 demands, and never appears by accident.
+//! occurrences and never appears by accident.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +38,7 @@ const LEAF_DOMAIN: &[u8] = b"lait/space/1/policy/1/leaf";
 /// without limit. A consensus input like the policy limits.
 pub const MAX_FEDERATION_DEPTH: usize = 16;
 
-/// Bound on the **expanded** leaf count. C1's `MAX_LEAVES` bounds the
+/// Bound on the **expanded** leaf count. [`crate::policy::MAX_LEAVES`] bounds the
 /// *unexpanded* policy, but every federated principal can expand into another
 /// full policy, so a 256-principal root could otherwise reach tens of thousands
 /// of leaves — a compile/solve exhaustion path. This bounds the artifact
@@ -67,7 +67,7 @@ pub struct PrincipalDescriptor {
     pub custody: PrincipalCustody,
 }
 
-/// A single cryptographic row's stable provenance (§18): the leaf, the principal
+/// A single cryptographic row's stable provenance: the leaf, the principal
 /// that owns it, the device that operates it, and the occurrence path that makes
 /// it distinct from every other leaf.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn distinct_occurrences_of_one_principal_get_distinct_leaves() {
-        // `a` appears in two genuinely distinct positions (C1 allows this).
+        // `a` appears in two genuinely distinct positions; canonicalization permits this.
         let policy = OwnershipPolicy::Threshold {
             k: 2,
             members: vec![key(1), OwnershipPolicy::AnyOf(vec![key(1), key(2)])],
@@ -412,9 +412,9 @@ mod tests {
         ));
     }
 
-    /// Finding 2: C1 bounds the unexpanded policy, but federation can multiply
+    /// Federation can multiply the unexpanded policy beyond its leaf bound:
     /// leaves — three federated principals, each a 200-key group, blow past
-    /// MAX_EXPANDED_LEAVES even though each sub-policy is within C1's limit. The
+    /// MAX_EXPANDED_LEAVES even though each sub-policy is individually valid. The
     /// incremental check fires instead of building the whole structure.
     #[test]
     fn federation_that_exceeds_the_expanded_leaf_limit_is_rejected() {
