@@ -76,7 +76,7 @@ impl Fe {
     /// canonical field element. Fallible on purpose — a deserialized matrix is
     /// untrusted, so nothing calls this without validation having first proven
     /// canonicality.
-    fn to_scalar(self) -> Option<Scalar> {
+    pub fn as_scalar(&self) -> Option<Scalar> {
         Scalar::from_canonical_bytes(self.0).into_option()
     }
 }
@@ -195,7 +195,7 @@ impl CompiledPolicy {
             .iter()
             .flatten()
             .chain(self.target.iter())
-            .all(|f| f.to_scalar().is_some());
+            .all(|f| f.as_scalar().is_some());
         if !canonical {
             return Err(ValidationError::NoncanonicalScalar);
         }
@@ -224,6 +224,10 @@ impl StructurallyValidatedCompiledPolicy {
     pub fn leaves(&self) -> &[LeafId] {
         &self.0.leaves
     }
+    /// The matrix column count (access-structure dimension).
+    pub fn cols(&self) -> usize {
+        self.0.matrix.cols
+    }
 
     /// The content-address, over the whole committed structure (§19).
     pub fn commitment(&self) -> AccessStructureCommitment {
@@ -244,7 +248,7 @@ impl StructurallyValidatedCompiledPolicy {
                 self.0.matrix.rows[i]
                     .iter()
                     // Validation proved canonicality.
-                    .map(|f| f.to_scalar().expect("validated scalar"))
+                    .map(|f| f.as_scalar().expect("validated scalar"))
                     .collect()
             })
             .collect()
@@ -254,7 +258,7 @@ impl StructurallyValidatedCompiledPolicy {
         self.0
             .target
             .iter()
-            .map(|f| f.to_scalar().expect("validated scalar"))
+            .map(|f| f.as_scalar().expect("validated scalar"))
             .collect()
     }
 
@@ -305,14 +309,14 @@ impl StructurallyValidatedCompiledPolicy {
                 return false;
             }
             prev = Some(i);
-            let Some(c) = coeff.to_scalar() else {
+            let Some(c) = coeff.as_scalar() else {
                 return false;
             };
             if c == Scalar::ZERO {
                 return false;
             }
             for (a, cell) in acc.iter_mut().zip(&self.0.matrix.rows[i]) {
-                *a += c * cell.to_scalar().expect("validated scalar");
+                *a += c * cell.as_scalar().expect("validated scalar");
             }
         }
         acc == self.target_scalars()
