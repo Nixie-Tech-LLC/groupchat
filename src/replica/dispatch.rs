@@ -208,7 +208,9 @@ impl Replica {
             Request::MemberRemove { who } => {
                 return Self::respond(self.member_remove_cmd(who), Self::member_removed_response)
             }
-            Request::AgentAdd { key } => Ok(self.agent_add_cmd(key)),
+            Request::AgentAdd { key } => {
+                return Self::respond(self.agent_add_cmd(key), Self::agent_sponsored_response)
+            }
             Request::KeyRotate => {
                 return Self::respond(self.key_rotate_cmd(), Self::key_rotated_response)
             }
@@ -218,11 +220,24 @@ impl Replica {
                     Self::invite_revoked_response,
                 )
             }
-            Request::DeviceInvite => Ok(self.device_invite_cmd()),
-            Request::DeviceAdd { consent } => Ok(self.device_add_cmd(consent)),
-            Request::DeviceRevoke { device } => Ok(self.device_revoke_cmd(device)),
-            Request::DeviceList => Ok((self.device_list_response(), None)),
-            Request::Recover => Ok(self.recover()),
+            Request::DeviceInvite => {
+                return Self::respond_read(self.device_invite_cmd(), |invite| Response::Text {
+                    text: format!("{} {}", invite.actor, invite.space),
+                })
+            }
+            Request::DeviceAdd { consent } => {
+                return Self::respond(self.device_add_cmd(consent), Self::device_added_response)
+            }
+            Request::DeviceRevoke { device } => {
+                return Self::respond(
+                    self.device_revoke_cmd(device),
+                    Self::device_revoked_response,
+                )
+            }
+            Request::DeviceList => Ok((Self::device_list_response(self.device_list()), None)),
+            Request::Recover => {
+                return Self::respond(self.recover(), Self::actor_recovered_response)
+            }
             Request::SpaceRecover => Ok(self.space_recover_cmd()),
             Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
             Request::SpaceElevateApprove { session, proposal } => {
@@ -302,6 +317,68 @@ impl Replica {
         let verb = if d.restored { "restored" } else { "deleted" };
         Response::Ok {
             message: Some(format!("{verb} {}", d.reff)),
+        }
+    }
+
+    fn agent_sponsored_response(a: AgentSponsored) -> Response {
+        Response::Ok {
+            message: Some(format!("sponsored agent {}", a.0.short())),
+        }
+    }
+
+    fn device_added_response(d: DeviceAdded) -> Response {
+        Response::Ok {
+            message: Some(format!("added device {}", d.0.short())),
+        }
+    }
+
+    /// De-listing always applies; fencing the device from existing content needs
+    /// a rotation only an admin may mint. Say which happened rather than
+    /// claiming a rotation that would be inert.
+    fn device_revoked_response(d: DeviceRevoked) -> Response {
+        let message = if d.rotated {
+            format!("revoked device {} and rotated the key", d.device.short())
+        } else {
+            format!(
+                "revoked device {} from your identity — ask an admin to rotate the space key to fence its access to existing content",
+                d.device.short()
+            )
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    fn actor_recovered_response(r: ActorRecovered) -> Response {
+        Response::Ok {
+            message: Some(format!(
+                "recovered actor {} — device set reset to this device; content access re-seals once a peer syncs",
+                r.0.short()
+            )),
+        }
+    }
+
+    fn device_list_response(devices: Vec<DeviceListing>) -> Response {
+        Response::Text {
+            text: if devices.is_empty() {
+                "no devices".to_string()
+            } else {
+                devices
+                    .into_iter()
+                    .map(|d| {
+                        let me = if d.is_this_device {
+                            " (this device)"
+                        } else {
+                            ""
+                        };
+                        format!("{}{}", d.device.as_str(), me)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    )
+            },
         }
     }
 

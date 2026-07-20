@@ -87,6 +87,12 @@ pub enum NotFound {
     /// is the widest failure in this family, and every `Result` in the replica
     /// would otherwise carry its three strings by value.
     Link(Box<LinkRef>),
+    /// No actor answers to that `<who>`, on the agent-sponsorship path — which
+    /// says how to fix it in its own terms: an agent arrives by being started,
+    /// not by being invited.
+    AgentActor {
+        named: String,
+    },
     /// No actor answers to that `<who>`. `invite_hint` asks for the tail that
     /// says how to fix it, which the add path wants and the remove path does
     /// not — removing someone who was never here needs no invitation.
@@ -175,6 +181,14 @@ pub enum Invalid {
     ActorInception { in_join_request: bool },
     /// Neither a ticket nor a bare nonce.
     InviteRef,
+    /// An agent inception that does not cleanly incept for this space.
+    AgentInception,
+    /// The consent blob did not decode at all.
+    DeviceConsentBlob,
+    /// The consent blob decoded but does not bind this device to this actor.
+    DeviceConsentMismatch,
+    /// Not a 64-hex ed25519 device key.
+    DeviceKey,
 }
 
 /// The fields that must carry text. A closed set rather than a string: these
@@ -212,6 +226,26 @@ pub enum Conflict {
     ActorUnknown {
         short: String,
     },
+    /// An agent whose identity has not reached this replica yet.
+    AgentUnknown {
+        short: String,
+    },
+    /// Already holds standing here, so there is nothing to sponsor.
+    AlreadyPrincipal {
+        short: String,
+    },
+    /// The named device is not one of this actor's.
+    NotYourDevice,
+    /// Revoking the last device would strand the actor; recovery is the verb
+    /// for that, and it re-roots the device set rather than emptying it.
+    OnlyDevice,
+    /// No offline recovery key is present beside the store.
+    RecoveryKeyMissing,
+    /// The recovery key matches no actor's standing commitment here.
+    RecoveryKeyUnmatched,
+    /// The key resolved to an actor, but the replay does not agree the recovery
+    /// took — the commitment does not match.
+    RecoveryCommitmentMismatch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,6 +313,10 @@ impl fmt::Display for NotFound {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
             Self::Member { named } => write!(f, "no known member matches '{named}'"),
+            Self::AgentActor { named } => write!(
+                f,
+                "no known actor for '{named}' — start the agent so it joins the space, then sponsor it"
+            ),
             Self::Actor { named, invite_hint } => {
                 write!(f, "no known actor matches '{named}'")?;
                 if *invite_hint {
@@ -370,6 +408,12 @@ impl fmt::Display for Invalid {
             Self::InviteRef => {
                 f.write_str("not a valid invite — pass the ticket or its 32-hex nonce")
             }
+            Self::AgentInception => f.write_str("invalid agent inception"),
+            Self::DeviceConsentBlob => f.write_str("could not decode device consent blob"),
+            Self::DeviceConsentMismatch => {
+                f.write_str("device consent is not valid for this actor")
+            }
+            Self::DeviceKey => f.write_str("a device is a 64-hex ed25519 key"),
             Self::ProjectKey { value } => write!(
                 f,
                 "bad project key '{value}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
@@ -401,6 +445,26 @@ impl fmt::Display for Conflict {
                 f,
                 "unknown actor {short} — invite them so their identity arrives first"
             ),
+            Self::AgentUnknown { short } => write!(
+                f,
+                "unknown agent {short} — start it so its identity joins first"
+            ),
+            Self::AlreadyPrincipal { short } => {
+                write!(f, "{short} is already a space principal")
+            }
+            Self::NotYourDevice => f.write_str("not a device of your actor"),
+            Self::OnlyDevice => {
+                f.write_str("cannot revoke your only device — use `recover` instead")
+            }
+            Self::RecoveryKeyMissing => f.write_str(
+                "no recovery.key found beside the store — restore your offline recovery key first",
+            ),
+            Self::RecoveryKeyUnmatched => {
+                f.write_str("no actor in this space matches this recovery key")
+            }
+            Self::RecoveryCommitmentMismatch => {
+                f.write_str("recovery key does not match this actor's commitment")
+            }
         }
     }
 }

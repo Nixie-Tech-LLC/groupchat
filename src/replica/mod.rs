@@ -46,6 +46,7 @@ mod sync;
 mod tests;
 
 pub use change::{Change, ChangeResult, ReplicaResult};
+pub use devices::{ActorRecovered, AgentSponsored, DeviceAdded, DeviceRevoked};
 pub use error::{
     AdminAction, Ceremony, Conflict, Denied, EmptyField, GraphViolation, Invalid, LinkRef,
     NotFound, ProjectChoice, RefError, ReplicaError,
@@ -59,6 +60,7 @@ pub use recovery::{
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;
 
+use devices::DeviceListing;
 use mutate::{Deletion, ResolvedRef, WorkAction};
 use recovery::{persist_recovery_key, persist_space_recovery};
 

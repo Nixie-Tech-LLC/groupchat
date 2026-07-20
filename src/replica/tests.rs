@@ -653,12 +653,11 @@ fn recover_resets_device_set_with_the_offline_key() {
         &actor::ConsentCtx::Member { actor: &x },
     );
     let hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
-    a.replica.device_add_cmd(hex);
+    ok(a.replica.device_add_cmd(hex));
     assert!(a.replica.actor_plane().is_device_of(&x, &db));
 
     // Recover with the offline key: device set resets to just this device.
-    let (resp, _) = a.replica.recover();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.recover());
     let devices = a.replica.actor_plane().devices_of(&x);
     assert_eq!(devices, vec![da], "recovery reset the set to this device");
     assert!(a.replica.actor_plane().state(&x).unwrap().recovered);
@@ -708,8 +707,7 @@ fn fresh_device_recovers_and_decrypts_after_peer_reseal() {
     // Restore the offline recovery key beside dC's store and recover.
     let key = std::fs::read(a.home.join("recovery.key")).unwrap();
     std::fs::write(c.home.join("recovery.key"), key).unwrap();
-    let (resp, _) = c.replica.recover();
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(c.replica.recover());
     assert_eq!(
         c.replica.actor_plane().devices_of(&x),
         vec![c_device.clone()],
@@ -757,8 +755,7 @@ fn second_device_decrypts_then_revocation_fences_it() {
     let consent_hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
 
     // A adds dB.
-    let (resp, _) = a.replica.device_add_cmd(consent_hex);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.device_add_cmd(consent_hex));
     assert!(
         a.replica.actor_plane().is_device_of(&x, &db_device),
         "dB is now a device of X"
@@ -784,8 +781,7 @@ fn second_device_decrypts_then_revocation_fences_it() {
     );
 
     // A revokes dB and rotates; dB loses future content.
-    let (resp, _) = a.replica.device_revoke_cmd(db_device.as_str().to_string());
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica.device_revoke_cmd(db_device.as_str().to_string()));
     assert!(
         !a.replica.actor_plane().is_device_of(&x, &db_device),
         "dB revoked from X"
@@ -1214,21 +1210,15 @@ fn a_non_admin_device_revoke_is_honest_about_pending_rotation() {
         &actor::ConsentCtx::Member { actor: &b_actor },
     );
     let hex = data_encoding::HEXLOWER.encode(&postcard::to_stdvec(&binding).unwrap());
-    let (resp, _) = b.replica.device_add_cmd(hex);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.device_add_cmd(hex));
 
     let gen_before = b.replica.active_epoch().map(|e| e.gen);
     // B (non-admin) revokes its second device.
-    let (resp, _) = b.replica.device_revoke_cmd(b2_device.as_str().to_string());
-    match resp {
-        Response::Ok { message: Some(m) } => {
-            assert!(
-                m.contains("admin"),
-                "expected a pending-rotation notice: {m}"
-            )
-        }
-        other => panic!("expected Ok with a pending-rotation notice, got {other:?}"),
-    }
+    let (revoked, _) = ok(b.replica.device_revoke_cmd(b2_device.as_str().to_string()));
+    assert!(
+        !revoked.rotated,
+        "a non-admin de-lists but cannot mint the rotation that fences the device"
+    );
     // The device is de-listed, but a non-admin's mint is inert: no rotation.
     assert!(
         !b.replica.actor_plane().is_device_of(&b_actor, &b2_device),
@@ -4064,8 +4054,7 @@ fn signed_delete_syncs_agents_cannot_delete_and_restore_wins() {
     // B sponsors an agent (the agent self-incepted its degenerate actor).
     let agent_incept = incept_for([99u8; 32], &b.replica);
     let agent_actor = actor_of(&agent_incept);
-    let (resp, _) = b.replica.agent_add(&agent_incept);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica.agent_add(&agent_incept));
     assert!(b.replica.acl_state().is_agent(&agent_actor));
     assert_eq!(
         b.replica.acl_state().sponsor_of(&agent_actor),
@@ -4853,4 +4842,88 @@ fn admitting_someone_already_seated_says_so_and_commits_nothing() {
         "the second is a no-op: {again:?}"
     );
     assert!(dirty.is_none(), "re-admitting rings nothing");
+}
+
+// ---- the device and agent sentences, pinned at the adapter ----
+
+#[test]
+fn device_refusals_read_exactly_as_before() {
+    let mut n = new_node();
+    let cases: Vec<(Request, &str, crate::control::ErrorKind)> = vec![
+        (
+            Request::DeviceRevoke {
+                device: "not-a-key".into(),
+            },
+            "a device is a 64-hex ed25519 key",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::DeviceRevoke {
+                device: "aa".repeat(32),
+            },
+            "not a device of your actor",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::DeviceAdd {
+                consent: "zzzz".into(),
+            },
+            "could not decode device consent blob",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::AgentAdd {
+                key: "nobody".into(),
+            },
+            "no known actor for 'nobody' — start the agent so it joins the space, then sponsor it",
+            crate::control::ErrorKind::NotFound,
+        ),
+    ];
+    for (req, expected, expected_kind) in cases {
+        let (resp, dirty) = n.replica.handle(req);
+        let (msg, kind) = refusal(resp);
+        assert_eq!(msg, expected);
+        assert_eq!(kind, expected_kind, "{expected}");
+        assert!(dirty.is_none(), "a refused device op rings nothing");
+    }
+}
+
+#[test]
+fn revoking_your_only_device_points_at_recovery() {
+    // The founder holds exactly one device, so this is the guard, not a typo.
+    let mut n = new_node();
+    let only = n.replica.me.as_str().to_string();
+    let (resp, dirty) = n.replica.handle(Request::DeviceRevoke { device: only });
+    let (msg, _) = refusal(resp);
+    assert_eq!(
+        msg,
+        "cannot revoke your only device — use `recover` instead"
+    );
+    assert!(dirty.is_none());
+}
+
+#[test]
+fn the_device_projections_render_as_text() {
+    let mut n = new_node();
+
+    let (resp, dirty) = n.replica.handle(Request::DeviceList);
+    let text = match resp {
+        Response::Text { text } => text,
+        other => panic!("expected the device listing, got {other:?}"),
+    };
+    assert!(
+        text.ends_with(" (this device)") && text.starts_with(n.replica.me.as_str()),
+        "the caller's own device is marked: {text}"
+    );
+    assert!(dirty.is_none(), "a listing commits nothing");
+
+    // The enrollment token is `<actor> <space>`, which the other machine parses.
+    let (resp, _) = n.replica.handle(Request::DeviceInvite);
+    let text = match resp {
+        Response::Text { text } => text,
+        other => panic!("expected the enrollment token, got {other:?}"),
+    };
+    let (actor, space) = text.split_once(' ').expect("two fields");
+    assert_eq!(actor, n.replica.my_actor().unwrap().as_str());
+    assert_eq!(space, n.replica.space_str());
 }
