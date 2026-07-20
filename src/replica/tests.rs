@@ -169,6 +169,61 @@ fn new_issue(t: &mut Replica, title: &str) -> String {
     }
 }
 
+#[test]
+fn issue_view_preserves_ambiguous_and_near_miss_candidates() {
+    let mut node = new_node();
+    with_project(&mut node.replica);
+    new_issue(&mut node.replica, "first candidate");
+    new_issue(&mut node.replica, "second candidate");
+
+    // A deliberately short DocId prefix matches both issues. This exercises
+    // RefResolution::Many -> RefError::Candidates -> Response::Candidates at
+    // the dispatch boundary, including the "ambiguous" marker.
+    let (ambiguous, dirty) = node.replica.handle(Request::IssueView {
+        reff: "iss_".into(),
+    });
+    assert!(dirty.is_none(), "a failed read must not ring a doorbell");
+    match ambiguous {
+        Response::Candidates {
+            candidates,
+            near_miss_for,
+        } => {
+            assert_eq!(near_miss_for, None, "an ambiguous ref is not a typo");
+            assert_eq!(candidates.len(), 2, "both matching issues must be offered");
+            let aliases: Vec<_> = candidates
+                .iter()
+                .filter_map(|candidate| candidate.key_alias.as_deref())
+                .collect();
+            assert!(aliases.contains(&"ENG-1"), "missing ENG-1: {candidates:?}");
+            assert!(aliases.contains(&"ENG-2"), "missing ENG-2: {candidates:?}");
+        }
+        other => panic!("ambiguous issue ref must yield Candidates, got {other:?}"),
+    }
+
+    // ENG-3 matches nothing but is one edit from the two real aliases. This
+    // takes the distinct Zero + near-misses path and must retain the original
+    // typo so the CLI renders its "did you mean" form.
+    let (near_miss, dirty) = node.replica.handle(Request::IssueView {
+        reff: "ENG-3".into(),
+    });
+    assert!(dirty.is_none(), "a failed read must not ring a doorbell");
+    match near_miss {
+        Response::Candidates {
+            candidates,
+            near_miss_for,
+        } => {
+            assert_eq!(near_miss_for.as_deref(), Some("ENG-3"));
+            let aliases: Vec<_> = candidates
+                .iter()
+                .filter_map(|candidate| candidate.key_alias.as_deref())
+                .collect();
+            assert!(aliases.contains(&"ENG-1"), "missing ENG-1: {candidates:?}");
+            assert!(aliases.contains(&"ENG-2"), "missing ENG-2: {candidates:?}");
+        }
+        other => panic!("near-miss issue ref must yield Candidates, got {other:?}"),
+    }
+}
+
 /// Perf harness (run: `GC_PERF_N=5000 cargo test --release -p lait --lib
 /// perf_seed_and_cold_load -- --ignored --nocapture`). Proves/refutes the
 /// scaling claims: cold-load is O(issues) (loads every doc), board/list reads
