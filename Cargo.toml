@@ -225,6 +225,16 @@ tar = "0.4"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
 # The profile that 'dist' will build with
+# Tests build with the `test` profile, which inherits `dev` — i.e. unoptimized.
+# That is fine for our own code (fast rebuilds, real debug info) but brutal for
+# the crypto: curve25519-dalek/frost-ed25519 run 10–50x slower unoptimized, and
+# the ceremony tests drive real DKG + threshold-signing rounds. Optimizing only
+# *dependencies* keeps workspace compile times and debuggability intact while
+# making those tests finish in seconds instead of minutes — the difference
+# between fitting nextest's terminate-after budget and being killed by it.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.dist]
 inherits = "release"
 lto = "thin"
