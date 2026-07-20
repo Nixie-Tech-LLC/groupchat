@@ -2,8 +2,8 @@
 # integration suite, which `cargo test` ran serially. This config keeps that fast
 # path both quick and reliable.
 
-# Bound how many network-heavy tests run at once. Each integration test spawns
-# real daemons doing P2P over iroh (endpoint + relay); nextest otherwise scales
+# Bound how many network-heavy tests run at once. The selected integration
+# binaries spawn daemons or put real P2P traffic over iroh; nextest otherwise scales
 # concurrency to num-cpus, so on a high-core SELF-HOSTED runner it would fire many
 # at once — dozens of daemons hammering the relay — trading speed for flakiness.
 # Capping at a fixed, core-independent number keeps contention sane. The suite's
@@ -43,9 +43,9 @@ slow-timeout = { period = "30s", terminate-after = 3 }
 # integration binary added, so the cost of naming these explicitly — a new
 # network suite must be added here — is the point rather than the drawback.
 #
-# `retries` rides with the group: these are the tests whose nondeterminism is
-# real and tolerated (a relay or discovery hiccup), so they are the only ones
-# that earn a second attempt.
+# `retries` rides with the group at binary granularity. These binaries contain
+# the relay/discovery paths whose nondeterminism is tolerated, so they earn a
+# second attempt; deterministic tests colocated in the same binaries inherit it.
 [[profile.default.overrides]]
 filter = '''
     binary(two_node_sync)
