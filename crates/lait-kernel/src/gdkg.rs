@@ -173,6 +173,40 @@ impl GroupKey {
             .get(leaf)
             .map(|p| p.compress().to_bytes())
     }
+
+    /// Assemble a group key from parts a *different* protocol has already
+    /// verified — same-key resharing (D4) and refresh/repair (D5) each establish
+    /// share/commitment consistency their own way, then hand the result here.
+    /// The DKG path is [`aggregate`], not this. Rejects any non-canonical point
+    /// encoding, and (as a last-line invariant) any share whose commitment is not
+    /// `s·G`.
+    pub fn from_verified_parts(
+        public: [u8; 32],
+        shares: BTreeMap<LeafId, Scalar>,
+        leaf_commitments: BTreeMap<LeafId, [u8; 32]>,
+    ) -> Option<Self> {
+        let public = decompress(&public)?;
+        let mut points = BTreeMap::new();
+        for (leaf, s) in &shares {
+            let commit = decompress(leaf_commitments.get(leaf)?)?;
+            if G * s != commit {
+                return None;
+            }
+            points.insert(leaf.clone(), commit);
+        }
+        if points.len() != leaf_commitments.len() {
+            return None;
+        }
+        Some(GroupKey {
+            public,
+            shares,
+            leaf_commitments: points,
+        })
+    }
+}
+
+fn decompress(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
+    curve25519_dalek::edwards::CompressedEdwardsY(*bytes).decompress()
 }
 
 impl KeyShares for GroupKey {
