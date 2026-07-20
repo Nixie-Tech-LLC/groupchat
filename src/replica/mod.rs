@@ -57,7 +57,7 @@ pub use recovery::{
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;
-use mutate::WorkAction;
+use mutate::{Deletion, ResolvedRef, WorkAction};
 use recovery::{persist_recovery_key, persist_space_recovery};
 
 /// The batched, project-keyed dirty set produced by a mutation. The

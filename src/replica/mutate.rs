@@ -1,10 +1,16 @@
 //! Mutations (writes).
 //!
-//! **Validate then commit.** Every mutating request fully
-//! resolves refs and validates *before* any Loro commit; on failure it returns
-//! `Response::Error` having touched nothing and produced **no** dirty-set (so no
-//! doorbell rings), which is what makes an optimistic client's rollback
-//! race-free. There is no compare-and-swap token: failures occur before commit.
+//! **Validate then commit.** Every mutating request resolves refs and validates
+//! *before* any Loro commit, and returns [`Err`] having touched nothing — no
+//! dirty set, so no doorbell rings, which is what makes an optimistic client's
+//! rollback race-free. There is no compare-and-swap token: failures occur
+//! before commit.
+//!
+//! [`ChangeResult`] makes half of that structural — an error cannot carry a
+//! dirty set. The other half, that nothing durable precedes an error, is the
+//! author's to preserve: put every fallible step before the first write. Where
+//! a commit must come first, report [`Change::committed`] rather than an error,
+//! or a landed change reaches no subscriber.
 //!
 //! **Writer-direction projection.** Every mutation ends by recomputing the issue's
 //! `DocMeta` row from the issue doc via [`CatalogDoc::upsert_row`] — the issue
@@ -20,6 +26,19 @@ pub(super) enum WorkAction {
     Stop,
 }
 
+/// The canonical handle a write echoes back, so the caller can name what it
+/// just changed. Ten of the mutations answer with exactly this.
+#[derive(Debug)]
+pub(super) struct ResolvedRef(pub String);
+
+/// A tombstone toggle's result. The direction is a flag rather than a verb:
+/// which word says it belongs to whoever renders the sentence.
+#[derive(Debug)]
+pub(super) struct Deletion {
+    pub reff: String,
+    pub restored: bool,
+}
+
 impl Replica {
     // ---- mutations ----
 
@@ -33,19 +52,20 @@ impl Replica {
         priority: Option<String>,
         labels: Vec<String>,
         body: Option<String>,
-    ) -> Result<(Response, Option<DirtySet>)> {
+    ) -> ChangeResult<ResolvedRef> {
         // ---- validate (no commits yet) ----
         if title.trim().is_empty() {
-            return Ok((Response::err("title must not be empty"), None));
+            return Err(ReplicaError::Invalid(Invalid::Empty(EmptyField::Title)));
         }
-        let project = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
-            Ok(pr) => pr,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+        let project = self.choose_project(project.as_deref(), project_hint.as_deref())?;
         let priority = match priority {
             Some(p) => match Priority::parse(&p) {
                 Some(pr) => pr,
-                None => return Ok((Response::err(format!("bad priority '{p}'")), None)),
+                None => {
+                    return Err(ReplicaError::Invalid(Invalid::Priority {
+                        value: p.clone(),
+                    }))
+                }
             },
             None => Priority::None,
         };
@@ -55,10 +75,9 @@ impl Replica {
             match self.resolve_actor(a) {
                 Some(act) => assignee_ids.push(act),
                 None => {
-                    return Ok((
-                        Response::not_found(format!("no known member matches '{a}'")),
-                        None,
-                    ))
+                    return Err(ReplicaError::NotFound(NotFound::Member {
+                        named: a.clone(),
+                    }))
                 }
             }
         }
@@ -66,7 +85,7 @@ impl Replica {
         // whole batch is validated before anything is minted, so a bad input
         // later in the list can't leave stray labels behind.
         if let Some(l) = labels.iter().find(|l| self.invalid_label_input(l)) {
-            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
+            return Err(ReplicaError::NotFound(NotFound::Label { named: l.clone() }));
         }
         let mut label_ids = Vec::new();
         let mut created_label = false;
@@ -86,7 +105,11 @@ impl Replica {
             priority,
             created_by: match self.my_actor() {
                 Some(a) => a,
-                None => return Ok((Response::err("this device has no actor identity"), None)),
+                None => {
+                    return Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                        in_this_space: false,
+                    }))
+                }
             },
             committed_by: self.me.clone(),
             created_at: self.now_secs(),
@@ -124,7 +147,7 @@ impl Replica {
         if created_label {
             dirty = dirty.with_scope(CatalogScope::Labels);
         }
-        Ok((Response::Ref { reff }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(reff), dirty))
     }
 
     pub(super) fn issue_edit(
@@ -134,26 +157,27 @@ impl Replica {
         status: Option<String>,
         priority: Option<String>,
         description: Option<String>,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<ResolvedRef> {
+        let doc_id = self.resolve_issue(&reff)?;
         // validate status/priority before touching anything
         if let Some(s) = &status {
             if self.catalog.workflow_state(s).is_none() {
-                return Ok((Response::err(format!("no such status '{s}'")), None));
+                return Err(ReplicaError::Invalid(Invalid::Status { value: s.clone() }));
             }
         }
         let new_priority = match &priority {
             Some(p) => match Priority::parse(p) {
                 Some(pr) => Some(pr),
-                None => return Ok((Response::err(format!("bad priority '{p}'")), None)),
+                None => {
+                    return Err(ReplicaError::Invalid(Invalid::Priority {
+                        value: p.clone(),
+                    }))
+                }
             },
             None => None,
         };
         if title.is_none() && status.is_none() && priority.is_none() && description.is_none() {
-            return Ok((Response::err("nothing to edit"), None));
+            return Err(ReplicaError::Invalid(Invalid::NothingToEdit));
         }
 
         let ctx = OpCtx::content("edited", &self.me);
@@ -225,41 +249,38 @@ impl Replica {
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
             project: project_id.as_str().to_string(),
         });
-        Ok((Response::Ref { reff }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(reff), dirty))
     }
 
     /// One `start`, `done`, or `stop` work-state transition: the fields a
     /// single human intent moves — status by workflow *category* plus the
     /// viewer's assignment, in one Loro commit and one activity row.
-    /// Returns a fresh `Response::Issue` snapshot (the CLI derives the git
-    /// branch name from the title); a no-op (already there) returns the
-    /// snapshot with no commit, no activity, no doorbell.
+    /// Returns a fresh snapshot (the CLI derives the git branch name from the
+    /// title); a no-op (already there) returns the snapshot with no commit, no
+    /// activity, no doorbell.
     pub(super) fn work_state(
         &mut self,
         reff: String,
         action: WorkAction,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<IssueView> {
+        let doc_id = self.resolve_issue(&reff)?;
         let (cat, kind) = match action {
             WorkAction::Start => (StatusCategory::Active, "started"),
             WorkAction::Done => (StatusCategory::Done, "finished"),
             WorkAction::Stop => (StatusCategory::Backlog, "stopped"),
         };
         let Some(target) = self.first_state_in(cat) else {
-            return Ok((
-                Response::err(format!(
-                    "this space's workflow has no {}-category status",
-                    cat.as_str()
-                )),
-                None,
-            ));
+            return Err(ReplicaError::Conflict(Conflict::NoStatusInCategory {
+                category: cat,
+            }));
         };
         let me = match self.my_actor() {
             Some(a) => a,
-            None => return Ok((Response::err("this device has no actor identity"), None)),
+            None => {
+                return Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                    in_this_space: false,
+                }))
+            }
         };
         let ctx = OpCtx::content(kind, &self.me);
 
@@ -305,10 +326,7 @@ impl Replica {
             }
             if changes.is_empty() {
                 // Already exactly there — idempotent: no commit, no activity.
-                return Ok(match self.issue_view(reff) {
-                    Ok(view) => (Response::Issue(Box::new(view)), None),
-                    Err(e) => (Self::error_response(e), None),
-                });
+                return Ok(Change::unchanged(self.issue_view_at(&doc_id)?));
             }
             issue.apply(&ctx);
         }
@@ -325,20 +343,19 @@ impl Replica {
             }
         }
 
+        // Render before committing, so nothing fallible follows the write. The
+        // snapshot projects the already-mutated in-memory doc; of what persisting
+        // changes, it reads only the row's project and the alias table, and this
+        // verb moves neither. `work_state_snapshot_matches_a_fresh_read` is what
+        // keeps that true.
+        let view = self.issue_view_at(&doc_id)?;
         self.persist_issue_and_row(&doc_id, kind)?;
         let canonical = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &canonical, kind, changes, "");
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
             project: project_id.as_str().to_string(),
         });
-        Ok(match self.issue_view(canonical) {
-            Ok(view) => (Response::Issue(Box::new(view)), Some(dirty)),
-            // The commit already landed. Failing to render its snapshot is a
-            // reporting failure, not a rejected write, so the doorbell still
-            // rings — otherwise subscribers never learn about a change that is
-            // durably on disk.
-            Err(e) => (Self::error_response(e), Some(dirty)),
-        })
+        Ok(Change::committed(view, dirty))
     }
 
     pub(super) fn issue_move(
@@ -346,30 +363,23 @@ impl Replica {
         reff: String,
         project: Option<String>,
         pos: Option<BoardPos>,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<ResolvedRef> {
+        let doc_id = self.resolve_issue(&reff)?;
         // validate target project + anchors up front
         let new_project = match &project {
             Some(p) => match self.resolve_project(p) {
                 Some(pr) => Some(pr),
                 None => {
-                    return Ok((
-                        Response::not_found(format!("no project matches '{p}'")),
-                        None,
-                    ))
+                    return Err(ReplicaError::NotFound(NotFound::Project {
+                        named: p.clone(),
+                    }))
                 }
             },
             None => None,
         };
         let anchor = match &pos {
             Some(BoardPos::Before { reff }) | Some(BoardPos::After { reff }) => {
-                match self.resolve_issue(reff) {
-                    Ok(id) => Some(id),
-                    Err(e) => return Ok((Self::error_response(e), None)),
-                }
+                Some(self.resolve_issue(reff)?)
             }
             _ => None,
         };
@@ -434,7 +444,7 @@ impl Replica {
                 project: old_project.as_str().to_string(),
             });
         }
-        Ok((Response::Ref { reff }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(reff), dirty))
     }
 
     pub(super) fn assign(
@@ -442,20 +452,16 @@ impl Replica {
         reff: String,
         who: Vec<String>,
         add: bool,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<ResolvedRef> {
+        let doc_id = self.resolve_issue(&reff)?;
         let mut actors = Vec::new();
         for w in &who {
             match self.resolve_actor(w) {
                 Some(a) => actors.push(a),
                 None => {
-                    return Ok((
-                        Response::not_found(format!("no known member matches '{w}'")),
-                        None,
-                    ))
+                    return Err(ReplicaError::NotFound(NotFound::Member {
+                        named: w.clone(),
+                    }))
                 }
             }
         }
@@ -484,9 +490,9 @@ impl Replica {
             vec![],
             "",
         );
-        Ok((
-            Response::Ref { reff },
-            Some(DirtySet::issue(&project_id, &doc_id)),
+        Ok(Change::committed(
+            ResolvedRef(reff),
+            DirtySet::issue(&project_id, &doc_id),
         ))
     }
 
@@ -495,23 +501,20 @@ impl Replica {
         reff: String,
         add: Vec<String>,
         remove: Vec<String>,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<ResolvedRef> {
+        let doc_id = self.resolve_issue(&reff)?;
         // Adds create the label on first use (labels are vocabulary, not
         // ceremony); removals still error on unknown (removing a
         // label that never existed is a typo, not intent). Everything that can
         // fail is validated BEFORE anything is created (validate-then-commit).
         if let Some(l) = add.iter().find(|l| self.invalid_label_input(l)) {
-            return Ok((Response::not_found(format!("no label matches '{l}'")), None));
+            return Err(ReplicaError::NotFound(NotFound::Label { named: l.clone() }));
         }
         let mut remove_ids = Vec::new();
         for l in &remove {
             match self.resolve_label(l) {
                 Some(id) => remove_ids.push(id),
-                None => return Ok((Response::not_found(format!("no label matches '{l}'")), None)),
+                None => return Err(ReplicaError::NotFound(NotFound::Label { named: l.clone() })),
             }
         }
         let mut created_any = false;
@@ -542,27 +545,24 @@ impl Replica {
         if created_any {
             dirty = dirty.with_scope(CatalogScope::Labels);
         }
-        Ok((Response::Ref { reff }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(reff), dirty))
     }
 
-    pub(super) fn comment(
-        &mut self,
-        reff: String,
-        body: String,
-    ) -> Result<(Response, Option<DirtySet>)> {
+    pub(super) fn comment(&mut self, reff: String, body: String) -> ChangeResult<ResolvedRef> {
         if body.trim().is_empty() {
-            return Ok((Response::err("comment body must not be empty"), None));
+            return Err(ReplicaError::Invalid(Invalid::Empty(EmptyField::Comment)));
         }
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+        let doc_id = self.resolve_issue(&reff)?;
         let ts = self.now_secs();
         // The comment is attributed to the *actor* (the person); the device that
         // landed it rides the change's `OpCtx` as the advisory commit stamp.
         let me = match self.my_actor() {
             Some(a) => a,
-            None => return Ok((Response::err("this device has no actor identity"), None)),
+            None => {
+                return Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                    in_this_space: false,
+                }))
+            }
         };
         let ctx = OpCtx::content("commented", &self.me);
         let project_id = {
@@ -576,16 +576,16 @@ impl Replica {
         self.persist_issue_and_row(&doc_id, "commented")?;
         let reff = self.aliases.canonical_for(&doc_id);
         self.push_activity(Some(&doc_id), &reff, "commented", vec![], &body);
-        Ok((
-            Response::Ref { reff },
-            Some(DirtySet::issue(&project_id, &doc_id)),
+        Ok(Change::committed(
+            ResolvedRef(reff),
+            DirtySet::issue(&project_id, &doc_id),
         ))
     }
 
-    pub(super) fn issue_delete(&mut self, reff: String) -> Result<(Response, Option<DirtySet>)> {
+    pub(super) fn issue_delete(&mut self, reff: String) -> ChangeResult<Deletion> {
         self.set_deleted(reff, true)
     }
-    pub(super) fn issue_restore(&mut self, reff: String) -> Result<(Response, Option<DirtySet>)> {
+    pub(super) fn issue_restore(&mut self, reff: String) -> ChangeResult<Deletion> {
         self.set_deleted(reff, false)
     }
 
@@ -594,11 +594,8 @@ impl Replica {
     /// reversible, and the catalog tombstone flag becomes a *cache* of the
     /// authz-plane replay. Human members only (an agent holds the key but no
     /// content authority).
-    fn set_deleted(&mut self, reff: String, on: bool) -> Result<(Response, Option<DirtySet>)> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    fn set_deleted(&mut self, reff: String, on: bool) -> ChangeResult<Deletion> {
+        let doc_id = self.resolve_issue(&reff)?;
         let project_id = self
             .catalog
             .row(&doc_id)
@@ -611,10 +608,9 @@ impl Replica {
         let me_actor = match self.my_actor() {
             Some(a) if self.acl_state().can_write(&a) => a,
             _ => {
-                return Ok((
-                    Response::err("no content authority to delete issues (view-only or agent)"),
-                    None,
-                ))
+                return Err(ReplicaError::Denied(Denied::NotAdmin(
+                    AdminAction::DeleteIssue,
+                )))
             }
         };
         // Sign the tombstone op, embedding both the membership frontier and the
@@ -652,11 +648,12 @@ impl Replica {
         let dirty = DirtySet::issue(&project_id, &doc_id).with_scope(CatalogScope::Boards {
             project: project_id.as_str().to_string(),
         });
-        Ok((
-            Response::Ok {
-                message: Some(format!("{verb} {reff}")),
+        Ok(Change::committed(
+            Deletion {
+                reff,
+                restored: !on,
             },
-            Some(dirty),
+            dirty,
         ))
     }
 
@@ -717,27 +714,19 @@ impl Replica {
         kind: String,
         target: String,
         add: bool,
-    ) -> Result<(Response, Option<DirtySet>)> {
+    ) -> ChangeResult<ResolvedRef> {
         let kind = kind.to_ascii_lowercase();
         if !LINK_KINDS.contains(&kind.as_str()) {
-            return Ok((
-                Response::err(format!(
-                    "unknown link kind '{kind}' — one of: {}",
-                    LINK_KINDS.join(", ")
-                )),
-                None,
-            ));
+            return Err(ReplicaError::Invalid(Invalid::LinkKind {
+                value: kind.clone(),
+            }));
         }
-        let from = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
-        let to = match self.resolve_issue(&target) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+        let from = self.resolve_issue(&reff)?;
+        let to = self.resolve_issue(&target)?;
         if from == to {
-            return Ok((Response::err("an issue cannot link to itself"), None));
+            return Err(ReplicaError::Conflict(Conflict::IssueGraph(
+                GraphViolation::SelfLink,
+            )));
         }
         let (a, b) = if kind == "relates" && to < from {
             (to.clone(), from.clone())
@@ -747,10 +736,11 @@ impl Replica {
         if add {
             self.catalog.edge_add(&a, &kind, &b)?;
         } else if !self.catalog.edge_remove(&a, &kind, &b)? {
-            return Ok((
-                Response::not_found(format!("no such link: {reff} {kind} {target}")),
-                None,
-            ));
+            return Err(ReplicaError::NotFound(NotFound::Link(Box::new(LinkRef {
+                reff,
+                kind,
+                target,
+            }))));
         }
         let verb = if add { "linked" } else { "unlinked" };
         self.catalog.apply(&OpCtx::structure(verb, &self.me));
@@ -771,7 +761,7 @@ impl Replica {
                 dirty.merge(DirtySet::issue(&r.project_id, id));
             }
         }
-        Ok((Response::Ref { reff: canonical }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(canonical), dirty))
     }
 
     /// Set or clear an issue's parent in the sub-issue hierarchy. The `subs`
@@ -781,20 +771,16 @@ impl Replica {
         &mut self,
         reff: String,
         parent: Option<String>,
-    ) -> Result<(Response, Option<DirtySet>)> {
-        let child = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok((Self::error_response(e), None)),
-        };
+    ) -> ChangeResult<ResolvedRef> {
+        let child = self.resolve_issue(&reff)?;
         let parent_id = match &parent {
-            Some(p) => match self.resolve_issue(p) {
-                Ok(id) => Some(id),
-                Err(e) => return Ok((Self::error_response(e), None)),
-            },
+            Some(p) => Some(self.resolve_issue(p)?),
             None => None,
         };
         if parent_id.as_ref() == Some(&child) {
-            return Ok((Response::err("an issue cannot be its own parent"), None));
+            return Err(ReplicaError::Conflict(Conflict::IssueGraph(
+                GraphViolation::SelfParent,
+            )));
         }
         // validate-then-commit: reject a locally visible cycle before staging
         // any op (Loro's CyclicMoveError is the backstop; concurrent
@@ -802,10 +788,9 @@ impl Replica {
         let mut cur = parent_id.clone();
         while let Some(p) = cur {
             if p == child {
-                return Ok((
-                    Response::err("that would make an issue its own ancestor"),
-                    None,
-                ));
+                return Err(ReplicaError::Conflict(Conflict::IssueGraph(
+                    GraphViolation::Ancestor,
+                )));
             }
             cur = self.catalog.parent_of(&p);
         }
@@ -825,17 +810,14 @@ impl Replica {
                 dirty.merge(DirtySet::issue(&r.project_id, id));
             }
         }
-        Ok((Response::Ref { reff: canonical }, Some(dirty)))
+        Ok(Change::committed(ResolvedRef(canonical), dirty))
     }
 
     /// The issue's graph neighborhood: parent, children, links, and the
     /// transitively-open blockers. The catalog IS the graph index — this is a
     /// read over the structure doc, no issue doc is opened.
-    pub(super) fn issue_graph(&mut self, reff: String) -> Result<Response> {
-        let doc_id = match self.resolve_issue(&reff) {
-            Ok(id) => id,
-            Err(e) => return Ok(Self::error_response(e)),
-        };
+    pub(super) fn issue_graph(&mut self, reff: String) -> ReplicaResult<GraphView> {
+        let doc_id = self.resolve_issue(&reff)?;
         let canonical = self.aliases.canonical_for(&doc_id);
         let rows: HashMap<DocId, RowMeta> = self
             .catalog
@@ -897,7 +879,7 @@ impl Replica {
             }
         }
 
-        Ok(Response::Graph(Box::new(GraphView {
+        Ok(GraphView {
             schema_version: SCHEMA_VERSION,
             reff: canonical,
             doc_id,
@@ -905,33 +887,23 @@ impl Replica {
             children,
             links,
             blocked_by,
-        })))
+        })
     }
 
-    pub(super) fn project_new(
-        &mut self,
-        name: String,
-        key: String,
-    ) -> Result<(Response, Option<DirtySet>)> {
+    pub(super) fn project_new(&mut self, name: String, key: String) -> ChangeResult<ResolvedRef> {
         let key = key.trim().to_ascii_uppercase();
         if name.trim().is_empty() || key.is_empty() {
-            return Ok((Response::err("project name and key are required"), None));
+            return Err(ReplicaError::Invalid(Invalid::Empty(
+                EmptyField::ProjectNameKey,
+            )));
         }
         // 1–8 ASCII letters: anything else breaks `KEY-n` alias parsing and
         // git-branch inference (both scan for one alphabetic run).
         if key.len() > 8 || !key.chars().all(|c| c.is_ascii_alphabetic()) {
-            return Ok((
-                Response::err(format!(
-                    "bad project key '{key}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
-                )),
-                None,
-            ));
+            return Err(ReplicaError::Invalid(Invalid::ProjectKey { value: key }));
         }
         if self.catalog.project_by_key(&key).is_some() {
-            return Ok((
-                Response::err(format!("project key '{key}' already exists")),
-                None,
-            ));
+            return Err(ReplicaError::Conflict(Conflict::ProjectKeyExists { key }));
         }
         let id = ProjectId::mint(&*self.clock);
         self.catalog.add_project(&id, name.trim(), &key, "blue")?;
@@ -939,9 +911,9 @@ impl Replica {
             .apply(&OpCtx::structure("project_new", &self.me));
         self.store.save_catalog(&self.catalog)?;
         self.store.commit(&format!("new project {key}"));
-        Ok((
-            Response::Ref { reff: key },
-            Some(DirtySet::catalog(CatalogScope::Projects)),
+        Ok(Change::committed(
+            ResolvedRef(key),
+            DirtySet::catalog(CatalogScope::Projects),
         ))
     }
 
@@ -949,15 +921,12 @@ impl Replica {
         &mut self,
         name: String,
         color: Option<String>,
-    ) -> Result<(Response, Option<DirtySet>)> {
+    ) -> ChangeResult<ResolvedRef> {
         if name.trim().is_empty() {
-            return Ok((Response::err("label name is required"), None));
+            return Err(ReplicaError::Invalid(Invalid::Empty(EmptyField::LabelName)));
         }
         if self.catalog.label_by_name(name.trim()).is_some() {
-            return Ok((
-                Response::err(format!("label '{name}' already exists")),
-                None,
-            ));
+            return Err(ReplicaError::Conflict(Conflict::LabelExists { name }));
         }
         let id = LabelId::mint(&*self.clock);
         self.catalog
@@ -965,11 +934,9 @@ impl Replica {
         self.catalog.apply(&OpCtx::structure("label_new", &self.me));
         self.store.save_catalog(&self.catalog)?;
         self.store.commit(&format!("new label {}", name.trim()));
-        Ok((
-            Response::Ref {
-                reff: name.trim().to_string(),
-            },
-            Some(DirtySet::catalog(CatalogScope::Labels)),
+        Ok(Change::committed(
+            ResolvedRef(name.trim().to_string()),
+            DirtySet::catalog(CatalogScope::Labels),
         ))
     }
 

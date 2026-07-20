@@ -4543,3 +4543,208 @@ fn a_replica_error_stays_small_enough_to_return_by_value() {
         std::mem::size_of::<ReplicaError>()
     );
 }
+
+// ---- the mutation surface, after decoupling ----
+
+#[test]
+fn work_state_snapshot_matches_a_fresh_read() {
+    // `work_state` renders its snapshot *before* persisting, so that nothing
+    // fallible follows the commit and the doorbell can never be lost. That is
+    // only sound while the view does not depend on what persisting changes —
+    // the catalog row's project and the alias table. This is that guarantee:
+    // if a future edit makes the verb move projects, the hoisted view goes
+    // stale and this fails rather than silently returning the wrong snapshot.
+    let mut n = new_node();
+    with_project(&mut n.replica);
+    let reff = new_issue(&mut n.replica, "hoist me");
+
+    let (started, dirty) = n.replica.handle(Request::IssueStart { reff: reff.clone() });
+    assert!(dirty.is_some(), "a real transition rings the doorbell");
+    let hoisted = match started {
+        Response::Issue(view) => *view,
+        other => panic!("expected the issue snapshot, got {other:?}"),
+    };
+
+    let (read_back, dirty) = n.replica.handle(Request::IssueView { reff });
+    assert!(dirty.is_none());
+    let fresh = match read_back {
+        Response::Issue(view) => *view,
+        other => panic!("expected the issue snapshot, got {other:?}"),
+    };
+
+    assert_eq!(hoisted.reff, fresh.reff);
+    assert_eq!(hoisted.key_alias, fresh.key_alias);
+    assert_eq!(hoisted.project_id, fresh.project_id);
+    assert_eq!(hoisted.project_key, fresh.project_key);
+    assert_eq!(hoisted.status, fresh.status);
+    assert_eq!(hoisted.assignees, fresh.assignees);
+    assert_eq!(hoisted.title, fresh.title);
+}
+
+#[test]
+fn an_idempotent_work_state_commits_nothing() {
+    // The canonical Change::unchanged case: `start` twice. The second call must
+    // report no persistence effect at all, not an empty one — `ring_doorbell`
+    // does not check emptiness, so Some(empty) would wake every subscriber.
+    let mut n = new_node();
+    with_project(&mut n.replica);
+    let reff = new_issue(&mut n.replica, "already started");
+
+    let (_, dirty) = n.replica.handle(Request::IssueStart { reff: reff.clone() });
+    assert!(dirty.is_some(), "the first transition commits");
+    let (resp, dirty) = n.replica.handle(Request::IssueStart { reff });
+    assert!(
+        matches!(resp, Response::Issue(_)),
+        "a no-op still answers with the snapshot: {resp:?}"
+    );
+    assert!(dirty.is_none(), "a no-op rings nothing");
+}
+
+#[test]
+fn a_refused_mutation_commits_nothing_and_reads_as_before() {
+    let mut n = new_node();
+    with_project(&mut n.replica);
+    let reff = new_issue(&mut n.replica, "subject");
+
+    // One case per family the conversion introduced, asserting both the exact
+    // sentence and that no doorbell rang.
+    let cases: Vec<(Request, &str, crate::control::ErrorKind)> = vec![
+        (
+            Request::IssueNew {
+                title: "   ".into(),
+                project: Some("ENG".into()),
+                project_hint: None,
+                assignees: vec![],
+                priority: None,
+                labels: vec![],
+                body: None,
+            },
+            "title must not be empty",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::IssueEdit {
+                reff: reff.clone(),
+                title: None,
+                status: None,
+                priority: Some("blazing".into()),
+                description: None,
+            },
+            "bad priority 'blazing'",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::IssueEdit {
+                reff: reff.clone(),
+                title: None,
+                status: Some("nowhere".into()),
+                priority: None,
+                description: None,
+            },
+            "no such status 'nowhere'",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::IssueEdit {
+                reff: reff.clone(),
+                title: None,
+                status: None,
+                priority: None,
+                description: None,
+            },
+            "nothing to edit",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::IssueLink {
+                reff: reff.clone(),
+                kind: "causes".into(),
+                target: reff.clone(),
+            },
+            "unknown link kind 'causes' — one of: blocks, relates, duplicates",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::IssueParent {
+                reff: reff.clone(),
+                parent: Some(reff.clone()),
+            },
+            "an issue cannot be its own parent",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::Assign {
+                reff: reff.clone(),
+                who: vec!["nobody".into()],
+                add: true,
+            },
+            "no known member matches 'nobody'",
+            crate::control::ErrorKind::NotFound,
+        ),
+        (
+            Request::ProjectNew {
+                name: "Engineering".into(),
+                key: "ENG".into(),
+            },
+            "project key 'ENG' already exists",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::ProjectNew {
+                name: "Too Long".into(),
+                key: "TOOLONGKEY".into(),
+            },
+            "bad project key 'TOOLONGKEY' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::LabelNew {
+                name: "  ".into(),
+                color: None,
+            },
+            "label name is required",
+            crate::control::ErrorKind::Error,
+        ),
+        (
+            Request::Comment {
+                reff: reff.clone(),
+                body: "\n".into(),
+            },
+            "comment body must not be empty",
+            crate::control::ErrorKind::Error,
+        ),
+    ];
+    for (req, expected, expected_kind) in cases {
+        let (resp, dirty) = n.replica.handle(req);
+        let (msg, kind) = refusal(resp);
+        assert_eq!(msg, expected);
+        assert_eq!(kind, expected_kind, "{expected}");
+        assert!(dirty.is_none(), "a refused write rings nothing: {expected}");
+    }
+}
+
+#[test]
+fn deleting_and_restoring_pick_their_own_verb() {
+    // The domain reports the direction; the sentence is the adapter's.
+    let mut n = new_node();
+    with_project(&mut n.replica);
+    let reff = new_issue(&mut n.replica, "doomed");
+
+    let (resp, dirty) = n
+        .replica
+        .handle(Request::IssueDelete { reff: reff.clone() });
+    assert!(dirty.is_some());
+    assert!(
+        matches!(&resp, Response::Ok { message } if message.as_deref() == Some(&*format!("deleted {reff}"))),
+        "{resp:?}"
+    );
+
+    let (resp, dirty) = n
+        .replica
+        .handle(Request::IssueRestore { reff: reff.clone() });
+    assert!(dirty.is_some());
+    assert!(
+        matches!(&resp, Response::Ok { message } if message.as_deref() == Some(&*format!("restored {reff}"))),
+        "{resp:?}"
+    );
+}

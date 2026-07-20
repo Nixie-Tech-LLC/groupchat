@@ -66,37 +66,88 @@ impl Replica {
                 priority,
                 labels,
                 body,
-            } => self.issue_new(
-                title,
-                project,
-                project_hint,
-                assignees,
-                priority,
-                labels,
-                body,
-            ),
+            } => {
+                return Self::respond(
+                    self.issue_new(
+                        title,
+                        project,
+                        project_hint,
+                        assignees,
+                        priority,
+                        labels,
+                        body,
+                    ),
+                    Self::ref_response,
+                )
+            }
             Request::IssueEdit {
                 reff,
                 title,
                 status,
                 priority,
                 description,
-            } => self.issue_edit(reff, title, status, priority, description),
-            Request::IssueMove { reff, project, pos } => self.issue_move(reff, project, pos),
-            Request::Assign { reff, who, add } => self.assign(reff, who, add),
-            Request::Label { reff, add, remove } => self.label(reff, add, remove),
-            Request::Comment { reff, body } => self.comment(reff, body),
-            Request::IssueDelete { reff } => self.issue_delete(reff),
-            Request::IssueRestore { reff } => self.issue_restore(reff),
-            Request::IssueLink { reff, kind, target } => self.issue_link(reff, kind, target, true),
-            Request::IssueUnlink { reff, kind, target } => {
-                self.issue_link(reff, kind, target, false)
+            } => {
+                return Self::respond(
+                    self.issue_edit(reff, title, status, priority, description),
+                    Self::ref_response,
+                )
             }
-            Request::IssueParent { reff, parent } => self.issue_parent(reff, parent),
-            Request::IssueGraph { reff } => self.issue_graph(reff).map(|r| (r, None)),
-            Request::IssueStart { reff } => self.work_state(reff, WorkAction::Start),
-            Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
-            Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
+            Request::IssueMove { reff, project, pos } => {
+                return Self::respond(self.issue_move(reff, project, pos), Self::ref_response)
+            }
+            Request::Assign { reff, who, add } => {
+                return Self::respond(self.assign(reff, who, add), Self::ref_response)
+            }
+            Request::Label { reff, add, remove } => {
+                return Self::respond(self.label(reff, add, remove), Self::ref_response)
+            }
+            Request::Comment { reff, body } => {
+                return Self::respond(self.comment(reff, body), Self::ref_response)
+            }
+            Request::IssueDelete { reff } => {
+                return Self::respond(self.issue_delete(reff), Self::deletion_response)
+            }
+            Request::IssueRestore { reff } => {
+                return Self::respond(self.issue_restore(reff), Self::deletion_response)
+            }
+            Request::IssueLink { reff, kind, target } => {
+                return Self::respond(
+                    self.issue_link(reff, kind, target, true),
+                    Self::ref_response,
+                )
+            }
+            Request::IssueUnlink { reff, kind, target } => {
+                return Self::respond(
+                    self.issue_link(reff, kind, target, false),
+                    Self::ref_response,
+                )
+            }
+            Request::IssueParent { reff, parent } => {
+                return Self::respond(self.issue_parent(reff, parent), Self::ref_response)
+            }
+            Request::IssueGraph { reff } => {
+                return Self::respond_read(self.issue_graph(reff), |view| {
+                    Response::Graph(Box::new(view))
+                })
+            }
+            Request::IssueStart { reff } => {
+                return Self::respond(
+                    self.work_state(reff, WorkAction::Start),
+                    Self::issue_response,
+                )
+            }
+            Request::IssueDone { reff } => {
+                return Self::respond(
+                    self.work_state(reff, WorkAction::Done),
+                    Self::issue_response,
+                )
+            }
+            Request::IssueStop { reff } => {
+                return Self::respond(
+                    self.work_state(reff, WorkAction::Stop),
+                    Self::issue_response,
+                )
+            }
             Request::IssueView { reff } => {
                 return Self::respond_read(self.issue_view(reff), |view| {
                     Response::Issue(Box::new(view))
@@ -121,14 +172,18 @@ impl Replica {
                     last: page.last,
                 })
             }
-            Request::ProjectNew { name, key } => self.project_new(name, key),
+            Request::ProjectNew { name, key } => {
+                return Self::respond(self.project_new(name, key), Self::ref_response)
+            }
             Request::ProjectList => Ok((
                 Response::Projects {
                     projects: self.project_list(),
                 },
                 None,
             )),
-            Request::LabelNew { name, color } => self.label_new(name, color),
+            Request::LabelNew { name, color } => {
+                return Self::respond(self.label_new(name, color), Self::ref_response)
+            }
             Request::LabelList => Ok((
                 Response::Labels {
                     labels: self.label_list(),
@@ -191,6 +246,43 @@ impl Replica {
     // place is what lets the domain be lifted out from under the daemon later,
     // and what keeps error prose from scattering back into the modules that
     // detect failures.
+
+    /// Turn a command's result into a wire response and a doorbell.
+    ///
+    /// The `Err` arm hard-codes `None`: a refused command has nothing to
+    /// announce. [`Change`] makes that unrepresentable on the way in, and this
+    /// makes it unrepresentable on the way out.
+    pub(super) fn respond<T>(
+        result: ChangeResult<T>,
+        into_response: impl FnOnce(T) -> Response,
+    ) -> (Response, Option<DirtySet>) {
+        match result {
+            Ok(change) => {
+                let (value, dirty) = change.into_parts();
+                (into_response(value), dirty)
+            }
+            Err(e) => (Self::error_response(e), None),
+        }
+    }
+
+    /// The handle a write echoes back.
+    fn ref_response(r: ResolvedRef) -> Response {
+        Response::Ref { reff: r.0 }
+    }
+
+    /// A work-state transition answers with the issue's fresh snapshot.
+    fn issue_response(view: IssueView) -> Response {
+        Response::Issue(Box::new(view))
+    }
+
+    /// Which verb a tombstone toggle used is a rendering choice, so the domain
+    /// reports the direction and the sentence is written here.
+    fn deletion_response(d: Deletion) -> Response {
+        let verb = if d.restored { "restored" } else { "deleted" };
+        Response::Ok {
+            message: Some(format!("{verb} {}", d.reff)),
+        }
+    }
 
     /// Turn a fallible read's result into a wire response. Always `None`: a read
     /// has no persistence effect, so there is nothing for it to report.
