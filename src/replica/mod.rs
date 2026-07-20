@@ -46,7 +46,8 @@ mod sync;
 mod tests;
 
 pub use error::{
-    AdminAction, Ceremony, Conflict, Denied, GraphViolation, Invalid, NotFound, ReplicaError,
+    AdminAction, Ceremony, Conflict, Denied, GraphViolation, Invalid, NotFound, ProjectChoice,
+    RefError, ReplicaError,
 };
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
 pub use outcome::Outcome;

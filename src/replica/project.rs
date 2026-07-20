@@ -128,7 +128,7 @@ impl Replica {
     ) -> Result<Response> {
         let project_dto = match self.choose_project(project.as_deref(), project_hint.as_deref()) {
             Ok(pr) => pr,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         let pid = &project_dto.id;
         let rows_by_doc: HashMap<String, RowMeta> = self
@@ -198,7 +198,7 @@ impl Replica {
     pub(super) fn issue_view(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
@@ -295,7 +295,7 @@ impl Replica {
     pub(super) fn history(&mut self, reff: String) -> Result<Response> {
         let doc_id = match self.resolve_issue(&reff) {
             Ok(id) => id,
-            Err(resp) => return Ok(resp),
+            Err(e) => return Ok(Self::error_response(e)),
         };
         let canonical = self.aliases.canonical_for(&doc_id);
         let issue = self

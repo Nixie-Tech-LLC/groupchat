@@ -21,6 +21,16 @@ use std::fmt;
 /// A replica operation's failure.
 #[derive(Debug)]
 pub enum ReplicaError {
+    /// A reference did not resolve to exactly one issue.
+    ///
+    /// Not every member of this family is really a failure: an ambiguous ref, or
+    /// a typo with near misses, is answered with the candidate list rather than
+    /// a refusal, because the useful reply is "did you mean one of these". The
+    /// domain reports what it found and the adapter decides how to say it, which
+    /// is exactly the split this type exists to make.
+    Ref(RefError),
+    /// A request needing one project could not settle on one.
+    ProjectChoice(ProjectChoice),
     /// Nothing here answers to that name. The only family the control plane
     /// reports as `NotFound` (exit code 2), so a script can tell "absent" from
     /// "refused" without reading the message.
@@ -42,11 +52,42 @@ pub enum ReplicaError {
     Internal(anyhow::Error),
 }
 
+/// How a reference failed to name exactly one issue.
+#[derive(Debug)]
+pub enum RefError {
+    /// Nothing matched, and nothing was close enough to suggest.
+    NoMatch { reff: String },
+    /// Either the ref matched several issues, or it matched none but some
+    /// handles are near enough to be worth offering. `near_miss_for` carries the
+    /// original ref in the second case, and is absent in the first — that is the
+    /// difference between "which of these did you mean" and "did you mean one of
+    /// these", and clients render them differently.
+    Candidates {
+        candidates: Vec<crate::dto::Candidate>,
+        near_miss_for: Option<String>,
+    },
+}
+
 /// Something was named that does not exist here.
 #[derive(Debug)]
 pub enum NotFound {
     Project { named: String },
     Label { named: String },
+}
+
+/// Why no single project could be chosen for a request that needs one.
+///
+/// Each case carries the way out in its message: a request that cannot name its
+/// project is usually a configuration gap, not a mistake, and the caller can
+/// almost always fix it in one command.
+#[derive(Debug)]
+pub enum ProjectChoice {
+    /// `project.default` names a project that no longer exists.
+    StaleDefault { configured: String },
+    /// The space has no projects yet.
+    None,
+    /// Several exist and nothing selected one.
+    Ambiguous { keys: Vec<String> },
 }
 
 /// The caller lacks the standing this operation requires.
@@ -131,6 +172,8 @@ impl From<anyhow::Error> for ReplicaError {
 impl fmt::Display for ReplicaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Ref(e) => e.fmt(f),
+            Self::ProjectChoice(e) => e.fmt(f),
             Self::NotFound(e) => e.fmt(f),
             Self::Denied(e) => e.fmt(f),
             Self::Invalid(e) => e.fmt(f),
@@ -141,11 +184,41 @@ impl fmt::Display for ReplicaError {
     }
 }
 
+impl fmt::Display for RefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMatch { reff } => write!(f, "no issue matches '{reff}'"),
+            // Rendered as a candidate list, never as a sentence; this exists so
+            // the type is printable, not because anyone reads it.
+            Self::Candidates { .. } => f.write_str("that reference matches more than one issue"),
+        }
+    }
+}
+
 impl fmt::Display for NotFound {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Project { named } => write!(f, "no project matches '{named}'"),
             Self::Label { named } => write!(f, "no label matches '{named}'"),
+        }
+    }
+}
+
+impl fmt::Display for ProjectChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleDefault { configured } => write!(
+                f,
+                "project.default is '{configured}' but no such project exists — fix it: `lait config set project.default <KEY>`"
+            ),
+            Self::None => f.write_str(
+                "no projects visible yet — still syncing, or create one: `lait projects new <name> --key <KEY>`",
+            ),
+            Self::Ambiguous { keys } => write!(
+                f,
+                "more than one project ({}) — pass -p <KEY> or set a default: `lait config set project.default <KEY>`",
+                keys.join(", ")
+            ),
         }
     }
 }
