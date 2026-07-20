@@ -147,7 +147,16 @@ jobs:
           # which now resets SIGPIPE to default for clean interactive piping — and
           # under `pipefail` that races the smoke. Capturing drains stdout fully,
           # so the assertions are deterministic regardless of buffering/timing.
-          bin() { cargo run --locked --quiet -- "$@"; }
+          # Invoke the built binary directly. `cargo run` would re-enter cargo
+          # for every one of these ~15 calls — workspace discovery, lockfile
+          # check, and fingerprinting each time — for a binary the Build step
+          # already produced. This is still the real binary, which is the point
+          # of a smoke test; it just stops paying cargo's startup per command.
+          LAIT_BIN="target/debug/lait"
+          [ -x "$LAIT_BIN" ] || LAIT_BIN="target/debug/lait.exe"
+          [ -x "$LAIT_BIN" ] || { echo "::error::no built lait binary at target/debug"; exit 1; }
+          LAIT_BIN="$(cd "$(dirname "$LAIT_BIN")" && pwd)/$(basename "$LAIT_BIN")"
+          bin() { "$LAIT_BIN" "$@"; }
           has() { case "$1" in *"$2"*) : ;; *) echo "::error::expected '$2' in:"; echo "$1"; exit 1 ;; esac; }
           # id is 64 lowercase hex chars
           id_out="$(bin id)"
@@ -273,6 +282,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # This job compiles the library to run one test, so it needs the same
+      # pinned toolchain and the same cache as the check matrix. Without the
+      # cache it rebuilds the whole dependency graph from scratch and becomes
+      # the workflow's critical path — minutes of compiling to run one
+      # assertion that takes milliseconds.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: Fetch the latest release's archives
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
