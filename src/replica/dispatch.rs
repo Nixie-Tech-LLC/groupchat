@@ -98,7 +98,9 @@ impl Replica {
             Request::IssueDone { reff } => self.work_state(reff, WorkAction::Done),
             Request::IssueStop { reff } => self.work_state(reff, WorkAction::Stop),
             Request::IssueView { reff } => self.issue_view(reff).map(|r| (r, None)),
-            Request::List { project, filter } => self.list(project, filter).map(|r| (r, None)),
+            Request::List { project, filter } => {
+                return Self::respond(self.list(project, filter), |rows| Response::List { rows })
+            }
             Request::Board {
                 project,
                 project_hint,
@@ -144,6 +146,42 @@ impl Replica {
         match r {
             Ok((resp, dirty)) => (resp, dirty),
             Err(e) => (Response::err(format!("{e:#}")), None),
+        }
+    }
+
+    // ---- the control adapter ----
+    //
+    // The single door between the domain and the client protocol. Everything
+    // below this line speaks `Response`; everything the replica exposes above it
+    // speaks [`Outcome`] and [`ReplicaError`]. Keeping the conversion in one
+    // place is what lets the domain be lifted out from under the daemon later,
+    // and what keeps error prose from scattering back into the modules that
+    // detect failures.
+
+    /// Turn a domain result into a wire response and a doorbell.
+    ///
+    /// The `Err` arm hard-codes `None`: a failed operation committed nothing, so
+    /// it has nothing to announce. [`Outcome`] makes that unrepresentable on the
+    /// way in, and this makes it unrepresentable on the way out.
+    pub(super) fn respond<T>(
+        result: std::result::Result<Outcome<T>, ReplicaError>,
+        into_response: impl FnOnce(T) -> Response,
+    ) -> (Response, Option<DirtySet>) {
+        match result {
+            Ok(outcome) => {
+                let (value, dirty) = outcome.into_parts();
+                (into_response(value), dirty)
+            }
+            Err(e) => (Self::error_response(e), None),
+        }
+    }
+
+    /// Render a domain failure. `NotFound` is the only family the control plane
+    /// reports as such — scripts read the kind, people read the message.
+    pub(super) fn error_response(e: ReplicaError) -> Response {
+        match e {
+            ReplicaError::NotFound(ref inner) => Response::not_found(inner.to_string()),
+            other => Response::err(other.to_string()),
         }
     }
 
