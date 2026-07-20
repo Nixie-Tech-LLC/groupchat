@@ -2,18 +2,48 @@
 
 use super::*;
 
+/// An agent gained sponsored standing.
+#[derive(Debug)]
+pub struct AgentSponsored(pub ActorId);
+
+/// A device joined this actor's set.
+#[derive(Debug)]
+pub struct DeviceAdded(pub DeviceId);
+
+/// A device left this actor's set. De-listing is self-authored and always
+/// applies; *fencing* it from existing content needs a key rotation that only
+/// an admin may mint, so `rotated` says which of the two actually happened.
+#[derive(Debug)]
+pub struct DeviceRevoked {
+    pub device: DeviceId,
+    pub rotated: bool,
+}
+
+/// An actor's device set was reset to this device by its offline recovery key.
+#[derive(Debug)]
+pub struct ActorRecovered(pub ActorId);
+
+/// The enrollment token another machine consumes with `device accept`.
+#[derive(Debug)]
+pub(super) struct DeviceInvite {
+    pub actor: ActorId,
+    pub space: SpaceId,
+}
+
+/// One device of this actor, and whether it is the one being asked.
+#[derive(Debug)]
+pub(super) struct DeviceListing {
+    pub device: DeviceId,
+    pub is_this_device: bool,
+}
+
 impl Replica {
-    pub(super) fn agent_add_cmd(&mut self, who: String) -> (Response, Option<DirtySet>) {
+    pub(super) fn agent_add_cmd(&mut self, who: String) -> ChangeResult<AgentSponsored> {
         // `who` is the agent's device key (or actor id). The agent self-incepts
         // when it joins, so by sponsor time its actor is known (synced, or
         // imported from the join request by the node layer).
         let Some(actor) = self.resolve_actor(&who) else {
-            return (
-                Response::not_found(format!(
-                    "no known actor for '{who}' — start the agent so it joins the space, then sponsor it"
-                )),
-                None,
-            );
+            return Err(ReplicaError::NotFound(NotFound::AgentActor { named: who }));
         };
         self.agent_add_by_actor(&actor)
     }
@@ -23,17 +53,37 @@ impl Replica {
     /// no recovery) that self-incepted in its own home.
     ///
     /// [`agent_add_by_actor`]: Self::agent_add_by_actor
-    pub fn agent_add(&mut self, agent_incept: &actor::SignedEvent) -> (Response, Option<DirtySet>) {
+    pub fn agent_add(&mut self, agent_incept: &actor::SignedEvent) -> ChangeResult<AgentSponsored> {
         let agent_actor = ActorId::from_incept_hash(&agent_incept.hash());
         let mut candidate = self.membership.actor_events();
         candidate.push(agent_incept.clone());
         if !actor::replay(&self.space_id, &candidate).exists(&agent_actor) {
-            return (Response::err("invalid agent inception"), None);
+            return Err(ReplicaError::Invalid(Invalid::AgentInception));
         }
-        if let Err(e) = self.import_inception(agent_incept) {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        // Both sponsorship gates are decidable before the import, so check them
+        // here: `import_inception` persists, and a refusal after it would leave
+        // a durable change that reported failure and rang nothing.
+        self.sponsorship_gate(&agent_actor)?;
+        self.import_inception(agent_incept)?;
         self.agent_add_by_actor(&agent_actor)
+    }
+
+    /// Who may sponsor, and whether this actor still needs sponsoring. Separated
+    /// out because [`agent_add`](Self::agent_add) must decide both *before* it
+    /// imports an inception, and [`agent_add_by_actor`](Self::agent_add_by_actor)
+    /// needs them too when reached directly.
+    fn sponsorship_gate(&self, agent_actor: &ActorId) -> ReplicaResult<()> {
+        let acl = self.acl_state();
+        match self.my_actor() {
+            Some(me) if acl.is_human_member(&me) => {}
+            _ => return Err(ReplicaError::Denied(Denied::NotHuman)),
+        }
+        if acl.is_member(agent_actor) {
+            return Err(ReplicaError::Conflict(Conflict::AlreadyPrincipal {
+                short: agent_actor.short(),
+            }));
+        }
+        Ok(())
     }
 
     /// Sponsor an already-known agent actor: sign `AddAgent` and
@@ -41,49 +91,20 @@ impl Replica {
     /// no membership or content authority, and its standing dies with the
     /// sponsor. The agent's inception must already be present (it self-incepts
     /// on join). Delegation, not elevation.
-    pub fn agent_add_by_actor(&mut self, agent_actor: &ActorId) -> (Response, Option<DirtySet>) {
-        let acl = self.acl_state();
-        match self.my_actor() {
-            Some(me) if acl.is_human_member(&me) => {}
-            _ => {
-                return (
-                    Response::err("only a human member can sponsor an agent"),
-                    None,
-                )
-            }
-        }
+    pub fn agent_add_by_actor(&mut self, agent_actor: &ActorId) -> ChangeResult<AgentSponsored> {
+        self.sponsorship_gate(agent_actor)?;
         if !self.actor_plane().exists(agent_actor) {
-            return (
-                Response::err(format!(
-                    "unknown agent {} — start it so its identity joins first",
-                    agent_actor.short()
-                )),
-                None,
-            );
-        }
-        if acl.is_member(agent_actor) {
-            return (
-                Response::err(format!(
-                    "{} is already a space principal",
-                    agent_actor.short()
-                )),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::AgentUnknown {
+                short: agent_actor.short(),
+            }));
         }
         // The op is authored as the sponsor's actor (its by/asof), so the
         // AddAgent's sponsor = sponsor actor by construction.
-        let op = match self.author_acl(AclAction::AddAgent {
+        let op = self.author_acl(AclAction::AddAgent {
             actor: agent_actor.clone(),
-        }) {
-            Ok(op) => op,
-            Err(e) => return (Response::err(format!("{e:#}")), None),
-        };
+        })?;
         let target = agent_actor.clone();
-        if let Err(e) =
-            self.member_apply(op, "agent_add", |t| Self::seal_epochs_to_actor(t, &target))
-        {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        self.member_apply(op, "agent_add", |t| Self::seal_epochs_to_actor(t, &target))?;
         self.push_activity(
             None,
             &agent_actor.short(),
@@ -91,12 +112,10 @@ impl Replica {
             vec![],
             &agent_actor.short(),
         );
-        (
-            Response::Ok {
-                message: Some(format!("sponsored agent {}", agent_actor.short())),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        Ok(Change::committed(
+            AgentSponsored(agent_actor.clone()),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     // ---- multi-device (lait/actor/1 device management) ----
@@ -104,47 +123,38 @@ impl Replica {
     /// A device-enrollment token for adding another device to *this* actor:
     /// `<actor_id> <space_id>`. The new machine consumes it with
     /// `device accept`, which produces a consent blob for `device add`.
-    pub(super) fn device_invite_cmd(&self) -> (Response, Option<DirtySet>) {
+    pub(super) fn device_invite_cmd(&self) -> ReplicaResult<DeviceInvite> {
         match self.my_actor() {
-            Some(a) => (
-                Response::Text {
-                    text: format!("{} {}", a, self.space_id),
-                },
-                None,
-            ),
-            None => (
-                Response::err("this device has no actor identity in this space yet"),
-                None,
-            ),
+            Some(actor) => Ok(DeviceInvite {
+                actor,
+                space: self.space_id.clone(),
+            }),
+            None => Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                in_this_space: true,
+            })),
         }
     }
 
-    pub(super) fn device_list_response(&self) -> Response {
-        let devices: Vec<String> = self
-            .my_actor()
+    pub(super) fn device_list(&self) -> Vec<DeviceListing> {
+        self.my_actor()
             .map(|a| self.actor_plane().devices_of(&a))
             .unwrap_or_default()
             .into_iter()
-            .map(|d| {
-                let me = if d == self.me { " (this device)" } else { "" };
-                format!("{}{}", d.as_str(), me)
+            .map(|device| DeviceListing {
+                is_this_device: device == self.me,
+                device,
             })
-            .collect();
-        Response::Text {
-            text: if devices.is_empty() {
-                "no devices".to_string()
-            } else {
-                devices.join("\n")
-            },
-        }
+            .collect()
     }
 
     /// Add a device to our actor from its consent blob (hex-encoded
     /// [`actor::DeviceBinding`] from `device accept`), authored by this device,
     /// and seal every held epoch to it so it can decrypt immediately.
-    pub(super) fn device_add_cmd(&mut self, consent_hex: String) -> (Response, Option<DirtySet>) {
+    pub(super) fn device_add_cmd(&mut self, consent_hex: String) -> ChangeResult<DeviceAdded> {
         let Some(actor) = self.my_actor() else {
-            return (Response::err("this device has no actor identity"), None);
+            return Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                in_this_space: false,
+            }));
         };
         let binding: actor::DeviceBinding = match data_encoding::HEXLOWER_PERMISSIVE
             .decode(consent_hex.as_bytes())
@@ -152,17 +162,14 @@ impl Replica {
             .and_then(|b| postcard::from_bytes(&b).ok())
         {
             Some(b) => b,
-            None => return (Response::err("could not decode device consent blob"), None),
+            None => return Err(ReplicaError::Invalid(Invalid::DeviceConsentBlob)),
         };
         if !actor::consent_verify(
             self.space_id.as_str(),
             &binding,
             &actor::ConsentCtx::Member { actor: &actor },
         ) {
-            return (
-                Response::err("device consent is not valid for this actor"),
-                None,
-            );
+            return Err(ReplicaError::Invalid(Invalid::DeviceConsentMismatch));
         }
         let new_device = binding.device.clone();
         let ev = actor::sign_event(
@@ -174,7 +181,7 @@ impl Replica {
             self.membership.actor_heads(&actor),
             &self.space_id,
         );
-        let res = (|| -> Result<()> {
+        (|| -> Result<()> {
             self.membership.add_actor_event(&ev)?;
             let held: Vec<([u8; 16], SpaceKey)> =
                 self.keyring.iter().map(|(e, k)| (*e, *k)).collect();
@@ -184,16 +191,11 @@ impl Replica {
                 }
             }
             self.persist_membership("device_add")
-        })();
-        if let Err(e) = res {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        (
-            Response::Ok {
-                message: Some(format!("added device {}", new_device.short())),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        })()?;
+        Ok(Change::committed(
+            DeviceAdded(new_device),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Revoke a device from our actor. De-listing is self-authored (any member
@@ -202,22 +204,21 @@ impl Replica {
     /// immediately (re-sealing the fresh epoch to the remaining devices only); a
     /// non-admin de-lists and is told the rotation is pending an admin, rather
     /// than being handed a rotation that would be inert.
-    pub(super) fn device_revoke_cmd(&mut self, device: String) -> (Response, Option<DirtySet>) {
+    pub(super) fn device_revoke_cmd(&mut self, device: String) -> ChangeResult<DeviceRevoked> {
         let Some(actor) = self.my_actor() else {
-            return (Response::err("this device has no actor identity"), None);
+            return Err(ReplicaError::Denied(Denied::NoActorIdentity {
+                in_this_space: false,
+            }));
         };
         let Some(device) = DeviceId::parse(&device) else {
-            return (Response::err("a device is a 64-hex ed25519 key"), None);
+            return Err(ReplicaError::Invalid(Invalid::DeviceKey));
         };
         let devices = self.actor_plane().devices_of(&actor);
         if !devices.contains(&device) {
-            return (Response::err("not a device of your actor"), None);
+            return Err(ReplicaError::Conflict(Conflict::NotYourDevice));
         }
         if devices.len() <= 1 {
-            return (
-                Response::err("cannot revoke your only device — use `recover` instead"),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::OnlyDevice));
         }
         let ev = actor::sign_event(
             &self.seed,
@@ -234,31 +235,18 @@ impl Replica {
         // honestly that content re-keying is pending an admin — never claim a
         // rotation that would be inert (the device would keep reading under the
         // still-active epoch).
-        let can_rotate = self.am_i_admin();
-        let res = (|| -> Result<()> {
+        let rotated = self.am_i_admin();
+        (|| -> Result<()> {
             self.membership.add_actor_event(&ev)?;
-            if can_rotate {
+            if rotated {
                 self.rotate_key()?;
             }
             self.persist_membership("device_revoke")
-        })();
-        if let Err(e) = res {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        let message = if can_rotate {
-            format!("revoked device {} and rotated the key", device.short())
-        } else {
-            format!(
-                "revoked device {} from your identity — ask an admin to rotate the space key to fence its access to existing content",
-                device.short()
-            )
-        };
-        (
-            Response::Ok {
-                message: Some(message),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        })()?;
+        Ok(Change::committed(
+            DeviceRevoked { device, rotated },
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     fn read_recovery_key(&self) -> Option<[u8; 32]> {
@@ -276,14 +264,9 @@ impl Replica {
     /// device set to *this* device. **Lazy** (design): identity/standing is
     /// restored immediately, but this fresh device holds no space key until
     /// an admin or surviving peer re-seals it (self-heal on their next sync).
-    pub fn recover(&mut self) -> (Response, Option<DirtySet>) {
+    pub fn recover(&mut self) -> ChangeResult<ActorRecovered> {
         let Some(seed) = self.read_recovery_key() else {
-            return (
-                Response::err(
-                    "no recovery.key found beside the store — restore your offline recovery key first",
-                ),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::RecoveryKeyMissing));
         };
         // Resolve the target actor by its pre-rotation commitment — NOT by the
         // current device set (a genuine recovery runs from a fresh device that is
@@ -297,10 +280,7 @@ impl Replica {
             .find(|(_, st)| commit.is_some() && st.recovery_commit == commit)
             .map(|(id, _)| id.clone())
         else {
-            return (
-                Response::err("no actor in this space matches this recovery key"),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::RecoveryKeyUnmatched));
         };
         let binding = actor::consent_sign(
             &self.seed,
@@ -326,26 +306,15 @@ impl Replica {
             .map(|s| s.recovered)
             .unwrap_or(false);
         if !recovered {
-            return (
-                Response::err("recovery key does not match this actor's commitment"),
-                None,
-            );
+            return Err(ReplicaError::Conflict(Conflict::RecoveryCommitmentMismatch));
         }
-        let res = (|| -> Result<()> {
+        (|| -> Result<()> {
             self.membership.add_actor_event(&ev)?;
             self.persist_membership("recover")
-        })();
-        if let Err(e) = res {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "recovered actor {} — device set reset to this device; content access re-seals once a peer syncs",
-                    actor.short()
-                )),
-            },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+        })()?;
+        Ok(Change::committed(
+            ActorRecovered(actor),
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 }
