@@ -50,7 +50,7 @@
 //! Wired into nothing. Exists to validate that dealer-free generation yields
 //! shares the general-access signer accepts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as G;
 use curve25519_dalek::edwards::EdwardsPoint;
@@ -72,6 +72,9 @@ pub enum DkgError {
     ShareSetMismatch { dealer: LeafId },
     /// A dealt sub-share failed its Feldman check against the commitments.
     InconsistentShare { dealer: LeafId, leaf: LeafId },
+    /// Two contributions claim the same dealer. Contributor identity is a set;
+    /// a repeat would change the aggregate without adding a distinct dealer.
+    DuplicateDealer { dealer: LeafId },
 }
 
 /// One contributor's dealing: Feldman commitments to its `ρ^(p)`, and the
@@ -177,19 +180,22 @@ impl GroupKey {
     /// Assemble a group key from parts a *different* protocol has already
     /// verified — same-key resharing (D4) and refresh/repair (D5) each establish
     /// share/commitment consistency their own way, then hand the result here.
-    /// The DKG path is [`aggregate`], not this. Rejects any non-canonical point
-    /// encoding, and (as a last-line invariant) any share whose commitment is not
-    /// `s·G`.
+    /// The DKG path is [`aggregate`], not this. Rejects any non-canonical or
+    /// non-prime-order point encoding, a public key that is the identity (a
+    /// degenerate zero-secret key), and (as a last-line invariant) any share
+    /// whose commitment is not `s·G`.
     pub fn from_verified_parts(
         public: [u8; 32],
         shares: BTreeMap<LeafId, Scalar>,
         leaf_commitments: BTreeMap<LeafId, [u8; 32]>,
     ) -> Option<Self> {
-        let public = decompress(&public)?;
+        // The public key crosses a trust boundary: non-identity, prime-order.
+        let public = crate::gaccess::decompress_prime_order(&public)?;
         let mut points = BTreeMap::new();
         for (leaf, s) in &shares {
+            // Subgroup membership on each commitment; `G*s == commit` then pins it.
             let commit = decompress(leaf_commitments.get(leaf)?)?;
-            if G * s != commit {
+            if !commit.is_torsion_free() || G * s != commit {
                 return None;
             }
             points.insert(leaf.clone(), commit);
@@ -230,6 +236,18 @@ pub fn aggregate(
     }
     let cols = compiled.cols();
     let leaves = compiled.leaves();
+
+    // Contributor identity is a *set*, not a multiset: two contributions from one
+    // dealer (e.g. a replayed valid one) would silently change the aggregate key
+    // and every share. Reject duplicates before aggregating anything.
+    let mut seen: BTreeSet<&LeafId> = BTreeSet::new();
+    for c in contributions {
+        if !seen.insert(&c.dealer) {
+            return Err(DkgError::DuplicateDealer {
+                dealer: c.dealer.clone(),
+            });
+        }
+    }
 
     // Validate every contribution before trusting any of it.
     for c in contributions {
@@ -401,6 +419,38 @@ mod tests {
                 leaf: victim,
             })
         );
+    }
+
+    #[test]
+    fn a_replayed_contribution_is_rejected() {
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let mut contribs = run_dkg(&c, &leaves);
+        // Replay dealer 0's valid contribution as if it were a second dealer.
+        let replay = contribs[0].clone();
+        contribs.push(replay);
+        assert_eq!(
+            aggregate(&c, &contribs),
+            Err(DkgError::DuplicateDealer {
+                dealer: leaves[0].clone(),
+            })
+        );
+    }
+
+    #[test]
+    fn aggregation_is_invariant_under_contribution_order() {
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let contribs = run_dkg(&c, &leaves);
+        let forward = aggregate(&c, &contribs).expect("aggregate");
+        let mut reversed = contribs.clone();
+        reversed.reverse();
+        let backward = aggregate(&c, &reversed).expect("aggregate");
+        assert_eq!(forward, backward, "sum aggregation is order-independent");
     }
 
     #[test]

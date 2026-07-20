@@ -47,7 +47,7 @@
 //! detects only in aggregate, via the final `s·G == S_lost` check). Wired into
 //! nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as G;
 use curve25519_dalek::edwards::EdwardsPoint;
@@ -69,6 +69,8 @@ pub enum RefreshError {
     NonZeroSecret { dealer: LeafId },
     /// A dealt delta failed its Feldman check.
     InconsistentDelta { dealer: LeafId, leaf: LeafId },
+    /// Two contributions claim the same dealer — a replayed zero-sharing.
+    DuplicateDealer { dealer: LeafId },
     /// A stored point did not decode.
     BadPoint,
 }
@@ -178,6 +180,16 @@ pub fn refresh(
     old: &GroupKey,
     contributions: &[RefreshContribution],
 ) -> Result<GroupKey, RefreshError> {
+    // Contributor identity is a set: a replayed zero-sharing must not be applied
+    // twice, which would double its delta and re-randomize past the agreed epoch.
+    let mut seen: BTreeSet<&LeafId> = BTreeSet::new();
+    for c in contributions {
+        if !seen.insert(&c.dealer) {
+            return Err(RefreshError::DuplicateDealer {
+                dealer: c.dealer.clone(),
+            });
+        }
+    }
     for c in contributions {
         if c.commitments.len() != compiled.cols() {
             return Err(RefreshError::WrongDimension {
@@ -362,6 +374,27 @@ mod tests {
             &[leaves[1].clone(), leaves[2].clone()],
             b"after refresh",
         ));
+    }
+
+    #[test]
+    fn a_replayed_refresh_contribution_is_rejected() {
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old = dkg(&c, &leaves);
+        let mut contribs: Vec<_> = leaves
+            .iter()
+            .map(|l| refresh_contribution(&c, l.clone()))
+            .collect();
+        // Replaying dealer 0's zero-sharing must not double-apply its delta.
+        contribs.push(contribs[0].clone());
+        assert_eq!(
+            refresh(&c, &old, &contribs),
+            Err(RefreshError::DuplicateDealer {
+                dealer: leaves[0].clone(),
+            })
+        );
     }
 
     #[test]

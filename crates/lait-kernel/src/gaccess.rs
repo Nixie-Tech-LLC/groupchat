@@ -267,11 +267,16 @@ pub fn sign_qualified<K: KeyShares>(
 ///
 /// This is **this module's** verifier, not a standard Ed25519 verifier — see the
 /// review boundary in the module docs.
+///
+/// The public key `Y` and nonce `R` cross a trust boundary, so decompression
+/// alone is not enough: both are checked to be non-identity points of the
+/// prime-order subgroup (torsion-free), rejecting small-order and mixed-order
+/// points a hostile peer could submit.
 pub fn verify(public_key: &[u8; 32], msg: &[u8], sig: &Signature) -> bool {
-    let Some(y) = decompress(public_key) else {
+    let Some(y) = decompress_prime_order(public_key) else {
         return false;
     };
-    let Some(r) = decompress(&sig.r) else {
+    let Some(r) = decompress_prime_order(&sig.r) else {
         return false;
     };
     let Some(z) = Scalar::from_canonical_bytes(sig.z).into_option() else {
@@ -283,6 +288,15 @@ pub fn verify(public_key: &[u8; 32], msg: &[u8], sig: &Signature) -> bool {
 
 fn decompress(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
     curve25519_dalek::edwards::CompressedEdwardsY(*bytes).decompress()
+}
+
+/// Decompress a point supplied by an untrusted party, accepting only a
+/// non-identity element of the prime-order subgroup. Honest locally-generated
+/// points always pass; this rejects the identity (a degenerate key/nonce) and
+/// any point with a torsion component.
+pub(crate) fn decompress_prime_order(bytes: &[u8; 32]) -> Option<EdwardsPoint> {
+    let p = decompress(bytes)?;
+    (p.is_torsion_free() && p != EdwardsPoint::identity()).then_some(p)
 }
 
 #[cfg(test)]
@@ -429,6 +443,27 @@ mod tests {
         // Or verify against the wrong message.
         let sig2 = sign_qualified(&witness, &dealing, &nonces, &commitments, b"m").unwrap();
         assert!(!verify(&dealing.public_key(), b"different", &sig2));
+    }
+
+    #[test]
+    fn verify_rejects_degenerate_points() {
+        let (c, leaves) = compiled(OwnershipPolicy::AnyOf(vec![key(1), key(2)]));
+        let dealing = deal(&c);
+        let witness = c.reconstruct(&[leaves[0].clone()]).unwrap();
+        let (n, com) = commit();
+        let mut nonces = BTreeMap::new();
+        nonces.insert(leaves[0].clone(), n);
+        let commitments = vec![(leaves[0].clone(), com)];
+        let sig = sign_qualified(&witness, &dealing, &nonces, &commitments, b"m").unwrap();
+        assert!(verify(&dealing.public_key(), b"m", &sig));
+
+        let identity = EdwardsPoint::identity().compress().to_bytes();
+        // An identity public key (zero-secret key) is refused.
+        assert!(!verify(&identity, b"m", &sig));
+        // An identity nonce R is refused.
+        let mut bad_r = sig;
+        bad_r.r = identity;
+        assert!(!verify(&dealing.public_key(), b"m", &bad_r));
     }
 
     #[test]

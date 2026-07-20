@@ -44,7 +44,7 @@
 //! does not enforce. The epoch/erasure protocol (CHURP-style) is the reviewed
 //! deliverable; this is the share-transfer algebra. Wired into nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as G;
 use curve25519_dalek::edwards::EdwardsPoint;
@@ -53,11 +53,17 @@ use curve25519_dalek::traits::Identity;
 
 use crate::authority::LeafId;
 use crate::compile::{ReconstructionWitness, StructurallyValidatedCompiledPolicy};
+use crate::gaccess::KeyShares;
 use crate::gdkg::GroupKey;
 
 /// Errors resharing onto a new access structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReshareError {
+    /// The old witness does not verify against the standing configuration — the
+    /// contributing leaves are not a qualified coalition of it.
+    UnqualifiedOldSet,
+    /// Two contributions claim the same old dealer.
+    DuplicateDealer { dealer: LeafId },
     /// The contributions do not correspond exactly to the qualified old set.
     ContributorSetMismatch,
     /// A contribution's commitment vector is not `d₂` long.
@@ -172,20 +178,33 @@ pub fn verify_contribution(
 }
 
 /// Combine an old qualified set's resharing contributions into a new group key
-/// under the **same** public key. `old_witness` names the qualified old set and
-/// its reconstruction coefficients; `old_commitments` are those leaves' old
-/// public shares `S_i`; `old_public_key` is the key that must be preserved.
+/// under the **same** public key.
 ///
-/// Every contribution is re-verified (Feldman + `C_0 == S_i`) before use, and
-/// the recomputed `Σ λ_i S_i` must equal `old_public_key`.
+/// The old side is *authenticated*, not asserted: `old_compiled` is the standing
+/// configuration's compiled policy, `old` is its generated key, and `old_witness`
+/// must [`verify`](StructurallyValidatedCompiledPolicy::verify_witness) against
+/// `old_compiled` — so the contributing leaves are proven to form a **qualified
+/// coalition under the standing configuration**, not merely a set whose algebra
+/// happens to reconstruct the key. Each old public share `S_i` is taken from
+/// `old`, never from a caller-supplied map. Contributions must correspond exactly
+/// (one per witness leaf, no duplicates, no strangers).
+///
+/// Every contribution is re-verified (Feldman + `C_0 == S_i`) before use, and the
+/// recomputed `Σ λ_i S_i` must equal the old key.
 pub fn reshare(
     new_compiled: &StructurallyValidatedCompiledPolicy,
+    old_compiled: &StructurallyValidatedCompiledPolicy,
+    old: &GroupKey,
     old_witness: &ReconstructionWitness,
-    old_commitments: &BTreeMap<LeafId, [u8; 32]>,
-    old_public_key: &[u8; 32],
     contributions: &[ReshareContribution],
 ) -> Result<GroupKey, ReshareError> {
-    // Coefficients keyed by old leaf.
+    // The witness must prove a qualified coalition of the *standing* structure.
+    if !old_compiled.verify_witness(old_witness) {
+        return Err(ReshareError::UnqualifiedOldSet);
+    }
+
+    // Coefficients keyed by old leaf. verify_witness guarantees unique, ordered
+    // leaves and canonical nonzero coefficients.
     let mut lambda: BTreeMap<LeafId, Scalar> = BTreeMap::new();
     for (leaf, coeff) in old_witness.leaves.iter().zip(&old_witness.coefficients) {
         lambda.insert(
@@ -193,28 +212,37 @@ pub fn reshare(
             coeff.as_scalar().ok_or(ReshareError::BadPoint)?,
         );
     }
-    // Contributions must correspond exactly to the qualified set.
-    if contributions.len() != lambda.len()
-        || contributions
-            .iter()
-            .any(|c| !lambda.contains_key(&c.dealer))
-    {
+
+    // Contributions correspond exactly to the qualified set — a set, not a
+    // multiset. Reject a repeated dealer before comparing membership, so a replay
+    // cannot stand in for an absent dealer.
+    let mut by_dealer: BTreeMap<&LeafId, &ReshareContribution> = BTreeMap::new();
+    for c in contributions {
+        if by_dealer.insert(&c.dealer, c).is_some() {
+            return Err(ReshareError::DuplicateDealer {
+                dealer: c.dealer.clone(),
+            });
+        }
+    }
+    let dealer_set: BTreeSet<&LeafId> = by_dealer.keys().copied().collect();
+    let witness_set: BTreeSet<&LeafId> = lambda.keys().collect();
+    if dealer_set != witness_set {
         return Err(ReshareError::ContributorSetMismatch);
     }
 
-    // Verify each contribution against its dealer's old public share.
+    // Verify each contribution against its dealer's authenticated old share `S_i`.
     for c in contributions {
         if c.commitments.len() != new_compiled.cols() {
             return Err(ReshareError::WrongDimension {
                 dealer: c.dealer.clone(),
             });
         }
-        let s_i = old_commitments
-            .get(&c.dealer)
+        let s_i = old
+            .leaf_commitment(&c.dealer)
             .ok_or(ReshareError::WrongOldCommitment {
                 dealer: c.dealer.clone(),
             })?;
-        let expected_s = decompress(s_i).ok_or(ReshareError::BadPoint)?;
+        let expected_s = decompress(&s_i).ok_or(ReshareError::BadPoint)?;
         if c.commitments[0] != expected_s {
             return Err(ReshareError::WrongOldCommitment {
                 dealer: c.dealer.clone(),
@@ -231,11 +259,12 @@ pub fn reshare(
     }
 
     // Recompute Y = Σ λ_i S_i and demand it equals the old key.
+    let old_public_key = old.public_key();
     let mut recomputed = EdwardsPoint::identity();
     for c in contributions {
         recomputed += c.commitments[0] * lambda[&c.dealer];
     }
-    let old_y = decompress(old_public_key).ok_or(ReshareError::BadPoint)?;
+    let old_y = decompress(&old_public_key).ok_or(ReshareError::BadPoint)?;
     if recomputed != old_y {
         return Err(ReshareError::SameKeyViolated);
     }
@@ -252,7 +281,7 @@ pub fn reshare(
         leaf_commitments.insert(leaf.clone(), (G * t).compress().to_bytes());
     }
 
-    GroupKey::from_verified_parts(*old_public_key, shares, leaf_commitments)
+    GroupKey::from_verified_parts(old_public_key, shares, leaf_commitments)
         .ok_or(ReshareError::BadPoint)
 }
 
@@ -326,12 +355,6 @@ mod tests {
         let sig = sign_qualified(&witness, key_material, &nonces, &commitments, msg).expect("sign");
         verify(&key_material.public_key(), msg, &sig)
     }
-    /// Build the old commitments map for a qualified set.
-    fn old_commitments_for(old: &GroupKey, set: &[LeafId]) -> BTreeMap<LeafId, [u8; 32]> {
-        set.iter()
-            .map(|l| (l.clone(), old.leaf_commitment(l).unwrap()))
-            .collect()
-    }
     /// The old qualified set's honest contributions.
     fn honest_contributions(
         new_c: &StructurallyValidatedCompiledPolicy,
@@ -365,14 +388,7 @@ mod tests {
             let s_i = old.leaf_commitment(&c.dealer).unwrap();
             assert!(verify_contribution(&new_c, c, &s_i));
         }
-        let new_key = reshare(
-            &new_c,
-            &old_witness,
-            &old_commitments_for(&old, &old_set),
-            &old.public_key(),
-            &contribs,
-        )
-        .expect("reshare");
+        let new_key = reshare(&new_c, &old_c, &old, &old_witness, &contribs).expect("reshare");
 
         // Same public key.
         assert_eq!(new_key.public_key(), old.public_key(), "key preserved");
@@ -402,14 +418,7 @@ mod tests {
             members: vec![key(4), key(5), key(6)],
         });
         let contribs = honest_contributions(&new_c, &old, &old_set);
-        let _new_key = reshare(
-            &new_c,
-            &old_witness,
-            &old_commitments_for(&old, &old_set),
-            &old.public_key(),
-            &contribs,
-        )
-        .expect("reshare");
+        let _new_key = reshare(&new_c, &old_c, &old, &old_witness, &contribs).expect("reshare");
 
         // The old holders kept their old shares → they still sign under Y.
         assert!(sign_with(&old_c, &old, &old_set, b"still valid"));
@@ -442,13 +451,7 @@ mod tests {
         assert!(!verify_contribution(&new_c, &contribs[1], &s_i));
         // And reshare refuses the whole set.
         assert_eq!(
-            reshare(
-                &new_c,
-                &old_witness,
-                &old_commitments_for(&old, &old_set),
-                &old.public_key(),
-                &contribs,
-            ),
+            reshare(&new_c, &old_c, &old, &old_witness, &contribs),
             Err(ReshareError::WrongOldCommitment {
                 dealer: old_set[1].clone()
             })
@@ -473,13 +476,7 @@ mod tests {
         let victim = new_leaves[0].clone();
         *contribs[0].sub_shares.get_mut(&victim).unwrap() += Scalar::ONE;
         assert_eq!(
-            reshare(
-                &new_c,
-                &old_witness,
-                &old_commitments_for(&old, &old_set),
-                &old.public_key(),
-                &contribs,
-            ),
+            reshare(&new_c, &old_c, &old, &old_witness, &contribs),
             Err(ReshareError::InconsistentSubShare {
                 dealer: old_set[0].clone(),
                 leaf: victim,
@@ -503,14 +500,64 @@ mod tests {
         // Only one contribution for a two-member qualified set.
         let contribs = honest_contributions(&new_c, &old, &old_set[0..1]);
         assert_eq!(
-            reshare(
-                &new_c,
-                &old_witness,
-                &old_commitments_for(&old, &old_set),
-                &old.public_key(),
-                &contribs,
-            ),
+            reshare(&new_c, &old_c, &old, &old_witness, &contribs),
             Err(ReshareError::ContributorSetMismatch)
+        );
+    }
+
+    #[test]
+    fn a_witness_from_a_foreign_structure_is_rejected() {
+        // A witness that reconstructs *some* key but is not a qualified coalition
+        // of the standing configuration must not authorize a reshare.
+        let (old_c, old_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old = dkg(&old_c, &old_leaves);
+        let old_set = vec![old_leaves[0].clone(), old_leaves[1].clone()];
+
+        // A witness produced against a *different* structure — its commitment does
+        // not match old_c, so verify_witness rejects it.
+        let (foreign_c, foreign_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(7), key(8), key(9)],
+        });
+        let foreign_witness = foreign_c
+            .reconstruct(&[foreign_leaves[0].clone(), foreign_leaves[1].clone()])
+            .unwrap();
+
+        let (new_c, _) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(4), key(5), key(6)],
+        });
+        let contribs = honest_contributions(&new_c, &old, &old_set);
+        assert_eq!(
+            reshare(&new_c, &old_c, &old, &foreign_witness, &contribs),
+            Err(ReshareError::UnqualifiedOldSet)
+        );
+    }
+
+    #[test]
+    fn a_duplicate_old_dealer_is_rejected() {
+        let (old_c, old_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old = dkg(&old_c, &old_leaves);
+        let old_set = vec![old_leaves[0].clone(), old_leaves[1].clone()];
+        let old_witness = old_c.reconstruct(&old_set).unwrap();
+        let (new_c, _) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(4), key(5), key(6)],
+        });
+        // Two contributions from dealer 0 (a replay), and none from dealer 1.
+        let mut contribs = honest_contributions(&new_c, &old, &old_set[0..1]);
+        contribs.push(contribs[0].clone());
+        assert_eq!(
+            reshare(&new_c, &old_c, &old, &old_witness, &contribs),
+            Err(ReshareError::DuplicateDealer {
+                dealer: old_set[0].clone(),
+            })
         );
     }
 }

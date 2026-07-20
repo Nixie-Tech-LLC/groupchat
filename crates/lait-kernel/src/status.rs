@@ -9,18 +9,19 @@
 //!   are backed* at a given `(configuration, generation)` — ignoring stale acks
 //!   (an earlier generation, a different configuration), so old-share backing
 //!   never counts toward a newer arrangement.
-//! - [`status`] projects the compiled access structure against the backed set to
-//!   a [`RecoveryStatus`]: is a backed qualified set present (policy
-//!   satisfiable), is quorum lost, is the arrangement merely degraded (satisfiable
-//!   but not every configured leaf backed), and what would restore quorum.
+//! - [`status`] projects the compiled access structure against **durability**
+//!   (the ledger) and **availability** (a session-bound readiness set), keeping
+//!   the two apart: is the key recoverable in principle from the backups on
+//!   record, recoverable *right now* from reachable holders, at risk of genuine
+//!   loss, or merely degraded — and what would restore recovery.
 //! - [`frost_to_policy`] migrates an existing flat k-of-n FROST arrangement to
 //!   the equivalent [`OwnershipPolicy`], preserving exactly its qualified sets.
 //!
 //! Everything here is a **pure, deterministic projection** — no key material, no
-//! signing — so every replica computes the same status, and a liveness failure
-//! (withheld shares, an abandoned ceremony) yields an unambiguous `quorum_lost`
-//! rather than an undefined state. This is the one D6 piece that lives entirely
-//! in the kernel; wiring it to the tracker's `RecoveryStatus` surface and the
+//! signing — so every replica computes the same status. Crucially, a custody ack
+//! proves a share was *backed up*, not that its holder is reachable or willing;
+//! [`status`] therefore never derives live recoverability from the grow-only
+//! ledger alone. Wiring it to the tracker's `RecoveryStatus` surface and the
 //! ceremony board is app-layer integration, deliberately not done here.
 
 use std::collections::BTreeSet;
@@ -67,57 +68,87 @@ impl CustodyLedger {
 
 /// The readiness of a recovery arrangement — the kernel projection behind the
 /// tracker's status surface (§30).
+///
+/// **Durability** (can recovery *ever* happen from the backups on record?) and
+/// **availability** (can it happen *right now* with holders that are reachable?)
+/// are kept strictly separate. A grow-only custody ledger proves the former, not
+/// the latter: a holder that backed up its share long ago and is now offline —
+/// or actively withholding — is durable but not available. Conflating the two
+/// would report a recoverable arrangement while recovery is operationally
+/// impossible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryStatus {
     pub configuration: AuthorityConfigurationId,
     pub generation: u64,
-    /// Configured leaves that are backed at this generation, sorted.
-    pub backed: Vec<LeafId>,
-    /// A backed set qualifies under the policy — recovery can proceed now.
-    pub satisfiable: bool,
-    /// No backed set qualifies — recovery cannot proceed. The unambiguous
-    /// outcome of a liveness failure, never an undefined state.
-    pub quorum_lost: bool,
-    /// Satisfiable, but not every configured leaf is backed — some branch is
-    /// down even though quorum holds.
+    /// Configured leaves with a qualifying custody ack at this generation — a
+    /// usable share exists somewhere. Sorted.
+    pub durable: Vec<LeafId>,
+    /// Durable leaves whose holder also provided fresh, session-bound readiness —
+    /// usable *and* reachable now. Sorted. A subset of `durable`.
+    pub available: Vec<LeafId>,
+    /// The durable set satisfies the policy: recovery is possible in principle
+    /// once enough holders come online. Says nothing about *now*.
+    pub durable_qualifies: bool,
+    /// The available set satisfies the policy: recovery can proceed right now.
+    pub recoverable_now: bool,
+    /// The durable set does **not** satisfy the policy — the backups on record
+    /// cannot recover the key even with everyone online. The sharp, unambiguous
+    /// signal of genuine loss, distinct from a transient availability gap.
+    pub durability_at_risk: bool,
+    /// Durable enough to recover, but not every configured leaf is durable —
+    /// redundancy is reduced even though quorum's backups exist.
     pub degraded: bool,
-    /// If quorum is lost, a set of currently-unbacked leaves whose backing would
-    /// restore it (best-effort, not guaranteed minimal). Empty when satisfiable.
-    pub missing_for_quorum: Vec<LeafId>,
+    /// When recovery cannot proceed now, **one** set of not-yet-available leaves
+    /// whose readiness would enable it — a hint, not the minimum set. Empty when
+    /// `recoverable_now`.
+    pub example_recovery_set: Vec<LeafId>,
 }
 
-/// Project the compiled policy against the ledger's backed leaves.
+/// Project the compiled policy against durability (the ledger) and availability
+/// (`available_now`, a session-bound readiness set the app collects — e.g. fresh
+/// signed readiness pings). A leaf counts as available only if it is *also*
+/// durable: reachability without a usable share is not something recovery can
+/// lean on.
 pub fn status(
     compiled: &StructurallyValidatedCompiledPolicy,
     configuration: AuthorityConfigurationId,
     generation: u64,
     ledger: &CustodyLedger,
+    available_now: &BTreeSet<LeafId>,
 ) -> RecoveryStatus {
-    // Only leaves that are actually in this policy can back it.
     let configured: BTreeSet<&LeafId> = compiled.leaves().iter().collect();
-    let backed_set = ledger.backed_leaves(&configuration, generation);
-    let backed: Vec<LeafId> = compiled
+    let durable_set = ledger.backed_leaves(&configuration, generation);
+
+    let durable: Vec<LeafId> = compiled
         .leaves()
         .iter()
-        .filter(|l| backed_set.contains(*l))
+        .filter(|l| durable_set.contains(*l))
+        .cloned()
+        .collect();
+    // Available = durable AND reachable now.
+    let available: Vec<LeafId> = durable
+        .iter()
+        .filter(|l| available_now.contains(*l))
         .cloned()
         .collect();
 
-    let satisfiable = compiled.reconstruct(&backed).is_some();
-    let degraded = satisfiable && backed.len() < configured.len();
+    let durable_qualifies = compiled.reconstruct(&durable).is_some();
+    let recoverable_now = compiled.reconstruct(&available).is_some();
+    let degraded = durable_qualifies && durable.len() < configured.len();
 
-    let mut missing_for_quorum = Vec::new();
-    if !satisfiable {
-        // Greedily add unbacked leaves until a qualified set forms. The full leaf
-        // set is always qualified, so this terminates.
-        let mut current = backed.clone();
+    let mut example_recovery_set = Vec::new();
+    if !recoverable_now {
+        // Greedily add leaves that are not yet available until a qualified set
+        // forms. The full leaf set always qualifies, so this terminates. This is
+        // one such set, not the minimum (that is set-cover).
+        let mut current = available.clone();
         for leaf in compiled.leaves() {
             if compiled.reconstruct(&current).is_some() {
                 break;
             }
             if !current.contains(leaf) {
                 current.push(leaf.clone());
-                missing_for_quorum.push(leaf.clone());
+                example_recovery_set.push(leaf.clone());
             }
         }
     }
@@ -125,11 +156,13 @@ pub fn status(
     RecoveryStatus {
         configuration,
         generation,
-        backed,
-        satisfiable,
-        quorum_lost: !satisfiable,
+        durable,
+        available,
+        durable_qualifies,
+        recoverable_now,
+        durability_at_risk: !durable_qualifies,
         degraded,
-        missing_for_quorum,
+        example_recovery_set,
     }
 }
 
@@ -196,8 +229,13 @@ mod tests {
         }
     }
 
+    /// A readiness set from the given leaves.
+    fn avail(leaves: &[LeafId]) -> BTreeSet<LeafId> {
+        leaves.iter().cloned().collect()
+    }
+
     #[test]
-    fn a_backed_qualified_set_is_satisfiable_and_not_degraded_when_all_backed() {
+    fn fully_backed_and_all_available_is_recoverable_now_and_not_degraded() {
         let (c, leaves) = compiled(OwnershipPolicy::Threshold {
             k: 2,
             members: vec![key(1), key(2), key(3)],
@@ -206,10 +244,52 @@ mod tests {
         for l in &leaves {
             ledger.record(ack(l, 0));
         }
-        let s = status(&c, config(), 0, &ledger);
-        assert!(s.satisfiable && !s.quorum_lost);
-        assert!(!s.degraded, "every configured leaf is backed");
-        assert!(s.missing_for_quorum.is_empty());
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
+        assert!(s.durable_qualifies && s.recoverable_now);
+        assert!(!s.durability_at_risk);
+        assert!(!s.degraded, "every configured leaf is durable");
+        assert!(s.example_recovery_set.is_empty());
+    }
+
+    #[test]
+    fn a_withheld_but_backed_share_blocks_recovery_now_without_endangering_durability() {
+        // The genuine "withheld share" case: every leaf is backed (durable), but
+        // only one holder is reachable now. Data is safe; recovery cannot proceed
+        // this instant. This is NOT durability loss.
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let mut ledger = CustodyLedger::new();
+        for l in &leaves {
+            ledger.record(ack(l, 0));
+        }
+        // Only leaf 0 is available; the other two withhold / are offline.
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..1]));
+        assert!(s.durable_qualifies, "backups can still recover the key");
+        assert!(!s.durability_at_risk, "nothing was lost");
+        assert!(!s.recoverable_now, "cannot act with one reachable holder");
+        assert_eq!(s.durable.len(), 3);
+        assert_eq!(s.available.len(), 1);
+        // One more available holder would restore live recoverability.
+        assert_eq!(s.example_recovery_set.len(), 1);
+    }
+
+    #[test]
+    fn a_never_acknowledged_share_endangers_durability() {
+        // Distinct from withholding: two leaves never backed up at all. Even with
+        // everyone online, the backups on record cannot recover the key.
+        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let mut ledger = CustodyLedger::new();
+        ledger.record(ack(&leaves[0], 0));
+        // leaves 1 and 2 never acknowledged; all three are "reachable".
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
+        assert!(!s.durable_qualifies && s.durability_at_risk);
+        assert!(!s.recoverable_now);
+        assert_eq!(s.durable.len(), 1);
     }
 
     #[test]
@@ -219,28 +299,13 @@ mod tests {
             members: vec![key(1), key(2), key(3)],
         });
         let mut ledger = CustodyLedger::new();
-        // Only two of three backed: 2-of-3 is satisfiable, but a branch is down.
+        // Two of three durable and available: 2-of-3 recoverable, but a branch is down.
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger);
-        assert!(s.satisfiable);
-        assert!(s.degraded, "not all leaves backed");
-        assert_eq!(s.backed.len(), 2);
-    }
-
-    #[test]
-    fn a_withheld_share_yields_unambiguous_quorum_loss() {
-        let (c, leaves) = compiled(OwnershipPolicy::Threshold {
-            k: 2,
-            members: vec![key(1), key(2), key(3)],
-        });
-        let mut ledger = CustodyLedger::new();
-        // Only one of three backed: 2-of-3 cannot be met.
-        ledger.record(ack(&leaves[0], 0));
-        let s = status(&c, config(), 0, &ledger);
-        assert!(!s.satisfiable && s.quorum_lost);
-        // Exactly one more leaf restores quorum.
-        assert_eq!(s.missing_for_quorum.len(), 1);
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..2]));
+        assert!(s.recoverable_now);
+        assert!(s.degraded, "not all leaves durable");
+        assert_eq!(s.durable.len(), 2);
     }
 
     #[test]
@@ -254,9 +319,12 @@ mod tests {
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[1], 0));
         // Query generation 1 (e.g. after a refresh): no backing counts.
-        let s = status(&c, config(), 1, &ledger);
-        assert!(s.quorum_lost, "old-generation backing does not carry over");
-        assert!(s.backed.is_empty());
+        let s = status(&c, config(), 1, &ledger, &avail(&leaves));
+        assert!(
+            s.durability_at_risk,
+            "old-generation backing does not carry over"
+        );
+        assert!(s.durable.is_empty());
     }
 
     #[test]
@@ -276,13 +344,13 @@ mod tests {
             .id();
         ledger.record(other);
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger);
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves));
         assert_eq!(
-            s.backed.len(),
+            s.durable.len(),
             1,
             "only the matching-configuration ack counts"
         );
-        assert!(s.quorum_lost);
+        assert!(s.durability_at_risk);
     }
 
     #[test]
@@ -295,13 +363,13 @@ mod tests {
         ledger.record(ack(&leaves[0], 0));
         ledger.record(ack(&leaves[0], 0)); // duplicate
         ledger.record(ack(&leaves[1], 0));
-        let s = status(&c, config(), 0, &ledger);
+        let s = status(&c, config(), 0, &ledger, &avail(&leaves[0..2]));
         assert_eq!(
-            s.backed.len(),
+            s.durable.len(),
             2,
-            "duplicate does not inflate the backed set"
+            "duplicate does not inflate the durable set"
         );
-        assert!(s.satisfiable);
+        assert!(s.recoverable_now);
     }
 
     #[test]

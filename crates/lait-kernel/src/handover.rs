@@ -10,18 +10,24 @@
 //! merely because a new participant claims to have derived it.
 //!
 //! This module defines the bytes the old authority signs ([`InstallationTerms`]),
-//! and the convergence rule when several candidates race ([`converge`]). The
-//! signature itself is an ordinary [`crate::gaccess`] signature under `Y₁`, so a
-//! solo old key (1-of-1), a flat FROST old key (k-of-n) and a general-policy old
-//! key all install a successor the same way.
+//! and — given a set of *signed* installations — decides which one wins and
+//! projects the outcome ([`resolve`]). Selection verifies each signature under
+//! `Y₁` and picks the smallest transition id among the authorized ones, so every
+//! replica converges without coordination. The signature itself is an ordinary
+//! [`crate::gaccess`] signature under `Y₁`, so a solo old key (1-of-1), a flat
+//! FROST old key (k-of-n) and a general-policy old key all install a successor
+//! the same way.
 //!
 //! # ⚠ Review boundary — UNREVIEWED functional prototype
 //!
-//! The [`crate::gaccess`]/[`crate::gdkg`] boundaries carry over. D3-specific:
-//! the ceremony that gathers custody acks and reaches agreement on *which*
-//! candidate a partitioned old authority signed — the liveness/agreement layer —
-//! is the reviewed deliverable. This module supplies the binding and the pure
-//! convergence function the ceremony drives, nothing more. Wired into nothing.
+//! The [`crate::gaccess`]/[`crate::gdkg`] boundaries carry over. **Scope:** this
+//! module binds and authorizes the *installation signature* and decides the race
+//! among authorized installations. It deliberately does **not** validate a
+//! candidate's possession evidence, its signing plan/witness, the custody acks,
+//! or transition readiness — those are the C4/D6 acceptance checks that must pass
+//! before an installation is signed, and they live above this module. The
+//! partition-tolerant agreement and liveness layer around all of this is the
+//! reviewed deliverable. Wired into nothing.
 
 use crate::authority::{AuthorityConfigurationId, LeafId};
 use crate::gaccess::{self, KeyShares, Signature};
@@ -88,6 +94,11 @@ impl InstallationTerms {
         &self.new_public_key
     }
 
+    /// The transition these terms install.
+    pub fn transition(&self) -> TransitionId {
+        self.transition
+    }
+
     /// The canonical, domain-separated message the old authority signs. Every
     /// field is length-prefixed so no two distinct term sets share an encoding.
     pub fn message(&self) -> Vec<u8> {
@@ -136,15 +147,23 @@ pub fn sign_installation<K: KeyShares>(
     gaccess::sign_qualified(witness, old_key, nonces, commitments, &terms.message())
 }
 
-/// When several candidate transitions race, exactly one is installed. Given the
-/// competing transitions and the one whose installation the old authority
-/// actually signed, mark that one [`TransitionState::Activated`] and every other
-/// [`TransitionState::Superseded`]. Deterministic: the result is sorted by
-/// transition id, and `installed` wins regardless of arrival order.
+/// An installation the old authority signed: the terms plus the signature over
+/// them. The unit [`resolve`] selects among when candidates race.
+#[derive(Debug, Clone)]
+pub struct SignedInstallation {
+    pub terms: InstallationTerms,
+    pub signature: Signature,
+}
+
+/// Project a *already-decided* race: given the competing transitions and the one
+/// that won, mark it [`TransitionState::Activated`] and every other
+/// [`TransitionState::Superseded`]. Deterministic, sorted by transition id.
+/// Returns `None` if `installed` is not among `candidates`.
 ///
-/// Returns `None` if `installed` is not among `candidates` — a caller must not
-/// activate a transition that was never in the race.
-pub fn converge(
+/// This is pure projection — it does **not** decide the winner. [`resolve`] does
+/// that from signed installations; call this only when the winner is already
+/// established (e.g. re-deriving state from a recorded outcome).
+pub fn project_installed(
     candidates: &[TransitionId],
     installed: TransitionId,
 ) -> Option<Vec<(TransitionId, TransitionState)>> {
@@ -165,6 +184,41 @@ pub fn converge(
     out.sort_by_key(|(t, _)| t.to_hex());
     out.dedup_by(|a, b| a.0 == b.0);
     Some(out)
+}
+
+/// Decide a race among concurrent signed installations and project the outcome.
+///
+/// Each installation is verified under `old_public_key`; ones whose signature
+/// does not check are excluded entirely (an unauthorized installation cannot
+/// win). Among the *valid* ones, the winner is selected deterministically — the
+/// smallest transition id, which is content-addressed, so every replica agrees
+/// without coordination. The result activates the winner and supersedes the
+/// other valid candidates.
+///
+/// Returns `None` if no installation is valid — there is then no authorized
+/// successor, and the arrangement stays put rather than entering an ambiguous
+/// state. Invalid installations do not appear in the projection at all.
+///
+/// Scope: this decides *which authorized installation wins*. It does **not**
+/// validate candidate possession evidence, the custody acks, or transition
+/// readiness — those are the C4/D6 acceptance checks that must pass *before* an
+/// installation is signed, and they live above this module.
+pub fn resolve(
+    old_public_key: &[u8; 32],
+    installations: &[SignedInstallation],
+) -> Option<Vec<(TransitionId, TransitionState)>> {
+    // Keep only authorized installations, deduped by transition.
+    let mut valid: Vec<TransitionId> = Vec::new();
+    for si in installations {
+        if verify_installation(old_public_key, &si.terms, &si.signature) {
+            let t = si.terms.transition();
+            if !valid.contains(&t) {
+                valid.push(t);
+            }
+        }
+    }
+    let winner = *valid.iter().min_by_key(|t| t.to_hex())?;
+    project_installed(&valid, winner)
 }
 
 #[cfg(test)]
@@ -368,30 +422,103 @@ mod tests {
         prin(n)
     }
 
+    /// A signed installation for a fresh candidate key (seeded by `cand_seed`)
+    /// under transition `transition`.
+    fn signed_installation(
+        old_c: &StructurallyValidatedCompiledPolicy,
+        old_key: &GroupKey,
+        old_signers: &[LeafId],
+        transition: TransitionId,
+        cand_seed: u8,
+    ) -> SignedInstallation {
+        let (cand_c, cand_leaves) = compiled(OwnershipPolicy::Key(prin(cand_seed)));
+        let cand_key = dkg(&cand_c, &cand_leaves);
+        let terms = InstallationTerms::new(
+            transition,
+            AuthorityConfigurationId::single(),
+            user_of(&cand_key),
+            [cand_seed; 32],
+            cand_leaves,
+        );
+        let signature = old_signs(old_c, old_key, old_signers, &terms);
+        SignedInstallation { terms, signature }
+    }
+
     #[test]
-    fn concurrent_candidates_converge_to_one_activation() {
+    fn resolve_selects_the_deterministic_winner_among_signed_installations() {
+        let (old_c, old_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old_key = dkg(&old_c, &old_leaves);
+        let signers = vec![old_leaves[0].clone(), old_leaves[1].clone()];
+
+        // Two authorized, racing installations with distinct transition ids.
+        let a = tid(0x01);
+        let b = tid(0x02);
+        let inst_a = signed_installation(&old_c, &old_key, &signers, a, 40);
+        let inst_b = signed_installation(&old_c, &old_key, &signers, b, 41);
+
+        let resolved = resolve(&old_key.public_key(), &[inst_b.clone(), inst_a.clone()])
+            .expect("an authorized installation exists");
+        // Smallest transition id (a) wins regardless of input order.
+        let activated: Vec<_> = resolved
+            .iter()
+            .filter(|(_, s)| *s == TransitionState::Activated)
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(activated, vec![a], "min transition id wins");
+        assert_eq!(
+            resolved
+                .iter()
+                .filter(|(_, s)| *s == TransitionState::Superseded)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_excludes_unauthorized_installations() {
+        let (old_c, old_leaves) = compiled(OwnershipPolicy::Threshold {
+            k: 2,
+            members: vec![key(1), key(2), key(3)],
+        });
+        let old_key = dkg(&old_c, &old_leaves);
+        let signers = vec![old_leaves[0].clone(), old_leaves[1].clone()];
+
+        // A valid installation for b, and a *forged* one for a (tampered signature).
+        let a = tid(0x01);
+        let b = tid(0x02);
+        let mut forged = signed_installation(&old_c, &old_key, &signers, a, 40);
+        forged.signature.z[0] ^= 1; // break the signature
+        let inst_b = signed_installation(&old_c, &old_key, &signers, b, 41);
+
+        let resolved = resolve(&old_key.public_key(), &[forged, inst_b]).expect("b is authorized");
+        // The forged a does not win despite its smaller id, and does not appear.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0], (b, TransitionState::Activated));
+
+        // With no valid installation, there is no successor — not an ambiguous one.
+        let mut all_forged = signed_installation(&old_c, &old_key, &signers, a, 40);
+        all_forged.signature.z[0] ^= 1;
+        assert_eq!(resolve(&old_key.public_key(), &[all_forged]), None);
+    }
+
+    #[test]
+    fn project_installed_is_a_pure_deterministic_projection() {
         let a = tid(0x01);
         let b = tid(0x02);
         let c = tid(0x03);
-        let resolved = converge(&[a, b, c], b).expect("installed is in the race");
-        // Exactly one Activated (b), the rest Superseded.
+        let resolved = project_installed(&[a, b, c], b).expect("installed is in the race");
         let activated: Vec<_> = resolved
             .iter()
             .filter(|(_, s)| *s == TransitionState::Activated)
             .map(|(t, _)| *t)
             .collect();
         assert_eq!(activated, vec![b]);
-        assert_eq!(
-            resolved
-                .iter()
-                .filter(|(_, s)| *s == TransitionState::Superseded)
-                .count(),
-            2
-        );
-        // Deterministic order regardless of input order.
-        let reordered = converge(&[c, b, a], b).expect("installed in race");
-        assert_eq!(resolved, reordered);
-        // Installing a transition that never raced is refused.
-        assert_eq!(converge(&[a, c], b), None);
+        // Deterministic regardless of input order.
+        assert_eq!(resolved, project_installed(&[c, b, a], b).unwrap());
+        // Projecting a transition that never raced is refused.
+        assert_eq!(project_installed(&[a, c], b), None);
     }
 }
