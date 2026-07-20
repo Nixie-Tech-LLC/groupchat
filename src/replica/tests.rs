@@ -1396,10 +1396,8 @@ fn elevate_solo_recovery_to_a_2_of_2_dkg_group_key() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // A elevates to a 2-of-2 over {A, B}.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
 
     // Drive the DKG to a fixpoint via sync round-trips (each import advances).
     for _ in 0..6 {
@@ -1592,10 +1590,8 @@ fn a_nonce_bound_to_another_package_refuses_to_sign() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -1682,10 +1678,8 @@ fn an_unreadable_share_is_reported_as_degraded_not_absent() {
     ok(a.replica
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2120,10 +2114,8 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     sync_all(&mut a.replica, &mut c.replica);
 
     // ---- solo → group: {A, B} 2-of-2.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2157,17 +2149,18 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
     // ---- group → group: {A, B, C} 2-of-3, proposed by a group holder.
     // A no longer has a usable solo key, so this can only proceed by
     // threshold authorization.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    let (elevation, _) = ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    let msg = match resp {
-        Response::Ok { message: Some(m) } => m,
-        other => panic!("expected a pending group authorization, got {other:?}"),
-    };
+    ));
     assert!(
-        msg.contains("elevate-approve"),
-        "a group elevation must ask the other holders to authorize: {msg}"
+        elevation.grant_request.is_some(),
+        "a group elevation must ask the other holders to authorize"
+    );
+    assert!(
+        elevation.incomplete.is_none(),
+        "nothing was left unfinished: {:?}",
+        elevation.incomplete
     );
 
     // Pull the request and the proposal ids off the verified board.
@@ -2195,17 +2188,19 @@ fn a_group_authorizes_and_installs_its_own_replacement() {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
     }
-    let (bad, _) = b
-        .replica
-        .space_elevate_approve_cmd(signing.to_hex(), "f".repeat(64));
+    let bad = refused(
+        b.replica
+            .space_elevate_approve_cmd(signing.to_hex(), "f".repeat(64)),
+    );
     assert!(
-        matches!(bad, Response::Error { .. }),
+        matches!(
+            &bad,
+            ReplicaError::Ceremony(c) if matches!(&**c, Ceremony::ProposalMismatch { .. })
+        ),
         "approving a session while naming the wrong proposal must be refused: {bad:?}"
     );
-    let (resp, _) = b
-        .replica
-        .space_elevate_approve_cmd(signing.to_hex(), proposal.to_hex());
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(b.replica
+        .space_elevate_approve_cmd(signing.to_hex(), proposal.to_hex()));
 
     // Everything else is automatic: the group signs the grant, the new DKG
     // runs, the group signs the rotation, the plane installs it.
@@ -2287,11 +2282,10 @@ fn any_k_of_n_can_sign_without_the_lowest_index_holder() {
     sync_all(&mut a.replica, &mut c.replica);
 
     // A 2-of-3 group over {A, B, C}.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     let mut nodes = vec![a, b, c];
     sync_mesh(&mut nodes, 8);
     assert_eq!(
@@ -2394,10 +2388,8 @@ fn an_indispensable_arrangement_waits_for_verified_custody() {
     )
     .recovery_commit;
 
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..8 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2496,11 +2488,10 @@ fn a_redundant_arrangement_installs_without_universal_attestation() {
     sync_all(&mut a.replica, &mut b.replica);
     sync_all(&mut a.replica, &mut c.replica);
 
-    let (resp, _) = a.replica.space_elevate_cmd(
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2, // 2-of-3: one holder may be lost
-    );
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ));
     let mut nodes = vec![a, b, c];
     sync_mesh(&mut nodes, 8);
     assert_eq!(
@@ -2542,10 +2533,8 @@ fn a_lost_share_is_restored_from_its_portable_package() {
     ok(a.replica
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2689,10 +2678,8 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     }
 
     // A 2-of-2 group over {A, B}.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2711,29 +2698,22 @@ fn a_rotation_that_could_never_install_is_refused_up_front() {
     // Now propose a handover to {C, D} — disjoint from the current holders.
     // The current group is 2-of-2, so it needs BOTH of {A, B} to sign the
     // rotation, and neither would be able to derive the new key.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    let refusal = refused(a.replica.space_elevate_cmd(
         vec![c_device.as_str().to_string(), d_device.as_str().to_string()],
         2,
+    ));
+    assert!(
+        refusal.to_string().contains("current holders"),
+        "must explain why it cannot work: {refusal}"
     );
-    match resp {
-        Response::Error { message, .. } => assert!(
-            message.contains("current holders"),
-            "must explain why it cannot work: {message}"
-        ),
-        other => panic!("a disjoint handover must be refused, got {other:?}"),
-    }
 
     // Keeping one current holder is still not enough for a 2-of-2: two
     // signatures are needed and only one signer could derive the key.
-    let (resp, _) = a.replica.space_elevate_cmd(
+    // {A, B, C}: both current holders are present, so this one CAN install.
+    ok(a.replica.space_elevate_cmd(
         vec![b_device.as_str().to_string(), c_device.as_str().to_string()],
         2,
-    );
-    // {A, B, C}: both current holders are present, so this one CAN install.
-    assert!(
-        matches!(resp, Response::Ok { .. }),
-        "an overlapping arrangement is allowed: {resp:?}"
-    );
+    ));
 }
 
 /// A rogue proposal carries a perfectly
@@ -2920,10 +2900,8 @@ fn a_swapped_public_key_package_cannot_redirect_the_rotation() {
         .admit_member(&b_incept, vec![Grant::Admin, Grant::Write]));
     sync_all(&mut a.replica, &mut b.replica);
 
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -2981,10 +2959,8 @@ fn group_break_glass_recovery_needs_the_threshold_and_re_roots() {
     sync_all(&mut a.replica, &mut b.replica);
 
     // Elevate {A, B} to a 2-of-2 group recovery key.
-    let (resp, _) = a
-        .replica
-        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2);
-    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    ok(a.replica
+        .space_elevate_cmd(vec![b_device.as_str().to_string()], 2));
     for _ in 0..6 {
         sync_all(&mut a.replica, &mut b.replica);
         sync_all(&mut b.replica, &mut a.replica);
@@ -4997,5 +4973,41 @@ fn a_group_recovery_reports_a_share_it_could_not_add() {
         message.contains("could not add its own share")
             && message.contains("other holders can still complete it"),
         "says what this device failed to do without implying the ceremony died: {message}"
+    );
+}
+
+#[test]
+fn an_elevation_that_cannot_finish_still_reports_its_proposal() {
+    // `space_elevate_cmd` posts the proposal, then attaches an authorization —
+    // signing it outright with a solo key, or opening a request for the standing
+    // group. Every step after the post used to be able to fail into an error
+    // with no dirty set, discarding a proposal that was already on the board and
+    // that the other participants would see on their next sync. The old code
+    // also swallowed the ceremony drive entirely (`let _ = self.dkg_advance()`).
+    let (resp, dirty) = Replica::respond(
+        Ok(Change::committed(
+            Elevation {
+                k: 2,
+                n: 3,
+                proposal: crate::dkg::TranscriptId::parse_hex(&"c".repeat(64)).unwrap(),
+                grant_request: None,
+                incomplete: Some(anyhow!("recovery key disappeared mid-elevation")),
+            },
+            DirtySet::catalog(CatalogScope::Acl),
+        )),
+        Replica::elevation_response,
+    );
+    assert!(dirty.is_some(), "a posted proposal rings");
+    let message = match resp {
+        Response::Ok { message } => message.unwrap_or_default(),
+        other => panic!("a posted proposal is not an error: {other:?}"),
+    };
+    assert!(
+        message.contains("proposed a 2-of-3 recovery arrangement"),
+        "names what landed: {message}"
+    );
+    assert!(
+        message.contains("recovery key disappeared") && message.contains("the proposal stands"),
+        "says what failed without implying the proposal is gone: {message}"
     );
 }

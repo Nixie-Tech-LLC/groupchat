@@ -35,6 +35,30 @@ pub struct SpaceRecovered {
     pub rekey_failed: Option<anyhow::Error>,
 }
 
+/// A proposed K-of-N recovery arrangement.
+///
+/// The proposal is durable by the time this exists — that is what makes the
+/// optional fields honest rather than sloppy. `grant_request` names the signing
+/// transcript when the standing authority is a group and must authorize the
+/// change; `incomplete` carries a step that did not finish after the proposal
+/// was posted, which the operator needs to know without being told the whole
+/// elevation failed.
+#[derive(Debug)]
+pub struct Elevation {
+    pub k: u16,
+    pub n: u16,
+    pub proposal: crate::dkg::TranscriptId,
+    pub grant_request: Option<crate::dkg::TranscriptId>,
+    pub incomplete: Option<anyhow::Error>,
+}
+
+/// A holder co-signed an authorization for a proposed arrangement.
+#[derive(Debug)]
+pub struct ElevationApproved {
+    pub k: u16,
+    pub n: usize,
+}
+
 /// A holder co-signed a pending recovery.
 #[derive(Debug)]
 pub struct RecoveryApproved {
@@ -698,7 +722,7 @@ impl Replica {
         &mut self,
         cofounders: Vec<String>,
         k: u16,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<Elevation> {
         // Must hold the current recovery key to install the resulting Rotate.
         let cur = crate::space::replay(
             &self.genesis,
@@ -713,12 +737,9 @@ impl Replica {
         // we can OPEN the grant request even though we cannot sign it alone.
         let holds_share = self.active_dkg_session().is_some();
         if !holds_solo && !holds_share {
-            return (
-                Response::err(
-                    "only the current recovery authority can elevate: run this where space-recovery.key lives, or on a device holding a share of the current group key",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "only the current recovery authority can elevate: run this where space-recovery.key lives, or on a device holding a share of the current group key",
+            ));
         }
         // Assemble the sorted participant set (co-founders + me). Sorted and
         // deduped here AND re-checked by every acceptor: a hostile proposer must
@@ -730,10 +751,9 @@ impl Replica {
                     set.insert(u);
                 }
                 None => {
-                    return (
-                        Response::err(format!("'{c}' is not a device key (64 hex chars)")),
-                        None,
-                    )
+                    return Err(ReplicaError::Invalid(Invalid::CofounderDeviceKey {
+                        value: c.clone(),
+                    }))
                 }
             }
         }
@@ -743,30 +763,23 @@ impl Replica {
         // k == 0 means "all holders" (N-of-N) — the safe default.
         let k = if k == 0 { n } else { k };
         if !(1..=n).contains(&k) || n < 2 {
-            return (
-                Response::err("elevation needs ≥2 participants and threshold in 1..=N"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "elevation needs ≥2 participants and threshold in 1..=N",
+            ));
         }
         if !self.rotation_can_complete(&participants) {
-            return (
-                Response::err(
-                    "too few of the current holders are in the proposed arrangement: installing the result needs the current group to sign the rotation, and only a participant of the new ceremony can derive the key it installs. Include at least the current threshold of existing holders.",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "too few of the current holders are in the proposed arrangement: installing the result needs the current group to sign the rotation, and only a participant of the new ceremony can derive the key it installs. Include at least the current threshold of existing holders.",
+            ));
         }
         // Sign the proposal FIRST: its id is the hash of the signed node, so it
         // does not exist until now. `nonce` keeps two identical elevations by
         // the same initiator from colliding — Ed25519 signing is deterministic,
         // so without it the same (n, k, participants) would hash identically.
         let Some(current) = self.current_authority() else {
-            return (
-                Response::err(
-                    "cannot determine the arrangement operating the current recovery key — sync the ceremony that produced it first",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "cannot determine the arrangement operating the current recovery key — sync the ceremony that produced it first",
+            ));
         };
         let principals: Vec<crate::authority::PrincipalId> = participants
             .iter()
@@ -778,74 +791,79 @@ impl Replica {
             principals,
             current,
         ));
-        let _ = n;
         let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.space_id);
         let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
-            return (Response::err("could not derive the proposal id"), None);
+            return Err(ReplicaError::ceremony("could not derive the proposal id"));
         };
         // Local consent record for the ceremony itself, keyed by the transcript
         // it consents to. Written before posting so a crash leaves an orphan
         // marker (harmless) rather than a proposal nobody will install.
-        if let Err(e) = self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes()) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        if let Err(e) = self
-            .membership
+        self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes())?;
+        self.membership
             .add_ceremony_event(&ev)
-            .and_then(|()| self.persist_membership("dkg_propose"))
-        {
-            return (Response::err(format!("{e:#}")), None);
-        }
+            .and_then(|()| self.persist_membership("dkg_propose"))?;
+
+        // ---- the proposal is durable from here ----
+        //
+        // Every step below can fail, and none of them may report that failure as
+        // an error: the proposal is on the board, other participants will see it
+        // on their next sync, and an `Err` would both deny that and silence the
+        // doorbell announcing it. They ride out as `incomplete` instead, and the
+        // adapter says the proposal stands and what still needs doing.
 
         // Authorization. The device signature on the proposal proves only
         // control of a device; what every participant checks is a grant from the
         // standing authority. How that grant is produced is the ONLY thing that
         // differs between a solo and a group authority — the grant object itself
         // is identical either way, which is what B1 bought.
-        let message = if holds_solo {
-            let Some(secret) = self.read_space_recovery_key() else {
-                return (
-                    Response::err("recovery key disappeared mid-elevation"),
-                    None,
-                );
-            };
-            let grant = crate::dkg::sign_authority_grant(&secret, &self.space_id, &transcript);
-            let auth_ev = crate::dkg::sign_ceremony(
-                &self.seed,
-                &crate::dkg::CeremonyOp::DkgAuthorize(grant),
-                &self.space_id,
-            );
-            if let Err(e) = self
-                .membership
-                .add_ceremony_event(&auth_ev)
-                .and_then(|()| self.persist_membership("dkg_authorize"))
-            {
-                return (Response::err(format!("{e:#}")), None);
+        let mut grant_request = None;
+        let mut incomplete = None;
+        if holds_solo {
+            // The device signature on the proposal proves only control of a
+            // device; what every participant checks is a grant from the standing
+            // authority. A solo key signs it directly.
+            match self.read_space_recovery_key() {
+                Some(secret) => {
+                    let grant =
+                        crate::dkg::sign_authority_grant(&secret, &self.space_id, &transcript);
+                    let auth_ev = crate::dkg::sign_ceremony(
+                        &self.seed,
+                        &crate::dkg::CeremonyOp::DkgAuthorize(grant),
+                        &self.space_id,
+                    );
+                    incomplete = self
+                        .membership
+                        .add_ceremony_event(&auth_ev)
+                        .and_then(|()| self.persist_membership("dkg_authorize"))
+                        .err();
+                }
+                None => incomplete = Some(anyhow!("recovery key disappeared mid-elevation")),
             }
-            format!(
-                "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
-            )
         } else {
             // The standing authority is a group, so the grant needs a threshold
             // signature. Open a signing request for it; the other holders consent
             // with `space elevate-approve`, and the aggregate lands as the grant.
-            match self.open_grant_request(&transcript).map(|(id, _)| id) {
-                Ok(signing) => format!(
-                    "proposed a {k}-of-{n} recovery arrangement (proposal {}) — the current group must authorize it: each holder runs `space elevate-approve {} --proposal {}`",
-                    transcript.to_hex(),
-                    signing.to_hex(),
-                    transcript.to_hex(),
-                ),
-                Err(e) => return (Response::err(format!("{e:#}")), None),
+            match self.open_grant_request(&transcript) {
+                Ok((signing, _)) => grant_request = Some(signing),
+                Err(e) => incomplete = Some(e),
             }
-        };
-        let _ = self.dkg_advance();
-        (
-            Response::Ok {
-                message: Some(message),
+        }
+        // Driving the ceremony is opportunistic — it advances again on the next
+        // sync — but a failure here is still worth surfacing rather than
+        // discarding, provided something worse has not already been recorded.
+        if let Err(e) = self.dkg_advance() {
+            incomplete.get_or_insert(e);
+        }
+        Ok(Change::committed(
+            Elevation {
+                k,
+                n,
+                proposal: transcript,
+                grant_request,
+                incomplete,
             },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Open (or join) a threshold-signing transcript asking the standing group to
@@ -919,28 +937,21 @@ impl Replica {
         &mut self,
         session_hex: String,
         expect_proposal: String,
-    ) -> (Response, Option<DirtySet>) {
+    ) -> ChangeResult<ElevationApproved> {
         let Some(session) = crate::dkg::TranscriptId::parse_hex(session_hex.trim()) else {
-            return (
-                Response::err("not a valid request id (64 lowercase hex chars)"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "not a valid request id (64 lowercase hex chars)",
+            ));
         };
         let Some(expected) = crate::dkg::TranscriptId::parse_hex(expect_proposal.trim()) else {
-            return (
-                Response::err(
-                    "name the proposal you expect this to authorize (`--proposal <64-hex>`)",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "name the proposal you expect this to authorize (`--proposal <64-hex>`)",
+            ));
         };
         if self.active_dkg_session().is_none() {
-            return (
-                Response::err(
-                    "this device holds no share of the current group key — nothing to co-sign",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "this device holds no share of the current group key — nothing to co-sign",
+            ));
         }
         let events = self.membership.ceremony_events();
         let board = self.ceremony_board(&events);
@@ -955,31 +966,26 @@ impl Replica {
                 _ => None,
             })
         else {
-            return (
-                Response::err("no pending request for that id (sync from the initiator first)"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "no pending request for that id (sync from the initiator first)",
+            ));
         };
         if target != crate::dkg::SignTarget::AuthorityGrant {
-            return (
-                Response::err("that request is not an authority grant — refusing to co-sign"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that request is not an authority grant — refusing to co-sign",
+            ));
         }
         let Ok(grant) = postcard::from_bytes::<crate::dkg::AuthorityGrant>(&op_bytes) else {
-            return (
-                Response::err("that request does not carry a well-formed grant"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that request does not carry a well-formed grant",
+            ));
         };
         if grant.proposal != expected {
-            return (
-                Response::err(format!(
-                    "that request authorizes proposal {}, not the one you named — refusing to co-sign",
-                    grant.proposal.to_hex()
-                )),
-                None,
-            );
+            return Err(ReplicaError::Ceremony(Box::new(
+                Ceremony::ProposalMismatch {
+                    proposal: grant.proposal,
+                },
+            )));
         }
         // The proposal must be one we can see and would accept on its own terms:
         // well formed, a transition we implement, and replacing the authority
@@ -994,24 +1000,19 @@ impl Replica {
                 _ => None,
             })
         else {
-            return (
-                Response::err("that proposal has not synced here yet — sync and retry"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that proposal has not synced here yet — sync and retry",
+            ));
         };
         let Some(cfg) = proposal.frost_config() else {
-            return (
-                Response::err("that proposal is malformed or uses an unsupported transition"),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that proposal is malformed or uses an unsupported transition",
+            ));
         };
         if !self.claims_the_standing_authority(proposal.current_authority()) {
-            return (
-                Response::err(
-                    "that proposal does not replace the authority standing here — refusing to co-sign",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "that proposal does not replace the authority standing here — refusing to co-sign",
+            ));
         }
         // A holder must not authorize a ceremony that cannot be installed. The
         // proposer checks this too, but a hostile or stale proposer does not, and
@@ -1022,37 +1023,27 @@ impl Replica {
             .filter_map(|p| p.as_device())
             .collect();
         if !self.rotation_can_complete(&proposed) {
-            return (
-                Response::err(
-                    "refusing to authorize: too few of the current holders are in the proposed arrangement, so the resulting key could never be installed",
-                ),
-                None,
-            );
+            return Err(ReplicaError::ceremony(
+                "refusing to authorize: too few of the current holders are in the proposed arrangement, so the resulting key could never be installed",
+            ));
         }
-        if let Err(e) = self.dkg_write(&session, "intent", &op_bytes) {
-            return (Response::err(format!("{e:#}")), None);
-        }
+        // These write local consent artifacts only; nothing reaches the shared
+        // board here, so a failure has committed nothing.
+        self.dkg_write(&session, "intent", &op_bytes)?;
         // Consent to the CEREMONY as well, not only to the grant that authorizes
         // it. The holder named this proposal explicitly, so this is exactly what
         // they agreed to — and without it they would authorize a ceremony they
         // then refuse to help install, stalling the rotation at the last step
         // with no indication why.
-        if let Err(e) = self.dkg_write(&expected, "intent", expected.to_hex().as_bytes()) {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        if let Err(e) = self.dkg_advance() {
-            return (Response::err(format!("{e:#}")), None);
-        }
-        (
-            Response::Ok {
-                message: Some(format!(
-                    "co-signed the authorization for a {}-of-{} arrangement — it takes effect once the threshold has signed",
-                    cfg.k,
-                    cfg.participants.len()
-                )),
+        self.dkg_write(&expected, "intent", expected.to_hex().as_bytes())?;
+        self.dkg_advance()?;
+        Ok(Change::committed(
+            ElevationApproved {
+                k: cfg.k,
+                n: cfg.participants.len(),
             },
-            Some(DirtySet::catalog(CatalogScope::Acl)),
-        )
+            DirtySet::catalog(CatalogScope::Acl),
+        ))
     }
 
     /// Drive every FROST ceremony this device participates in to a fixpoint, based

@@ -241,9 +241,17 @@ impl Replica {
             Request::SpaceRecover => {
                 return Self::respond(self.space_recover_cmd(), Self::space_recovery_response)
             }
-            Request::SpaceElevate { cofounders, k } => Ok(self.space_elevate_cmd(cofounders, k)),
+            Request::SpaceElevate { cofounders, k } => {
+                return Self::respond(
+                    self.space_elevate_cmd(cofounders, k),
+                    Self::elevation_response,
+                )
+            }
             Request::SpaceElevateApprove { session, proposal } => {
-                Ok(self.space_elevate_approve_cmd(session, proposal))
+                return Self::respond(
+                    self.space_elevate_approve_cmd(session, proposal),
+                    Self::elevation_approved_response,
+                )
             }
             Request::SpaceCustodyExport { path, passphrase } => {
                 Ok(self.space_custody_export_cmd(path, passphrase))
@@ -363,6 +371,46 @@ impl Replica {
         };
         Response::Ok {
             message: Some(message),
+        }
+    }
+
+    /// An elevation always reports a posted proposal, then what still has to
+    /// happen to it — a group authorization, or a step this device could not
+    /// finish. `pub(super)` for the same reason as the recovery renderer.
+    pub(super) fn elevation_response(e: Elevation) -> Response {
+        let Elevation {
+            k,
+            n,
+            proposal,
+            grant_request,
+            incomplete,
+        } = e;
+        let message = match (grant_request, incomplete) {
+            (_, Some(why)) => format!(
+                "proposed a {k}-of-{n} recovery arrangement (proposal {}) — but this device could not carry it further ({why:#}); the proposal stands and can still be authorized",
+                proposal.to_hex()
+            ),
+            (None, None) => format!(
+                "started {k}-of-{n} recovery elevation — the DKG completes automatically as the co-founders' nodes sync; the group key installs once every share is in"
+            ),
+            (Some(signing), None) => format!(
+                "proposed a {k}-of-{n} recovery arrangement (proposal {}) — the current group must authorize it: each holder runs `space elevate-approve {} --proposal {}`",
+                proposal.to_hex(),
+                signing.to_hex(),
+                proposal.to_hex(),
+            ),
+        };
+        Response::Ok {
+            message: Some(message),
+        }
+    }
+
+    fn elevation_approved_response(a: ElevationApproved) -> Response {
+        Response::Ok {
+            message: Some(format!(
+                "co-signed the authorization for a {}-of-{} arrangement — it takes effect once the threshold has signed",
+                a.k, a.n
+            )),
         }
     }
 

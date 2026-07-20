@@ -194,6 +194,10 @@ pub enum Invalid {
     DeviceConsentMismatch,
     /// Not a 64-hex ed25519 device key.
     DeviceKey,
+    /// A co-founder named for an elevation is not a device key. Distinct from
+    /// [`DeviceKey`](Self::DeviceKey) because it echoes which of the named
+    /// co-founders was rejected, out of a list the caller passed.
+    CofounderDeviceKey { value: String },
 }
 
 /// The fields that must carry text. A closed set rather than a string: these
@@ -282,6 +286,8 @@ pub enum Ceremony {
     /// Carries where it actually points, since that is what the holder needs
     /// to see before deciding.
     RootMismatch { roots: Vec<crate::ids::ActorId> },
+    /// The signing request authorizes a different proposal than the one named.
+    ProposalMismatch { proposal: crate::dkg::TranscriptId },
 }
 
 impl ReplicaError {
@@ -436,6 +442,9 @@ impl fmt::Display for Invalid {
                 f.write_str("device consent is not valid for this actor")
             }
             Self::DeviceKey => f.write_str("a device is a 64-hex ed25519 key"),
+            Self::CofounderDeviceKey { value } => {
+                write!(f, "'{value}' is not a device key (64 hex chars)")
+            }
             Self::ProjectKey { value } => write!(
                 f,
                 "bad project key '{value}' — use 1-8 ASCII letters (it becomes the KEY in KEY-1 refs)"
@@ -522,6 +531,11 @@ impl fmt::Display for Ceremony {
                     "This device cannot take part in recovery. Recovery remains possible only if the configured authority requirements can still be satisfied by the other holders, which this device cannot verify.",
                 )
             }
+            Self::ProposalMismatch { proposal } => write!(
+                f,
+                "that request authorizes proposal {}, not the one you named — refusing to co-sign",
+                proposal.to_hex()
+            ),
             Self::RootMismatch { roots } => {
                 let roots = roots
                     .iter()
