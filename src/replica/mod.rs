@@ -47,8 +47,8 @@ mod tests;
 
 pub use change::{Change, ChangeResult, ReplicaResult};
 pub use error::{
-    AdminAction, Ceremony, Conflict, Denied, GraphViolation, Invalid, NotFound, ProjectChoice,
-    RefError, ReplicaError,
+    AdminAction, Ceremony, Conflict, Denied, EmptyField, GraphViolation, Invalid, LinkRef,
+    NotFound, ProjectChoice, RefError, ReplicaError,
 };
 pub use lifecycle::{derive_project_key, found_space, join_space_store};
 pub use recovery::{
@@ -57,7 +57,7 @@ pub use recovery::{
 };
 // private re-imports so `use super::*` in children keeps unqualified helper names working:
 use lifecycle::mint_recovery;
-use mutate::WorkAction;
+use mutate::{Deletion, ResolvedRef, WorkAction};
 use recovery::{persist_recovery_key, persist_space_recovery};
 
 /// The batched, project-keyed dirty set produced by a mutation. The

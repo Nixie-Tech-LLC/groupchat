@@ -200,6 +200,17 @@ impl Replica {
 
     pub(super) fn issue_view(&mut self, reff: String) -> ReplicaResult<IssueView> {
         let doc_id = self.resolve_issue(&reff)?;
+        self.issue_view_at(&doc_id)
+    }
+
+    /// The same projection, keyed on the document rather than a ref.
+    ///
+    /// A mutation already holds the `DocId` it just wrote, and re-resolving a
+    /// handle is the only way rendering its snapshot can fail. Keying on the
+    /// document removes that failure, which is what lets a command finish its
+    /// durable write with nothing fallible after it.
+    pub(super) fn issue_view_at(&mut self, doc_id: &DocId) -> ReplicaResult<IssueView> {
+        let doc_id = doc_id.clone();
         // Clone viewer context up front so it doesn't conflict with the issue
         // borrow below.
         let ws = self.space_id.clone();
