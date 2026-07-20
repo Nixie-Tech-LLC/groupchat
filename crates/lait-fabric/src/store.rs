@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! <home>/repo/
-//!   genesis.json        // workspaceId + founding admin keys (public only)
+//!   genesis.json        // spaceId + founding admin keys (public only)
 //!   catalog.loro        // export(Snapshot) of the Catalog doc
 //!   membership.loro     // signed authority inputs and sealed envelopes
 //!   docs/<DocId>.loro   // per-issue snapshot, lazily loaded
@@ -54,7 +54,7 @@ pub struct Store {
     /// once per store and persisted beside the docs, so a daemon restart reuses
     /// it (no version-vector growth per session) while a re-created store mints
     /// a fresh one (reusing a peer id over an empty store and then importing
-    /// the old ops silently drops them — verified against the engine). Copying
+    /// the old ops silently drops them — verified against Loro). Copying
     /// a store directory to a second live node stays forbidden, as it already
     /// was for the identity key.
     peer_id: u64,
@@ -84,7 +84,7 @@ impl Store {
         })
     }
 
-    /// The stable per-store engine peer id (see the field docs).
+    /// The stable per-store Loro peer id (see the field docs).
     pub fn peer_id(&self) -> u64 {
         self.peer_id
     }
@@ -143,7 +143,7 @@ impl Store {
         }
         let bytes = fs::read(&p).context("read catalog.loro")?;
         let catalog = CatalogDoc::from_snapshot(&bytes, Some(self.peer_id))?;
-        // Reject a store written by a newer lait before exposing its contents.
+        // Gate the on-disk schema window before exposing any contents.
         check_schema_version(catalog.schema_version())?;
         Ok(Some(catalog))
     }
@@ -354,18 +354,37 @@ fn run_git(repo: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Gate a loaded store's on-disk schema version against what this build supports
-/// (`dto::SCHEMA_VERSION`). Refuses a store written by a **newer** lait — opening
-/// it with an older binary risks dropping or misreading unknown fields. An
-/// older-or-equal store is accepted; migrations for older
-/// versions would run at the call site (none yet — only v1 exists). Pure, so the
-/// policy is unit-tested without touching the filesystem.
+/// Gate a loaded store's on-disk schema version against the window this build
+/// supports (`[dto::MIN_SUPPORTED_SCHEMA, dto::SCHEMA_VERSION]`).
+///
+/// Both bounds are closed. A **newer** store is refused because an older binary
+/// would drop or misread fields it does not know. An **older** store is refused
+/// because there is no migration: a v2 store's space id lives under keys a v3
+/// reader never consults, so accepting it would open a store that then projects
+/// as spaceless. A refusal that names the version is recoverable; a store that
+/// opens wrong is not.
+///
+/// `0` is **not** an old version — it is the absence of the key, which is what a
+/// joiner's catalog reads until the founder's ops arrive over sync
+/// ([`CatalogDoc::empty`] stamps nothing). Refusing it would make `lait join`
+/// impossible. An unstamped store carries no shape to be wrong about; the
+/// genesis is the root of truth at that point, and a v0.5.x genesis fails to
+/// parse on its own. Pure, so the window policy is unit-testable without
+/// touching the filesystem.
 fn check_schema_version(found: u32) -> Result<()> {
     let supported = crate::dto::SCHEMA_VERSION;
+    let min = crate::dto::MIN_SUPPORTED_SCHEMA;
     if found > supported {
         return Err(anyhow!(
-            "this workspace store was written by a newer lait (schema v{found}); \
+            "this space store was written by a newer lait (schema v{found}); \
              this build supports up to schema v{supported} — upgrade lait to open it"
+        ));
+    }
+    if found != 0 && found < min {
+        return Err(anyhow!(
+            "this space store was written by lait v0.5.x or earlier (schema v{found}); \
+             v0.6 changed the on-disk shape and does not migrate — re-found it with \
+             `lait init`, or re-join from a fresh invite"
         ));
     }
     Ok(())
@@ -374,13 +393,17 @@ fn check_schema_version(found: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dto::{Priority, SCHEMA_VERSION};
-    use crate::ids::WorkspaceId;
+    use crate::dto::{Priority, MIN_SUPPORTED_SCHEMA, SCHEMA_VERSION};
+    use crate::ids::SpaceId;
 
     #[test]
-    fn schema_gate_accepts_supported_and_refuses_newer() {
-        // Current and older schemas load; a newer store is refused (upgrade path).
+    fn schema_gate_accepts_supported_and_refuses_outside_the_window() {
+        // The window is closed at both ends: a newer store and a retired older
+        // one are both refused, so a v0.5.x store cannot open and mis-project.
         assert!(check_schema_version(SCHEMA_VERSION).is_ok());
+        assert!(check_schema_version(MIN_SUPPORTED_SCHEMA - 1).is_err());
+        // `0` is the key's absence, not a version: a joiner's catalog reads it
+        // until the founder's ops land, and refusing it would break `lait join`.
         assert!(check_schema_version(0).is_ok());
         assert!(check_schema_version(SCHEMA_VERSION + 1).is_err());
     }
@@ -403,7 +426,7 @@ mod tests {
         let store = Store::open(&home).unwrap();
         assert!(store.genesis().unwrap().is_none());
         let g = Genesis {
-            workspace_id: WorkspaceId::mint(&SystemUlidSource),
+            space_id: SpaceId::mint(&SystemUlidSource),
             founding_actors: vec![crate::ids::ActorId::from_incept_hash(&"a".repeat(64))],
             salt: [0u8; 16],
             recovery_root: [0u8; 32],
@@ -417,14 +440,14 @@ mod tests {
     fn catalog_and_issue_persist_and_reload() {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
-        let ws = WorkspaceId::mint(&SystemUlidSource);
-        let me = crate::ids::UserId::from_key_string("a".repeat(64));
+        let ws = SpaceId::mint(&SystemUlidSource);
+        let me = crate::ids::DeviceId::from_key_string("a".repeat(64));
         let cat = CatalogDoc::create(&ws, "test", None, &me).unwrap();
         let p = ProjectId::mint(&SystemUlidSource);
         cat.add_project(&p, "Eng", "ENG", "blue").unwrap();
         let issue = IssueDoc::create(NewIssue {
             doc_id: DocId::mint(&SystemUlidSource),
-            workspace_id: ws.clone(),
+            space_id: ws.clone(),
             project_id: p.clone(),
             title: "persist me".into(),
             priority: Priority::Low,
@@ -455,12 +478,12 @@ mod tests {
     fn atomic_write_leaves_no_tmp() {
         let home = tmp_home();
         let store = Store::open(&home).unwrap();
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let cat = CatalogDoc::create(
             &ws,
             "test",
             None,
-            &crate::ids::UserId::from_key_string("a".repeat(64)),
+            &crate::ids::DeviceId::from_key_string("a".repeat(64)),
         )
         .unwrap();
         store.save_catalog(&cat).unwrap();

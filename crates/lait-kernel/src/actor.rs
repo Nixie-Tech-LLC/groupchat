@@ -6,7 +6,7 @@
 //! **self-authorized**: an actor adds, revokes, and recovers its own devices;
 //! no admin signs a device event.
 //!
-//! **The split this plane creates.** A `UserId` (ed25519 device key) *signs*;
+//! **The split this plane creates.** A `DeviceId` (ed25519 device key) *signs*;
 //! an [`ActorId`] *is someone*. Every op on every plane is still signed by
 //! exactly one device (the [`SignedNode`] envelope binds the author key into
 //! both signature and content-address — that stays). Authority questions gain
@@ -17,8 +17,8 @@
 //! **Self-certifying identity.** `ActorId = act_ + blake3-hash(Incept event)`.
 //! No registry mints it and none can forge it: any replica holding the
 //! `Incept` event validates the id by rehashing. The `Incept` payload binds
-//! the workspace id + a nonce, so actors are **per-space** — the same human in
-//! two workspaces is two unlinkable actors (cross-space linking is a local
+//! the space id + a nonce, so actors are **per-space** — the same human in
+//! two spaces is two unlinkable actors (cross-space linking is a local
 //! address-book concern, never protocol state).
 //!
 //! **Consent bindings.** Every device in an actor's set consented: a
@@ -26,12 +26,12 @@
 //! context (`lait/devbind/1`) plus a fresh per-binding nonce, so no actor can
 //! claim a key it does not control and no consent can be replayed.
 //! - For an `Incept` the actor id does not exist yet (it *is* the event's
-//!   hash), so consent binds the **whole inception core**: `(workspace ‖
+//!   hash), so consent binds the **whole inception core**: `(space ‖
 //!   binding nonce ‖ incept nonce ‖ sorted device keys ‖ recovery commit)`.
 //!   Binding the full core is what stops a device's consent being replayed
 //!   into a *different* inception (different device set or recovery commitment)
 //!   that reuses the incept nonce.
-//! - For `AddDevice`/`Recover` consent binds `(workspace ‖ binding nonce ‖
+//! - For `AddDevice`/`Recover` consent binds `(space ‖ binding nonce ‖
 //!   actor id)`, and replay enforces the nonce is **single-use per actor**, so
 //!   an old consent cannot be replayed to re-add a device after its revocation.
 //!
@@ -80,7 +80,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// The signing domain for actor key-events (see [`crate::sigdag`]).
@@ -104,7 +104,7 @@ pub type SignedEvent = SignedNode;
 /// signed preimage so it cannot be swapped on a captured consent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBinding {
-    pub device: UserId,
+    pub device: DeviceId,
     pub nonce: [u8; 16],
     pub consent: Vec<u8>,
 }
@@ -116,10 +116,10 @@ pub struct DeviceBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActorOp {
     /// Establish an actor. The event's content-address IS the [`ActorId`].
-    /// The author device must be among `devices`; the workspace + nonce make
+    /// The author device must be among `devices`; the space + nonce make
     /// identical device sets yield distinct ids per space and per inception.
     Incept {
-        workspace: String,
+        space: String,
         nonce: [u8; 16],
         devices: Vec<DeviceBinding>,
         /// `blake3(recovery ed25519 pubkey)` — pre-rotation commitment.
@@ -133,7 +133,7 @@ pub enum ActorOp {
     },
     /// Unbind a device from `actor`. Author must be a current device (a
     /// device may revoke itself). Revoke-wins over concurrent adds.
-    RevokeDevice { actor: ActorId, device: UserId },
+    RevokeDevice { actor: ActorId, device: DeviceId },
     /// Recovery: authored by the **recovery key** (the envelope author), which
     /// must hash to the standing commitment. Wholesale-resets the device set
     /// and rolls the commitment. Recovery-wins over concurrent device events.
@@ -164,20 +164,14 @@ impl ActorOp {
 /// Sign an [`ActorOp`] with the author's ed25519 seed (a device key — or, for
 /// `Recover`, the recovery key), given the actor log's current heads as
 /// parents. Same envelope bindings as every plane (op ‖ author ‖
-/// sorted(parents) ‖ workspace id under the plane domain).
+/// sorted(parents) ‖ space id under the plane domain).
 pub fn sign_event(
     seed: &[u8; 32],
     op: &ActorOp,
     parents: Vec<String>,
-    workspace_id: &WorkspaceId,
+    space_id: &SpaceId,
 ) -> SignedEvent {
-    sigdag::sign_node(
-        ACTOR_DOMAIN,
-        seed,
-        op.encode(),
-        parents,
-        workspace_id.as_str(),
-    )
+    sigdag::sign_node(ACTOR_DOMAIN, seed, op.encode(), parents, space_id.as_str())
 }
 
 /// The context a device's consent signature covers.
@@ -189,7 +183,7 @@ pub enum ConsentCtx<'a> {
     Incept {
         incept_nonce: &'a [u8; 16],
         /// The inception's device keys (any order — hashed sorted).
-        devices: &'a [UserId],
+        devices: &'a [DeviceId],
         recovery_commit: &'a Option<[u8; 32]>,
     },
     /// Consent to join an existing actor (`AddDevice` / `Recover`). Freshness
@@ -198,14 +192,14 @@ pub enum ConsentCtx<'a> {
 }
 
 fn consent_payload(
-    workspace: &str,
-    device: &UserId,
+    space: &str,
+    device: &DeviceId,
     binding_nonce: &[u8; 16],
     ctx: &ConsentCtx,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(CONSENT_DOMAIN);
-    h.update(workspace.as_bytes());
+    h.update(space.as_bytes());
     h.update(device.as_str().as_bytes());
     h.update(&binding_nonce[..]);
     match ctx {
@@ -243,14 +237,14 @@ fn consent_payload(
 /// `device_seed`). `binding_nonce` should be fresh per binding.
 pub fn consent_sign(
     device_seed: &[u8; 32],
-    workspace: &str,
+    space: &str,
     binding_nonce: [u8; 16],
     ctx: &ConsentCtx,
 ) -> DeviceBinding {
     let sk = SigningKey::from_bytes(device_seed);
     let device =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
-    let payload = consent_payload(workspace, &device, &binding_nonce, ctx);
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+    let payload = consent_payload(space, &device, &binding_nonce, ctx);
     let sig: Signature = sk.sign(&payload);
     DeviceBinding {
         device,
@@ -260,7 +254,7 @@ pub fn consent_sign(
 }
 
 /// Verify a binding's consent signature under `ctx`.
-pub fn consent_verify(workspace: &str, binding: &DeviceBinding, ctx: &ConsentCtx) -> bool {
+pub fn consent_verify(space: &str, binding: &DeviceBinding, ctx: &ConsentCtx) -> bool {
     let Some(pk) = hex_key(binding.device.as_str()) else {
         return false;
     };
@@ -270,16 +264,16 @@ pub fn consent_verify(workspace: &str, binding: &DeviceBinding, ctx: &ConsentCtx
     let Ok(sig) = Signature::from_slice(&binding.consent) else {
         return false;
     };
-    let payload = consent_payload(workspace, &binding.device, &binding.nonce, ctx);
+    let payload = consent_payload(space, &binding.device, &binding.nonce, ctx);
     vk.verify(&payload, &sig).is_ok()
 }
 
 fn hex_key(s: &str) -> Option<[u8; 32]> {
-    // Reject any non-hex byte BEFORE slicing: a `UserId` is a bare validated-
+    // Reject any non-hex byte BEFORE slicing: a `DeviceId` is a bare validated-
     // nowhere String, so `s` is attacker-controlled UTF-8. Without this guard a
     // 64-*byte* string containing a multibyte char slices inside a char boundary
     // and panics — and because replay is a pure function every replica runs over
-    // the synced event set, one poison event would crash the whole workspace.
+    // the synced event set, one poison event would crash the whole space.
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -292,7 +286,7 @@ fn hex_key(s: &str) -> Option<[u8; 32]> {
 
 /// The blake3 hash of an ed25519 public key (the pre-rotation commitment
 /// shape): `blake3(raw 32 key bytes)`.
-pub fn recovery_commitment(recovery_pub: &UserId) -> Option<[u8; 32]> {
+pub fn recovery_commitment(recovery_pub: &DeviceId) -> Option<[u8; 32]> {
     let raw = hex_key(recovery_pub.as_str())?;
     Some(*blake3::hash(&raw).as_bytes())
 }
@@ -304,18 +298,18 @@ pub fn recovery_commitment(recovery_pub: &UserId) -> Option<[u8; 32]> {
 /// recovery; `None` forgoes it (agents).
 pub fn incept_single(
     device_seed: &[u8; 32],
-    workspace: &WorkspaceId,
+    space: &SpaceId,
     nonce: [u8; 16],
     binding_nonce: [u8; 16],
     recovery_commit: Option<[u8; 32]>,
 ) -> (SignedEvent, ActorId) {
     let sk = SigningKey::from_bytes(device_seed);
     let device =
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(sk.verifying_key().as_bytes()));
     let keys = [device];
     let binding = consent_sign(
         device_seed,
-        workspace.as_str(),
+        space.as_str(),
         binding_nonce,
         &ConsentCtx::Incept {
             incept_nonce: &nonce,
@@ -324,12 +318,12 @@ pub fn incept_single(
         },
     );
     let op = ActorOp::Incept {
-        workspace: workspace.as_str().to_string(),
+        space: space.as_str().to_string(),
         nonce,
         devices: vec![binding],
         recovery_commit,
     };
-    let ev = sign_event(device_seed, &op, vec![], workspace);
+    let ev = sign_event(device_seed, &op, vec![], space);
     let id = ActorId::from_incept_hash(&ev.hash());
     (ev, id)
 }
@@ -337,14 +331,14 @@ pub fn incept_single(
 /// The materialized state of one actor after replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorState {
-    pub devices: BTreeSet<UserId>,
+    pub devices: BTreeSet<DeviceId>,
     pub recovery_commit: Option<[u8; 32]>,
     /// Whether recovery has ever fired (renders as a visible identity event).
     pub recovered: bool,
 }
 
 /// The materialized actor plane: every validly-incepted actor and its current
-/// device set. Pure function of `(workspace id, event set)`.
+/// device set. Pure function of `(space id, event set)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorPlane {
     actors: BTreeMap<ActorId, ActorState>,
@@ -358,12 +352,12 @@ impl ActorPlane {
         self.actors.contains_key(actor)
     }
     /// Whether `device` currently speaks for `actor`.
-    pub fn is_device_of(&self, actor: &ActorId, device: &UserId) -> bool {
+    pub fn is_device_of(&self, actor: &ActorId, device: &DeviceId) -> bool {
         self.actors
             .get(actor)
             .is_some_and(|s| s.devices.contains(device))
     }
-    pub fn devices_of(&self, actor: &ActorId) -> Vec<UserId> {
+    pub fn devices_of(&self, actor: &ActorId) -> Vec<DeviceId> {
         self.actors
             .get(actor)
             .map(|s| s.devices.iter().cloned().collect())
@@ -373,7 +367,7 @@ impl ActorPlane {
     /// bound ambiguously (a device that consented into two actors forfeits
     /// attribution; authorization is unaffected because ops declare their
     /// actor explicitly).
-    pub fn actor_of_device(&self, device: &UserId) -> Option<&ActorId> {
+    pub fn actor_of_device(&self, device: &DeviceId) -> Option<&ActorId> {
         let mut found = None;
         for (id, st) in &self.actors {
             if st.devices.contains(device) {
@@ -391,8 +385,8 @@ impl ActorPlane {
 }
 
 /// Replay the full event set. See module docs for the two-pass rules.
-pub fn replay(workspace_id: &WorkspaceId, events: &[SignedEvent]) -> ActorPlane {
-    replay_inner(workspace_id, events, None)
+pub fn replay(space_id: &SpaceId, events: &[SignedEvent]) -> ActorPlane {
+    replay_inner(space_id, events, None)
 }
 
 /// Replay restricted to the causal past of `frontier` (event hashes): the
@@ -402,23 +396,19 @@ pub fn replay(workspace_id: &WorkspaceId, events: &[SignedEvent]) -> ActorPlane 
 /// hold the frontier resolve identically regardless of what else they hold.
 /// An oversized frontier (> [`MAX_ACTOR_ASOF`]) resolves to nothing — a
 /// malformed claim never authorizes.
-pub fn replay_at(
-    workspace_id: &WorkspaceId,
-    events: &[SignedEvent],
-    frontier: &[String],
-) -> ActorPlane {
+pub fn replay_at(space_id: &SpaceId, events: &[SignedEvent], frontier: &[String]) -> ActorPlane {
     if frontier.len() > MAX_ACTOR_ASOF {
         return ActorPlane::default();
     }
-    replay_inner(workspace_id, events, Some(frontier))
+    replay_inner(space_id, events, Some(frontier))
 }
 
 fn replay_inner(
-    workspace_id: &WorkspaceId,
+    space_id: &SpaceId,
     events: &[SignedEvent],
     frontier: Option<&[String]>,
 ) -> ActorPlane {
-    let ws = workspace_id.as_str();
+    let ws = space_id.as_str();
 
     // Index signature-valid events by hash; undecodable ops stay as opaque DAG
     // nodes (ancestry, no state) — the forward-compat rule shared with acl.rs.
@@ -455,18 +445,18 @@ fn replay_inner(
     let order = sigdag::topo_order(&nodes);
 
     // Partition into per-actor logs by declared claim; inceptions define.
-    // An Incept is valid only if: workspace matches, the author device is in
+    // An Incept is valid only if: space matches, the author device is in
     // its device set, and every binding's consent verifies.
     let mut incepts: BTreeMap<ActorId, String> = BTreeMap::new();
     for (h, op) in &decoded {
         if let Some(ActorOp::Incept {
-            workspace,
+            space,
             nonce,
             devices,
             recovery_commit,
         }) = op
         {
-            if workspace != ws {
+            if space != ws {
                 continue;
             }
             // An Incept must be a DAG root (no parents), so its causal closure
@@ -476,7 +466,7 @@ fn replay_inner(
                 continue;
             }
             let author = &nodes[h].author;
-            let keys: Vec<UserId> = devices.iter().map(|b| b.device.clone()).collect();
+            let keys: Vec<DeviceId> = devices.iter().map(|b| b.device.clone()).collect();
             if !keys.iter().any(|k| k == author) {
                 continue;
             }
@@ -596,11 +586,11 @@ fn replay_inner(
     // ---- pass 1 proper: evolve per-actor state in topo order.
     let mut states: BTreeMap<ActorId, ActorState> = BTreeMap::new();
     // Track authorized add/revoke events per (actor, device) for revoke-wins.
-    let mut adds: Vec<(ActorId, UserId, String)> = Vec::new();
-    let mut revokes: Vec<(ActorId, UserId, String)> = Vec::new();
+    let mut adds: Vec<(ActorId, DeviceId, String)> = Vec::new();
+    let mut revokes: Vec<(ActorId, DeviceId, String)> = Vec::new();
     // Single-use consent nonces per actor — a consent may authorize a binding
     // exactly once, so an old consent cannot re-add a device after revocation.
-    let mut consumed: BTreeSet<(ActorId, UserId, [u8; 16])> = BTreeSet::new();
+    let mut consumed: BTreeSet<(ActorId, DeviceId, [u8; 16])> = BTreeSet::new();
 
     for h in &order {
         if strikes.contains(h) {
@@ -719,16 +709,16 @@ mod tests {
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
     }
-    fn device(n: u8) -> UserId {
+    fn device(n: u8) -> DeviceId {
         let pk = SigningKey::from_bytes(&seed(n)).verifying_key();
-        UserId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
+        DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
     }
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&SystemUlidSource)
     }
 
     /// A member-consent binding for seed `s` into `actor`, nonce `bn`.
-    fn member_binding(s: u8, bn: u8, actor: &ActorId, w: &WorkspaceId) -> DeviceBinding {
+    fn member_binding(s: u8, bn: u8, actor: &ActorId, w: &SpaceId) -> DeviceBinding {
         consent_sign(
             &seed(s),
             w.as_str(),
@@ -743,7 +733,7 @@ mod tests {
     }
 
     /// Incept a single-device actor for seed `n`; returns (event, id).
-    fn incept(n: u8, w: &WorkspaceId, recovery: Option<u8>) -> (SignedEvent, ActorId) {
+    fn incept(n: u8, w: &SpaceId, recovery: Option<u8>) -> (SignedEvent, ActorId) {
         let nonce = [n; 16];
         let commit = recovery.map(recovery_commit);
         let keys = vec![device(n)];
@@ -758,7 +748,7 @@ mod tests {
             },
         );
         let op = ActorOp::Incept {
-            workspace: w.as_str().to_string(),
+            space: w.as_str().to_string(),
             nonce,
             devices: vec![binding],
             recovery_commit: commit,
@@ -776,7 +766,7 @@ mod tests {
         bn: u8,
         actor: &ActorId,
         parents: Vec<String>,
-        w: &WorkspaceId,
+        w: &SpaceId,
     ) -> SignedEvent {
         let binding = member_binding(new_seed, bn, actor, w);
         sign_event(
@@ -802,17 +792,17 @@ mod tests {
     }
 
     #[test]
-    fn incept_for_wrong_workspace_or_unconsented_device_is_void() {
+    fn incept_for_wrong_space_or_unconsented_device_is_void() {
         let w = ws();
-        let other = WorkspaceId::mint(&SystemUlidSource);
+        let other = SpaceId::mint(&SystemUlidSource);
         // Signed for `w` but claims `other` in the payload: void in both.
         let (ev, _) = incept(1, &other, None);
-        // Re-sign the SAME op under w's envelope — the payload workspace `other`
+        // Re-sign the SAME op under w's envelope — the payload space `other`
         // must still void it.
         let op: ActorOp = postcard::from_bytes(&ev.op).unwrap();
         let ev = sign_event(&seed(1), &op, vec![], &w);
         let plane = replay(&w, &[ev]);
-        assert_eq!(plane.actors().count(), 0, "cross-workspace incept is void");
+        assert_eq!(plane.actors().count(), 0, "cross-space incept is void");
 
         // Claiming a device without its consent: void.
         let nonce2 = [8u8; 16];
@@ -833,7 +823,7 @@ mod tests {
             consent: vec![0u8; 64],
         };
         let op = ActorOp::Incept {
-            workspace: w.as_str().to_string(),
+            space: w.as_str().to_string(),
             nonce: nonce2,
             devices: vec![mine, forged],
             recovery_commit: None,
@@ -878,7 +868,7 @@ mod tests {
             },
         );
         let op = ActorOp::Incept {
-            workspace: w.as_str().to_string(),
+            space: w.as_str().to_string(),
             nonce,
             devices: vec![attacker_binding, victim_consent],
             recovery_commit: None,
@@ -899,7 +889,7 @@ mod tests {
         // otherwise crash every replica's replay permanently.
         let w = ws();
         let poison = DeviceBinding {
-            device: UserId::from_key_string(format!("\u{20AC}{}", "a".repeat(61))),
+            device: DeviceId::from_key_string(format!("\u{20AC}{}", "a".repeat(61))),
             nonce: [1u8; 16],
             consent: vec![0u8; 64],
         };
@@ -917,7 +907,7 @@ mod tests {
             },
         );
         let op = ActorOp::Incept {
-            workspace: w.as_str().to_string(),
+            space: w.as_str().to_string(),
             nonce,
             devices: vec![mine, poison],
             recovery_commit: None,
@@ -947,7 +937,7 @@ mod tests {
             },
         );
         let op = ActorOp::Incept {
-            workspace: w.as_str().to_string(),
+            space: w.as_str().to_string(),
             nonce,
             devices: vec![binding],
             recovery_commit: None,

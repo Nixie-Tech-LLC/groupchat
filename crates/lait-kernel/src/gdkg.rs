@@ -47,7 +47,7 @@
 //!   contributions it is given; agreeing on the accepted-contributor set under
 //!   partial failure is outside this algebraic prototype.
 //!
-//! This module is not wired into the workspace authority path. It validates that
+//! This module is not wired into the space authority path. It validates that
 //! dealer-free generation yields shares the general-access signer accepts; that
 //! functional result does not establish active-adversary security.
 
@@ -327,7 +327,7 @@ mod tests {
     use crate::policy::OwnershipPolicy;
 
     fn prin(n: u8) -> PrincipalId {
-        PrincipalId::of_device(&crate::crypto::user_from_seed(&[n; 32]))
+        PrincipalId::of_device(&crate::crypto::device_from_seed(&[n; 32]))
     }
     fn key(n: u8) -> OwnershipPolicy {
         OwnershipPolicy::Key(prin(n))

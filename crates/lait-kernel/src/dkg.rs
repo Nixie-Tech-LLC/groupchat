@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::authority::{
     AuthorityConfiguration, AuthorityId, AuthorityScheme, FrostThresholdConfig, PrincipalId,
 };
-use crate::ids::{UserId, WorkspaceId};
+use crate::ids::{DeviceId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
 /// Signing domain for FROST ceremony contributions (bulletin-board packages).
@@ -44,7 +44,7 @@ pub const CEREMONY_DOMAIN: &[u8] = b"lait/space/1/ceremony/2";
 ///   which is what we want — Ed25519 signature bytes are not a canonical
 ///   function of the message across implementations, so hashing the envelope
 ///   could yield two ids for one proposal;
-/// - it is deliberately **not** domain- or workspace-bound (see its docs), so a
+/// - it is deliberately **not** domain- or space-bound (see its docs), so a
 ///   `TranscriptId` is only meaningful within the plane that produced it. Never
 ///   use one as a key in anything shared across planes, and keep the explicit
 ///   `nonce` on both openers: Ed25519 signing is deterministic (RFC 8032), so
@@ -127,7 +127,7 @@ pub enum CeremonyOp {
     /// A DKG round-2 secret share, sealed to recipient device `to`.
     DkgRound2 {
         dkg: TranscriptId,
-        to: UserId,
+        to: DeviceId,
         sealed: Vec<u8>,
     },
     /// Open a threshold-signing transcript over `op`.
@@ -149,7 +149,7 @@ pub enum CeremonyOp {
         /// from anyone else is not a plan. If the coordinator goes away, the
         /// answer is a new transcript with fresh nonces — never a second
         /// coordinator over the same commitments.
-        coordinator: UserId,
+        coordinator: DeviceId,
         op: Vec<u8>,
     },
     /// The coordinator's chosen signing plan for a transcript.
@@ -163,7 +163,7 @@ pub enum CeremonyOp {
     /// Required before an indispensable arrangement (every holder needed) may be
     /// installed. Without it, an N-of-N authority can be created in a state where
     /// one holder's share exists only behind a Windows profile — and the
-    /// workspace discovers this on the day it needs to recover, which is the day
+    /// space discovers this on the day it needs to recover, which is the day
     /// it is too late. The attestation is a signed board event rather than local
     /// state so that no *other* node can install the rotation before every
     /// custodian has actually made the check.
@@ -212,7 +212,7 @@ impl CeremonyOp {
 /// The proposal's signed-node hash is its transcript identity, and that hash
 /// therefore commits to everything above: scheme, configuration payload,
 /// transition kind, the authority being replaced, the nonce, and the
-/// workspace-scoped envelope. An [`AuthorityGrant`] needs only the id because
+/// space-scoped envelope. An [`AuthorityGrant`] needs only the id because
 /// the id already covers the whole decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyCeremonyProposal {
@@ -267,7 +267,7 @@ impl KeyCeremonyProposal {
     }
 
     /// Participant devices, in canonical index order, for a flat-FROST proposal.
-    pub fn frost_devices(&self) -> Option<Vec<UserId>> {
+    pub fn frost_devices(&self) -> Option<Vec<DeviceId>> {
         self.frost_config()?
             .participants
             .iter()
@@ -284,7 +284,7 @@ pub const AUTHORITY_GRANT_DOMAIN: &[u8] = b"lait/space/1/ceremony/2/authority-gr
 /// The recovery authority's statement that one exact key ceremony may run.
 ///
 /// The proposal's hash already commits to the whole configuration — scheme,
-/// threshold, participants, transition, nonce, workspace envelope — so naming it
+/// threshold, participants, transition, nonce, space envelope — so naming it
 /// is the entire content of the decision. A struct rather than bare bytes so a
 /// later field (a policy commitment, say) can ride the same object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,7 +323,7 @@ pub fn frost_rotation_proposal(
 /// Author an authority grant with a solo recovery secret.
 pub fn sign_authority_grant(
     recovery_seed: &[u8; 32],
-    ws: &WorkspaceId,
+    ws: &SpaceId,
     proposal: &TranscriptId,
 ) -> SignedAuthorityGrant {
     let grant = AuthorityGrant {
@@ -342,8 +342,8 @@ pub fn sign_authority_grant(
 /// `group_key`. The aggregated signature assembles into a node identical in
 /// shape to [`sign_authority_grant`]'s output.
 pub fn authority_grant_payload(
-    ws: &WorkspaceId,
-    group_key: &UserId,
+    ws: &SpaceId,
+    group_key: &DeviceId,
     proposal: &TranscriptId,
 ) -> (Vec<u8>, [u8; 32]) {
     let grant = AuthorityGrant {
@@ -355,10 +355,10 @@ pub fn authority_grant_payload(
 }
 
 /// The proposal a grant authorizes, if it is a well-formed grant for this
-/// workspace. `None` otherwise.
+/// space. `None` otherwise.
 ///
 /// Checks, in order: the signature verifies under the grant domain for this
-/// workspace; the payload decodes as an [`AuthorityGrant`]; and the node has no
+/// space; the payload decodes as an [`AuthorityGrant`]; and the node has no
 /// parents. Parents are rejected because a grant is a standalone statement — an
 /// unconstrained parent list is signed-over data with no defined meaning, and
 /// leaving it free would let two grants for one decision differ in their hash
@@ -366,7 +366,7 @@ pub fn authority_grant_payload(
 ///
 /// Says nothing about *whose* key signed it: the caller must still check the
 /// author against the standing recovery authority.
-pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &WorkspaceId) -> Option<AuthorityGrant> {
+pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &SpaceId) -> Option<AuthorityGrant> {
     if !node.verify_sig(AUTHORITY_GRANT_DOMAIN, ws.as_str()) || !node.parents.is_empty() {
         return None;
     }
@@ -374,7 +374,7 @@ pub fn authority_grant_of(node: &SignedAuthorityGrant, ws: &WorkspaceId) -> Opti
 }
 
 /// Sign a [`CeremonyOp`] with the contributing device's seed.
-pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &WorkspaceId) -> SignedNode {
+pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &SpaceId) -> SignedNode {
     sigdag::sign_node(
         CEREMONY_DOMAIN,
         seed,
@@ -388,7 +388,7 @@ pub fn sign_ceremony(seed: &[u8; 32], op: &CeremonyOp, ws: &WorkspaceId) -> Sign
 /// *is* the transcript id when the op is an opener), and the op.
 #[derive(Debug, Clone)]
 pub struct Verified {
-    pub author: UserId,
+    pub author: DeviceId,
     pub id: TranscriptId,
     pub op: CeremonyOp,
 }
@@ -409,7 +409,7 @@ pub struct DkgTranscript {
     ///
     /// Signatures are checked here; whether a signer is the *standing* authority
     /// is the caller's rule, since it needs the space plane.
-    pub auths: BTreeMap<UserId, SignedAuthorityGrant>,
+    pub auths: BTreeMap<DeviceId, SignedAuthorityGrant>,
     /// Round packages referencing this transcript (openers excluded).
     pub rounds: Vec<Verified>,
 }
@@ -423,7 +423,7 @@ pub struct SignTranscript {
 
 impl DkgTranscript {
     /// Devices that have attested portable custody of their share.
-    pub fn custody_acks(&self) -> Vec<UserId> {
+    pub fn custody_acks(&self) -> Vec<DeviceId> {
         self.rounds
             .iter()
             .filter(|v| matches!(v.op, CeremonyOp::CustodyAck { .. }))
@@ -475,7 +475,7 @@ thread_local! {
 /// Note this establishes *authenticity*, not *authorization*: a validly signed
 /// proposal from any device still lands here. Accepting it is
 /// the caller's proposal-authorization check, applied before acting on the board.
-pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
+pub fn parse_board(events: &[SignedNode], ws: &SpaceId) -> CeremonyBoard {
     let mut board = CeremonyBoard::default();
     for ev in events {
         #[cfg(test)]
@@ -594,11 +594,11 @@ fn retain(board: &mut CeremonyBoard) {
     board.dkg.retain(|_, t| t.proposal.is_some());
     board.signing.retain(|_, t| t.request.is_some());
     for t in board.dkg.values_mut() {
-        let participants: Vec<UserId> = match t.proposal.as_ref().map(|p| &p.op) {
+        let participants: Vec<DeviceId> = match t.proposal.as_ref().map(|p| &p.op) {
             Some(CeremonyOp::DkgPropose(p)) => p.frost_devices().unwrap_or_default(),
             _ => Vec::new(),
         };
-        let mut seen: BTreeMap<(UserId, u8, String), ()> = BTreeMap::new();
+        let mut seen: BTreeMap<(DeviceId, u8, String), ()> = BTreeMap::new();
         t.rounds.retain(|v| {
             let Some((kind, extra)) = round_key(&v.op) else {
                 return false;
@@ -613,7 +613,7 @@ fn retain(board: &mut CeremonyBoard) {
 
 impl CeremonyBoard {
     /// The participant set of a DKG transcript's proposal, if the board holds it.
-    fn dkg_participants(&self, id: &TranscriptId) -> Option<Vec<UserId>> {
+    fn dkg_participants(&self, id: &TranscriptId) -> Option<Vec<DeviceId>> {
         match self.dkg.get(id)?.proposal.as_ref().map(|p| &p.op) {
             Some(CeremonyOp::DkgPropose(p)) => p.frost_devices(),
             _ => None,
@@ -637,9 +637,9 @@ impl CeremonyBoard {
     /// rounds, since nothing can establish who may contribute.
     pub fn restrict_signing_rounds(
         &mut self,
-        fallback: impl Fn(&TranscriptId) -> Option<Vec<UserId>>,
+        fallback: impl Fn(&TranscriptId) -> Option<Vec<DeviceId>>,
     ) {
-        let resolved: BTreeMap<TranscriptId, Option<Vec<UserId>>> = self
+        let resolved: BTreeMap<TranscriptId, Option<Vec<DeviceId>>> = self
             .signing
             .iter()
             .map(|(id, t)| {
@@ -657,7 +657,7 @@ impl CeremonyBoard {
             .collect();
         for (id, t) in self.signing.iter_mut() {
             let participants = resolved.get(id).and_then(|p| p.clone());
-            let mut seen: BTreeMap<(UserId, u8, String), ()> = BTreeMap::new();
+            let mut seen: BTreeMap<(DeviceId, u8, String), ()> = BTreeMap::new();
             t.rounds.retain(|v| {
                 let Some((kind, extra)) = round_key(&v.op) else {
                     return false;
@@ -692,12 +692,12 @@ pub type Packages = BTreeMap<u16, Vec<u8>>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DkgManifest {
     pub proposal: TranscriptId,
-    pub proposal_author: UserId,
+    pub proposal_author: DeviceId,
     /// The recovery authority whose authorization we accepted. Recorded so a
     /// later rotation does not un-accept the transcript, while still requiring
     /// that *that* authorization is still on the board — the record pins which
     /// decision was accepted, it does not stand in for one.
-    pub authorized_by: UserId,
+    pub authorized_by: DeviceId,
     /// The arrangement this ceremony creates.
     ///
     /// Stored whole rather than as decoded threshold fields, so the record works
@@ -809,7 +809,7 @@ fn ser<T, E: std::fmt::Display>(r: std::result::Result<T, E>, what: &str) -> Res
     r.map_err(|e| anyhow!("{what}: {e}"))
 }
 
-/// The group public key as a lait `UserId` (a plain Ed25519 key), from a DKG
+/// The group public key as a lait `DeviceId` (a plain Ed25519 key), from a DKG
 /// public-key package. This is the recovery authority the plane commits to.
 /// Check that a private key share is genuinely usable for `index` in the group
 /// described by `public_package`.
@@ -873,7 +873,7 @@ pub fn validate_share(key_share: &[u8], public_package: &[u8], index: u16) -> Re
 /// The authority a `Rotate` installs must come from here, never from a stored
 /// plaintext `-group` artifact: the derivation is cheap and the file is a swap
 /// target that would let a local attacker redirect the rotation.
-pub fn group_key_of_package(pkp: &[u8]) -> Result<UserId> {
+pub fn group_key_of_package(pkp: &[u8]) -> Result<DeviceId> {
     let pkp = ser(
         frost::keys::PublicKeyPackage::deserialize(pkp),
         "deserialize public key package",
@@ -881,9 +881,9 @@ pub fn group_key_of_package(pkp: &[u8]) -> Result<UserId> {
     group_key_of(&pkp)
 }
 
-fn group_key_of(pkp: &frost::keys::PublicKeyPackage) -> Result<UserId> {
+fn group_key_of(pkp: &frost::keys::PublicKeyPackage) -> Result<DeviceId> {
     let bytes = ser(pkp.verifying_key().serialize(), "serialize group key")?;
-    Ok(UserId::from_key_string(
+    Ok(DeviceId::from_key_string(
         data_encoding::HEXLOWER.encode(&bytes),
     ))
 }
@@ -944,7 +944,7 @@ pub fn dkg_round3(
     secret2: &[u8],
     others_round1: &Packages,
     received_round2: &Packages,
-) -> Result<(Vec<u8>, Vec<u8>, UserId)> {
+) -> Result<(Vec<u8>, Vec<u8>, DeviceId)> {
     let secret = ser(
         frost::keys::dkg::round2::SecretPackage::deserialize(secret2),
         "deserialize round2 secret",
@@ -1076,7 +1076,7 @@ pub(crate) mod tests_support {
     /// only thing distinguishing it from a good share is that `s·G` no longer
     /// equals the published verifying share. Returns the forged share, the
     /// matching public package, and the group key.
-    pub fn share_with_foreign_secret() -> (Vec<u8>, Vec<u8>, UserId) {
+    pub fn share_with_foreign_secret() -> (Vec<u8>, Vec<u8>, DeviceId) {
         let (holders, group) = run_dkg(3, 2);
         let mine = frost::keys::KeyPackage::deserialize(&holders[&1].0).unwrap();
         let theirs = frost::keys::KeyPackage::deserialize(&holders[&2].0).unwrap();
@@ -1091,7 +1091,7 @@ pub(crate) mod tests_support {
     }
 
     /// Run a full dealer-free `k`-of-`n` DKG through the byte API.
-    pub fn run_dkg(n: u16, k: u16) -> (Holders, UserId) {
+    pub fn run_dkg(n: u16, k: u16) -> (Holders, DeviceId) {
         let ids: Vec<u16> = (1..=n).collect();
         let mut secret1 = BTreeMap::new();
         let mut round1 = BTreeMap::new();
@@ -1175,7 +1175,7 @@ mod tests {
     /// A flat-FROST rotation proposal for tests. `n` is now derived from the
     /// participant list rather than stated separately, so it cannot disagree
     /// with it.
-    fn test_proposal(nonce: [u8; 16], k: u16, participants: Vec<UserId>) -> KeyCeremonyProposal {
+    fn test_proposal(nonce: [u8; 16], k: u16, participants: Vec<DeviceId>) -> KeyCeremonyProposal {
         let mut principals: Vec<PrincipalId> =
             participants.iter().map(PrincipalId::of_device).collect();
         principals.sort();
@@ -1184,7 +1184,7 @@ mod tests {
             nonce,
             k,
             principals,
-            crate::authority::AuthorityId::single(crate::crypto::user_from_seed(&[200u8; 32])),
+            crate::authority::AuthorityId::single(crate::crypto::device_from_seed(&[200u8; 32])),
         )
     }
 
@@ -1225,8 +1225,8 @@ mod tests {
 
     // ---- transcript identity ----
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&crate::ids::SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&crate::ids::SystemUlidSource)
     }
 
     /// A transcript id only ever reaches the filesystem as `to_hex`, so the
@@ -1298,7 +1298,7 @@ mod tests {
         assert_eq!(parse_board(std::slice::from_ref(&ev), &w).dkg.len(), 1);
         ev.sig = vec![0u8; 64];
         assert!(parse_board(&[ev.clone()], &w).dkg.is_empty());
-        // Nor can it be lifted into a different workspace.
+        // Nor can it be lifted into a different space.
         assert!(parse_board(std::slice::from_ref(&ev), &ws()).dkg.is_empty());
     }
 
@@ -1330,17 +1330,17 @@ mod tests {
 
     // ---- proposal authorization ----
 
-    /// A grant is bound to one proposal in one workspace: it cannot be replayed
-    /// against a different proposal, nor lifted to another workspace.
+    /// A grant is bound to one proposal in one space: it cannot be replayed
+    /// against a different proposal, nor lifted to another space.
     #[test]
-    fn a_grant_binds_to_its_proposal_and_workspace() {
+    fn a_grant_binds_to_its_proposal_and_space() {
         let w = ws();
         let seed = [3u8; 32];
         let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
 
         let grant = sign_authority_grant(&seed, &w, &a);
         assert_eq!(authority_grant_of(&grant, &w).unwrap().proposal, a);
-        // Same signature, different workspace.
+        // Same signature, different space.
         assert!(authority_grant_of(&grant, &ws()).is_none());
         // Tampered payload: the signature no longer covers it.
         let mut swapped = grant.clone();
@@ -1364,7 +1364,7 @@ mod tests {
     fn solo_and_assembled_grants_satisfy_one_verifier() {
         let w = ws();
         let seed = [3u8; 32];
-        let author = crate::crypto::user_from_seed(&seed);
+        let author = crate::crypto::device_from_seed(&seed);
         let a = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
 
         let solo = sign_authority_grant(&seed, &w, &a);
@@ -1467,10 +1467,7 @@ mod tests {
     }
 
     // ---- signing plans and retention ----
-    fn request_with_coordinator(
-        w: &WorkspaceId,
-        coordinator: UserId,
-    ) -> (TranscriptId, SignedNode) {
+    fn request_with_coordinator(w: &SpaceId, coordinator: DeviceId) -> (TranscriptId, SignedNode) {
         let authority = TranscriptId::parse_hex(&"a".repeat(64)).unwrap();
         let req = CeremonyOp::SignRequest {
             nonce: [3u8; 16],
@@ -1489,7 +1486,7 @@ mod tests {
     #[test]
     fn a_plan_from_a_non_coordinator_is_ignored() {
         let w = ws();
-        let coordinator = crate::crypto::user_from_seed(&[50u8; 32]);
+        let coordinator = crate::crypto::device_from_seed(&[50u8; 32]);
         let (signing, rev) = request_with_coordinator(&w, coordinator.clone());
         let plan = test_plan(signing, [(1u16, vec![1])].into_iter().collect());
 
@@ -1527,7 +1524,7 @@ mod tests {
     #[test]
     fn only_one_plan_per_coordinator_is_honoured() {
         let w = ws();
-        let coordinator = crate::crypto::user_from_seed(&[50u8; 32]);
+        let coordinator = crate::crypto::device_from_seed(&[50u8; 32]);
         let (signing, rev) = request_with_coordinator(&w, coordinator.clone());
         let first = test_plan(signing, [(1u16, vec![1])].into_iter().collect());
         let second = test_plan(signing, [(2u16, vec![2])].into_iter().collect());
@@ -1562,7 +1559,7 @@ mod tests {
         let indices: Vec<u16> = commitments.keys().copied().collect();
         SigningPlan {
             signing,
-            authority: crate::authority::AuthorityId::single(crate::crypto::user_from_seed(
+            authority: crate::authority::AuthorityId::single(crate::crypto::device_from_seed(
                 &[201u8; 32],
             )),
             message_commitment: [0u8; 32],
@@ -1570,9 +1567,9 @@ mod tests {
                 .iter()
                 .map(|i| {
                     crate::authority::LeafId::of_principal(
-                        &crate::authority::PrincipalId::of_device(&crate::crypto::user_from_seed(
-                            &[*i as u8; 32],
-                        )),
+                        &crate::authority::PrincipalId::of_device(
+                            &crate::crypto::device_from_seed(&[*i as u8; 32]),
+                        ),
                     )
                 })
                 .collect(),
@@ -1624,7 +1621,7 @@ mod tests {
         // A different authority over the same commitments.
         let mut other_authority = test_plan(a, commitments.clone());
         other_authority.authority =
-            crate::authority::AuthorityId::single(crate::crypto::user_from_seed(&[202u8; 32]));
+            crate::authority::AuthorityId::single(crate::crypto::device_from_seed(&[202u8; 32]));
         assert_ne!(
             base,
             nonce_binding(&a, b"msg", &other_authority),

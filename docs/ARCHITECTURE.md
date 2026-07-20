@@ -30,19 +30,24 @@ dirty notifications, not state; clients re-read the affected projection.
   actor identity, membership, content authority, policy compilation, recovery,
   custody, and cryptographic protocol logic. It does not own Loro documents or
   network connections.
-- `lait-engine` owns Loro containers, storage, history projection, and the
+- `lait-fabric` owns Loro containers, storage, history projection, and the
   plaintext membership document that transports signed kernel events and sealed
   key material.
 - the application crate owns commands, the daemon, iroh transport, sync,
   configuration, local secrets, projections, and product surfaces.
 
-This boundary is intentional. Authority is a pure function of signed inputs;
-replication and persistence move those inputs but do not decide whether they are
-trusted.
+This boundary is intentional. The kernel determines **legitimacy** — identity,
+authority, custody, recovery, and which transitions are valid given signed
+history. The fabric maintains the **shared world** — documents, persistence,
+history, convergence, projection. They are separate crates because the
+dependency edge is a correctness boundary: convergence cannot confer legitimacy.
+Authority is a pure function of signed inputs; replication and persistence move
+those inputs but do not decide whether they are trusted. The two ship, test, and
+version together as lait's substrate.
 
 ## Identity
 
-A device has an ed25519 key represented by `UserId`. A person or agent is an
+A device has an ed25519 key represented by `DeviceId`. A person or agent is an
 `ActorId`, derived from the hash of an inception event. Actors are scoped to a
 space and therefore do not provide a global cross-space identifier.
 
@@ -71,7 +76,7 @@ Lait has three distinct signed planes:
    unsigned CRDT values.
 
 Each plane is a grow-only set of signed, content-addressed events. Replicas
-converge by deterministic replay from the workspace genesis, rejecting invalid
+converge by deterministic replay from the space genesis, rejecting invalid
 signatures, invalid ancestry, unresolved actor claims, and unauthorized actions.
 Loro transports the event sets but does not adjudicate them.
 
@@ -90,7 +95,7 @@ sites listed in the roadmap.
 
 ## Encryption and key epochs
 
-Collaborative payloads are encrypted with a workspace content key. Key epochs
+Collaborative payloads are encrypted with a space content key. Key epochs
 are signed, content-addressed records; concurrent rotations coexist and the
 active tip is selected deterministically. Ciphertext identifies its epoch so
 older held keys remain usable.
@@ -109,8 +114,8 @@ until it can encrypt under the active epoch.
 
 ## Networking
 
-Each device's iroh endpoint key is its device `UserId`. Workspace identity comes
-from a `WorkspaceId` and genesis, not a display name. Tickets carry the workspace
+Each device's iroh endpoint key is its `DeviceId`. Space identity comes
+from a `SpaceId` and genesis, not a display name. Tickets carry the space
 anchor, founder actor information, and optional invite authorization.
 
 Signed gossip announces presence and changed heads. Direct QUIC protocols probe
@@ -124,7 +129,7 @@ The exact compatibility contract is in [`PROTOCOL.md`](./PROTOCOL.md).
 
 Each space has a store containing genesis, Loro snapshots, signed authority
 events, and sealed envelopes. Device secrets, actor recovery material, custody
-shares, petnames, configuration, the inbox, and workspace navigation are local
+shares, petnames, configuration, the inbox, and space navigation are local
 machine state and are not synchronized as collaborative data.
 
 Secrets do touch local disk. The security boundary is that plaintext secrets are

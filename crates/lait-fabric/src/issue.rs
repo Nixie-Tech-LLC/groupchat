@@ -4,7 +4,7 @@
 //! is a single key in the root `LoroMap` resolved by Lamport order (LWW).
 //!
 //! Stored fields:
-//! - `id`, `workspaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
+//! - `id`, `spaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
 //! - `title`, `status`, `priority` — LWW value leaves.
 //! - `description` — `LoroText` (RGA char-merge, co-editable; writes are a
 //!   **splice**, never a full-buffer replace — see [`IssueDoc::set_description`]).
@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use loro::{ExportMode, Frontiers, LoroDoc};
 
 use crate::dto::{CommentDto, CorruptRecord, Priority, Projected, DEFAULT_STATUS};
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
 use crate::loro_ext as lx;
 use crate::op::{self, OpCtx};
@@ -64,7 +64,6 @@ pub(crate) fn project_comment(m: &loro::LoroMap, locus: String) -> Projected<Com
 
 const ROOT: &str = "issue";
 const K_ID: &str = "id";
-const K_WORKSPACE: &str = "workspaceId";
 const K_PROJECT: &str = "projectId";
 const K_TITLE: &str = "title";
 const K_STATUS: &str = "status";
@@ -79,19 +78,19 @@ const C_COMMENTS: &str = "comments";
 /// Parameters for creating a fresh issue.
 pub struct NewIssue {
     pub doc_id: DocId,
-    pub workspace_id: WorkspaceId,
+    pub space_id: SpaceId,
     pub project_id: ProjectId,
     pub title: String,
     pub priority: Priority,
     /// The authoring **actor** (identity), stable across the author's devices.
     pub created_by: ActorId,
     /// The device that committed, recorded as an advisory stamp.
-    pub committed_by: UserId,
+    pub committed_by: DeviceId,
     pub created_at: u64,
     pub body: Option<String>,
     /// The store's stable peer id: one version-vector entry per
     /// store lifetime instead of one per session. `None` (tests, replicas)
-    /// keeps the engine's fresh random peer.
+    /// keeps Loro's fresh random peer.
     pub peer: Option<u64>,
 }
 
@@ -108,7 +107,7 @@ impl IssueDoc {
         op::configure(&doc, spec.peer);
         let root = doc.get_map(ROOT);
         root.insert(K_ID, spec.doc_id.as_str())?;
-        root.insert(K_WORKSPACE, spec.workspace_id.as_str())?;
+        root.insert(lx::K_SPACE, spec.space_id.as_str())?;
         root.insert(K_PROJECT, spec.project_id.as_str())?;
         root.insert(K_TITLE, spec.title.as_str())?;
         root.insert(K_STATUS, DEFAULT_STATUS)?;
@@ -131,7 +130,7 @@ impl IssueDoc {
     }
 
     /// Load from stored/synced snapshot bytes (the only public constructor from
-    /// bytes; it applies the engine's required Loro configuration before any write
+    /// bytes; it applies the fabric's required Loro configuration before any write
     /// can happen on the loaded doc).
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
@@ -141,7 +140,7 @@ impl IssueDoc {
         Ok(Self { doc })
     }
 
-    /// The raw engine handle, restricted to engine internals.
+    /// The raw Loro handle, restricted to fabric internals.
     pub(crate) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
@@ -163,7 +162,7 @@ impl IssueDoc {
     }
 
     /// The issue document's oplog frontiers: the causal head used as the sync
-    /// digest. Engine-internal; external callers use [`Self::head_hash`].
+    /// digest. Fabric-internal; external callers use [`Self::head_hash`].
     pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
@@ -217,8 +216,8 @@ impl IssueDoc {
     pub fn doc_id(&self) -> Option<DocId> {
         lx::get_str(&self.root(), K_ID).and_then(|s| DocId::parse(&s))
     }
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        lx::get_str(&self.root(), K_WORKSPACE).and_then(|s| WorkspaceId::parse(&s))
+    pub fn space_id(&self) -> Option<SpaceId> {
+        lx::get_str(&self.root(), lx::K_SPACE).and_then(|s| SpaceId::parse(&s))
     }
     pub fn project_id(&self) -> Option<ProjectId> {
         lx::get_str(&self.root(), K_PROJECT).and_then(|s| ProjectId::parse(&s))
@@ -321,7 +320,7 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Set the description as a **splice**: the engine computes the minimal
+    /// Set the description as a **splice**: Loro computes the minimal
     /// edit, so a concurrent edit by another peer RGA-merges cleanly instead of
     /// concatenating both full bodies, and the oplog records the actual edit instead of
     /// a delete-all/insert-all pair per save.
@@ -392,8 +391,8 @@ mod tests {
     use super::*;
     use crate::ids::SystemUlidSource;
 
-    fn ws() -> WorkspaceId {
-        WorkspaceId::mint(&SystemUlidSource)
+    fn ws() -> SpaceId {
+        SpaceId::mint(&SystemUlidSource)
     }
     fn prj() -> ProjectId {
         ProjectId::mint(&SystemUlidSource)
@@ -401,25 +400,25 @@ mod tests {
     fn doc() -> DocId {
         DocId::mint(&SystemUlidSource)
     }
-    fn user() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+    fn device() -> DeviceId {
+        DeviceId::from_key_string("a".repeat(64))
     }
     fn actor(c: char) -> ActorId {
         ActorId::from_incept_hash(&c.to_string().repeat(64))
     }
     fn ctx(kind: &str) -> OpCtx {
-        OpCtx::content(kind, &user())
+        OpCtx::content(kind, &device())
     }
 
     fn sample() -> IssueDoc {
         IssueDoc::create(NewIssue {
             doc_id: doc(),
-            workspace_id: ws(),
+            space_id: ws(),
             project_id: prj(),
             title: "fix login".into(),
             priority: Priority::High,
             created_by: actor('a'),
-            committed_by: user(),
+            committed_by: device(),
             created_at: 1000,
             body: Some("the token refresh races".into()),
             peer: None,
@@ -606,7 +605,7 @@ mod tests {
         assert_eq!(hist[0].kind.as_deref(), Some("created"));
         assert_eq!(hist[1].kind.as_deref(), Some("started"));
         assert_eq!(hist[2].kind.as_deref(), Some("finished"));
-        assert_eq!(hist[2].actor, Some(user()));
+        assert_eq!(hist[2].actor, Some(device()));
         assert!(hist[2].ts > 0, "real wall-clock on every change");
         let status_change = hist[2]
             .changes

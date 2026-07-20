@@ -6,10 +6,10 @@
 //! a `DocId` is minted once and is permanent, while a Loro `PeerId`
 //! is an internal, per-session `u64`.
 //!
-//! `UserId` is an ed25519 public key — the same bytes as the iroh `EndpointId`.
+//! `DeviceId` is an ed25519 public key — the same bytes as the iroh `EndpointId`.
 //! Since the `lait/actor/1` cutover it identifies a **device**, not a person: a
 //! member is an [`ActorId`] over a set of device keys, so one human holds many
-//! `UserId`s and rotates them under a stable identity. Read a `UserId` as "which
+//! `DeviceId`s and rotates them under a stable identity. Read a `DeviceId` as "which
 //! device", an `ActorId` as "who".
 
 use std::fmt;
@@ -130,12 +130,12 @@ macro_rules! prefixed_id {
 }
 
 prefixed_id!(
-    /// Workspace id — minted at `workspace init` and committed by genesis.
-    WorkspaceId, "ws_"
+    /// Space id — minted at `space init` and committed by genesis.
+    SpaceId, "ws_"
 );
 
-impl WorkspaceId {
-    /// Derive a **self-certifying** workspace id from a 16-byte digest that
+impl SpaceId {
+    /// Derive a **self-certifying** space id from a 16-byte digest that
     /// commits to the founding device + salt (`lait/space/1`): `ws_<crockford128>`.
     /// The id is bound to its trust root rather than random, so a joiner can
     /// verify a ticket's founder anchor against the id (see [`crate::space`]).
@@ -181,9 +181,9 @@ prefixed_id!(
 /// transport peers, signature authors, and `committedBy` stamps — never to
 /// answer "who did this".
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct UserId(String);
+pub struct DeviceId(String);
 
-impl UserId {
+impl DeviceId {
     /// Parse a 64-char lowercase-hex ed25519 public key.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
@@ -200,9 +200,9 @@ impl UserId {
     ///
     /// Only use this where the value's provenance guarantees a device key. It
     /// is not a parser: reaching for it on a string read back out of a document
-    /// launders whatever is there into a `UserId`, and post-cutover those
+    /// launders whatever is there into a `DeviceId`, and post-cutover those
     /// strings are often `ActorId`s — a type lie that then mis-attributes
-    /// silently downstream. Use [`UserId::parse`] there instead.
+    /// silently downstream. Use [`DeviceId::parse`] there instead.
     pub fn from_key_string(s: String) -> Self {
         Self(s)
     }
@@ -217,7 +217,7 @@ impl UserId {
     }
 }
 
-impl fmt::Display for UserId {
+impl fmt::Display for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -226,10 +226,10 @@ impl fmt::Display for UserId {
 /// An actor id — the **self-certifying** identity of a member (`lait/actor/1`):
 /// `act_` + the blake3 content-address of the actor's `Incept` event, 64
 /// lowercase hex chars. An actor is a *set of device keys under one
-/// self-managed key-event log*; a `UserId` (device key) signs, an `ActorId`
+/// self-managed key-event log*; a `DeviceId` (device key) signs, an `ActorId`
 /// *is someone*. Not an ed25519 key — it never verifies a signature — and
 /// content-independent of any device key, so devices rotate under a stable
-/// identity. Minted per-workspace (the `Incept` payload binds the workspace id
+/// identity. Minted per-space (the `Incept` payload binds the space id
 /// + a nonce), so the same human is unlinkable across spaces by default.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActorId(String);
@@ -359,11 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn userid_validates_ed25519_hex() {
+    fn device_id_validates_ed25519_hex() {
         let key = "a".repeat(64);
-        assert!(UserId::parse(&key).is_some());
-        assert!(UserId::parse("tooshort").is_none());
-        assert!(UserId::parse(&"g".repeat(64)).is_none(), "non-hex rejected");
-        assert_eq!(UserId::parse(&key).unwrap().short().len(), 8);
+        assert!(DeviceId::parse(&key).is_some());
+        assert!(DeviceId::parse("tooshort").is_none());
+        assert!(
+            DeviceId::parse(&"g".repeat(64)).is_none(),
+            "non-hex rejected"
+        );
+        assert_eq!(DeviceId::parse(&key).unwrap().short().len(), 8);
     }
 }

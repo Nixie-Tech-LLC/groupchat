@@ -27,7 +27,7 @@
 //! Trust maximum unchanged: replay is deterministic (topo order, remove-wins,
 //! sponsor cascade), undecodable ops are opaque DAG nodes (ancestry, no
 //! state), and the E2EE epoch remains the recency fence (removal rotates the
-//! workspace key so a removed actor's devices cannot read forward).
+//! space key so a removed actor's devices cannot read forward).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::{self, ActorPlane, SignedEvent};
 use crate::genesis::Genesis;
-use crate::ids::{ActorId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, SpaceId};
 use crate::sigdag::{self, SignedNode};
 
 pub const ACL_DOMAIN: &[u8] = b"lait/aclop/1";
@@ -74,14 +74,14 @@ pub enum AclAction {
     AddAgent {
         actor: ActorId,
     },
-    /// Mint a workspace key epoch. **Signed, and authorized only when its
+    /// Mint a space key epoch. **Signed, and authorized only when its
     /// author holds admin standing** — re-keying decides who reads future content
     /// (a membership-authority action), so the key lifecycle rides the exact trust
     /// boundary as add/remove-member: a departed member cannot mint itself
     /// continued read access, and a replica adopts an epoch only when a valid mint
     /// authorizes it, never because it merely appeared in the synced doc. `gen` is
     /// bounded at replay to `max(ancestor mint gen) + 1` (no generation jump can
-    /// pin the tip or overflow). `key_commit = blake3(workspace_key)` binds the
+    /// pin the tip or overflow). `key_commit = blake3(space_key)` binds the
     /// (unsigned, per-device) sealed envelopes — a device accepts an unsealed key
     /// only if its hash matches, so a forged envelope is inert. Grow-only and
     /// orthogonal to the member set (no subject actor); concurrent mints coexist
@@ -201,25 +201,14 @@ impl AclOp {
 
 /// Sign an [`AclOp`] with the author's ed25519 device seed, given the current
 /// heads as parents. Uses the same envelope bindings as every signed plane.
-pub fn sign_op(
-    seed: &[u8; 32],
-    op: &AclOp,
-    parents: Vec<String>,
-    workspace_id: &WorkspaceId,
-) -> SignedOp {
-    sigdag::sign_node(
-        ACL_DOMAIN,
-        seed,
-        op.encode(),
-        parents,
-        workspace_id.as_str(),
-    )
+pub fn sign_op(seed: &[u8; 32], op: &AclOp, parents: Vec<String>, space_id: &SpaceId) -> SignedOp {
+    sigdag::sign_node(ACL_DOMAIN, seed, op.encode(), parents, space_id.as_str())
 }
 
 /// The materialized ACL state after replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AclState {
-    /// Every actor sealed into the workspace, humans and agents alike, with
+    /// Every actor sealed into the space, humans and agents alike, with
     /// their grants. Agents carry no grants.
     members: BTreeMap<ActorId, BTreeSet<Grant>>,
     /// agent actor → sponsoring actor. Every key here is also in `members`;
@@ -267,7 +256,7 @@ impl AclState {
     pub fn rekey_fences(&self) -> &[RekeyFence] {
         &self.rekey_fences
     }
-    /// Whether `a` is sealed into the workspace (humans and agents alike).
+    /// Whether `a` is sealed into the space (humans and agents alike).
     pub fn is_member(&self, a: &ActorId) -> bool {
         self.members.contains_key(a)
     }
@@ -345,7 +334,7 @@ impl AclState {
 pub struct AuditEntry {
     pub hash: String,
     /// The signing device key (verified — the signature covers the op).
-    pub author: UserId,
+    pub author: DeviceId,
     /// The actor the author claimed (its device→actor binding is part of the
     /// verdict).
     pub by: Option<ActorId>,
@@ -374,7 +363,7 @@ pub fn replay_with_audit(
     actor_events: &[SignedEvent],
     ops: &[SignedOp],
 ) -> (AclState, Vec<AuditEntry>) {
-    let ws = &genesis.workspace_id;
+    let ws = &genesis.space_id;
 
     // Index signature-valid ops by hash. Undecodable ops stay as opaque DAG
     // nodes (ancestry, no state) — the forward-compat rule in the module docs.
@@ -395,7 +384,7 @@ pub fn replay_with_audit(
     // Memoized at-frontier actor resolution: the same (device, actor, asof)
     // claim resolves identically everywhere, so cache by (actor, sorted asof).
     let mut planes: HashMap<Vec<String>, ActorPlane> = HashMap::new();
-    let mut device_speaks_for = |device: &UserId, by: &ActorId, asof: &[String]| -> bool {
+    let mut device_speaks_for = |device: &DeviceId, by: &ActorId, asof: &[String]| -> bool {
         let mut key: Vec<String> = asof.to_vec();
         key.sort();
         let plane = planes
@@ -845,8 +834,8 @@ mod tests {
         [n; 32]
     }
 
-    /// A one-device actor for seed `n` in workspace `w`.
-    fn incept(n: u8, w: &WorkspaceId) -> (SignedEvent, ActorId) {
+    /// A one-device actor for seed `n` in space `w`.
+    fn incept(n: u8, w: &SpaceId) -> (SignedEvent, ActorId) {
         actor::incept_single(&seed(n), w, [n; 16], [n.wrapping_add(70); 16], None)
     }
 
@@ -858,7 +847,7 @@ mod tests {
         actors: BTreeMap<u8, ActorId>,
     }
     fn fx(founder: u8, others: &[u8]) -> Fx {
-        let wsid = WorkspaceId::mint(&SystemUlidSource);
+        let wsid = SpaceId::mint(&SystemUlidSource);
         let mut events = Vec::new();
         let mut actors = BTreeMap::new();
         for n in std::iter::once(founder).chain(others.iter().copied()) {
@@ -868,7 +857,7 @@ mod tests {
         }
         Fx {
             genesis: Genesis {
-                workspace_id: wsid,
+                space_id: wsid,
                 founding_actors: vec![actors[&founder].clone()],
                 salt: [0u8; 16],
                 recovery_root: [0u8; 32],
@@ -890,7 +879,7 @@ mod tests {
                     nonce: None,
                 },
                 parents,
-                &self.genesis.workspace_id,
+                &self.genesis.space_id,
             )
         }
         fn op_nonce(
@@ -911,7 +900,7 @@ mod tests {
                     nonce: Some(nonce),
                 },
                 parents,
-                &self.genesis.workspace_id,
+                &self.genesis.space_id,
             )
         }
         fn replay(&self, ops: &[SignedOp]) -> AclState {
@@ -1007,7 +996,7 @@ mod tests {
         // Founder binds a second device (seed 9) to their actor...
         let binding = consent_sign(
             &seed(9),
-            f.genesis.workspace_id.as_str(),
+            f.genesis.space_id.as_str(),
             [90u8; 16],
             &ConsentCtx::Member { actor: f.a(1) },
         );
@@ -1018,7 +1007,7 @@ mod tests {
                 binding,
             },
             vec![f.a(1).incept_hash().to_string()],
-            &f.genesis.workspace_id,
+            &f.genesis.space_id,
         );
         let mut events = f.events.clone();
         events.push(add_dev.clone());
@@ -1036,7 +1025,7 @@ mod tests {
                 nonce: None,
             },
             vec![],
-            &f.genesis.workspace_id,
+            &f.genesis.space_id,
         );
         let st = replay(&f.genesis, &events, std::slice::from_ref(&op));
         assert!(
@@ -1432,7 +1421,7 @@ mod tests {
         // cannot mint a key-epoch: re-keying is a membership-authority action, so
         // a non-admin's mint never authorizes and never enters the epoch set. This
         // is the fence that stops a departed/rogue writer from re-keying the
-        // workspace to a key it controls.
+        // space to a key it controls.
         let f = fx(1, &[2]);
         let add_writer = f.op(
             1,
@@ -1617,7 +1606,7 @@ mod tests {
         assert!(
             !st.is_member(f.a(3)),
             "revoke must win over a concurrent redemption — an actor admitted \
-             by a nonce that was concurrently revoked keeps the workspace key"
+             by a nonce that was concurrently revoked keeps the space key"
         );
     }
 

@@ -10,7 +10,7 @@
 //!   * `board_movable_list_converges` — board ordering (movable list)
 //!   * `catalog_docs_grow_set_converges` — the `docs` grow-only key set
 //!
-//! Post-contract note: these tests exercise the sealed engine surface only
+//! Post-contract note: these tests exercise the sealed fabric surface only
 //! (`docs/DATA-CONTRACT.md`) — replicas fork via `from_snapshot`, mutate through
 //! the typed writers, land ops with `apply(OpCtx)`, and exchange bytes through
 //! `oplog_vv_bytes`/`export_from_bytes`/`import`. No raw kernel handle exists
@@ -26,22 +26,22 @@ use proptest::prelude::*;
 
 use lait::catalog::CatalogDoc;
 use lait::dto::Priority;
-use lait::engine::op::OpCtx;
-use lait::ids::{ActorId, DocId, LabelId, ProjectId, SystemUlidSource, UserId, WorkspaceId};
+use lait::fabric::op::OpCtx;
+use lait::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId, SystemUlidSource};
 use lait::issue::{IssueDoc, NewIssue};
 
 /// A fixed creation timestamp — never varied, so it can never be the reason two
 /// replicas differ.
 const CREATED_AT: u64 = 1_000;
 
-fn tester() -> UserId {
-    UserId::from_key_string("a".repeat(64))
+fn tester() -> DeviceId {
+    DeviceId::from_key_string("a".repeat(64))
 }
 fn ctx() -> OpCtx {
     OpCtx::content("test", &tester())
 }
 
-/// The engine surface a convergence test needs from any replicated doc.
+/// The fabric surface a convergence test needs from any replicated doc.
 trait Replica {
     fn vv(&self) -> Vec<u8>;
     fn export_missing(&self, peer_vv: &[u8]) -> Vec<u8>;
@@ -130,7 +130,7 @@ fn catalog_replica_from(snap: &[u8]) -> CatalogDoc {
 fn base_issue() -> IssueDoc {
     IssueDoc::create(NewIssue {
         doc_id: DocId::mint(&SystemUlidSource),
-        workspace_id: WorkspaceId::mint(&SystemUlidSource),
+        space_id: SpaceId::mint(&SystemUlidSource),
         project_id: ProjectId::mint(&SystemUlidSource),
         title: "base title".into(),
         priority: Priority::None,
@@ -251,9 +251,9 @@ proptest! {
         n_replicas in 2usize..=3,
         ops in prop::collection::vec((0u8..3, set_op_strategy()), 0..40),
     ) {
-        // Fixed pools of 4 users and 4 labels, minted once and shared by every
+        // Fixed pools of 4 actors and 4 labels, minted once and shared by every
         // replica (so add/remove target the same keys across replicas).
-        let users: Vec<ActorId> =
+        let actors: Vec<ActorId> =
             (0..4).map(|i| ActorId::from_incept_hash(&format!("{:064x}", i + 1))).collect();
         let labels: Vec<LabelId> = (0..4).map(|_| LabelId::mint(&SystemUlidSource)).collect();
 
@@ -263,8 +263,8 @@ proptest! {
         for (who, op) in &ops {
             let r = &replicas[(*who as usize) % n_replicas];
             match op {
-                SetOp::AddAssignee(i) => r.add_assignee(&users[*i]).unwrap(),
-                SetOp::RemoveAssignee(i) => r.remove_assignee(&users[*i]).unwrap(),
+                SetOp::AddAssignee(i) => r.add_assignee(&actors[*i]).unwrap(),
+                SetOp::RemoveAssignee(i) => r.remove_assignee(&actors[*i]).unwrap(),
                 SetOp::AddLabel(i) => r.add_label(&labels[*i]).unwrap(),
                 SetOp::RemoveLabel(i) => r.remove_label(&labels[*i]).unwrap(),
             }
@@ -328,7 +328,7 @@ proptest! {
         ops in prop::collection::vec((0u8..3, board_op_strategy()), 0..40),
     ) {
         // Shared base catalog: one project + K issues already on the board.
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -337,7 +337,7 @@ proptest! {
         for n in 0..k {
             let issue = IssueDoc::create(NewIssue {
                 doc_id: DocId::mint(&SystemUlidSource),
-                workspace_id: ws.clone(),
+                space_id: ws.clone(),
                 project_id: project.clone(),
                 title: format!("issue {n}"),
                 priority: Priority::None,
@@ -414,7 +414,7 @@ proptest! {
         n_replicas in 2usize..=3,
         registrations in prop::collection::vec(0u8..3, 0..30),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -431,7 +431,7 @@ proptest! {
             let c = &replicas[(*who as usize) % n_replicas];
             let issue = IssueDoc::create(NewIssue {
                 doc_id: DocId::mint(&SystemUlidSource),
-                workspace_id: ws.clone(),
+                space_id: ws.clone(),
                 project_id: project.clone(),
                 title: "grow".into(),
                 priority: Priority::None,
@@ -480,7 +480,7 @@ proptest! {
         n_replicas in 2usize..=3,
         moves in prop::collection::vec((0u8..3, 0usize..6, prop::option::of(0usize..6)), 0..30),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let project = ProjectId::mint(&SystemUlidSource);
         base.add_project(&project, "Engineering", "ENG", "blue").unwrap();
@@ -549,7 +549,7 @@ proptest! {
         n_replicas in 2usize..=3,
         ops in prop::collection::vec((0u8..3, 0usize..4, 0usize..4, any::<bool>()), 0..40),
     ) {
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let base = CatalogDoc::create(&ws, "test", None, &tester()).unwrap();
         let doc_ids: Vec<DocId> = (0..4).map(|_| DocId::mint(&SystemUlidSource)).collect();
         base.apply(&ctx());

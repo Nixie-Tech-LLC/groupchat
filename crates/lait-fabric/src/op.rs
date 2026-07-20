@@ -1,5 +1,5 @@
 //! Every commit carries a request kind, an advisory committing-device claim,
-//! and a trust tier. The engine is configured so those commits survive as distinct, timestamped,
+//! and a trust tier. Loro is configured so those commits survive as distinct, timestamped,
 //! self-labelled changes in the oplog instead of fusing into one anonymous blob.
 //!
 //! The crate pins Loro 1.13.6, whose configuration makes these details
@@ -21,7 +21,7 @@
 use loro::LoroDoc;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::UserId;
+use crate::ids::DeviceId;
 
 /// Trust tier of an operation. The tier is a property of the request kind,
 /// never a caller choice. Authority operations still require signed replay;
@@ -58,21 +58,21 @@ pub struct OpCtx {
     pub request: String,
     /// Advisory committing-device claim, not proof of authorship. It travels in
     /// the commit message so remote changes retain device attribution.
-    pub actor: UserId,
+    pub actor: DeviceId,
     pub tier: Tier,
 }
 
 impl OpCtx {
-    pub fn content(request: impl Into<String>, actor: &UserId) -> Self {
+    pub fn content(request: impl Into<String>, actor: &DeviceId) -> Self {
         Self::new(request, actor, Tier::Content)
     }
-    pub fn structure(request: impl Into<String>, actor: &UserId) -> Self {
+    pub fn structure(request: impl Into<String>, actor: &DeviceId) -> Self {
         Self::new(request, actor, Tier::Structure)
     }
-    pub fn authority(request: impl Into<String>, actor: &UserId) -> Self {
+    pub fn authority(request: impl Into<String>, actor: &DeviceId) -> Self {
         Self::new(request, actor, Tier::Authority)
     }
-    fn new(request: impl Into<String>, actor: &UserId, tier: Tier) -> Self {
+    fn new(request: impl Into<String>, actor: &DeviceId, tier: Tier) -> Self {
         OpCtx {
             request: request.into(),
             actor: actor.clone(),
@@ -110,12 +110,12 @@ impl OpMeta {
             .and_then(|m| serde_json::from_str(m).ok())
             .unwrap_or_default()
     }
-    pub fn actor_id(&self) -> Option<UserId> {
-        self.actor.as_deref().and_then(UserId::parse)
+    pub fn actor_id(&self) -> Option<DeviceId> {
+        self.actor.as_deref().and_then(DeviceId::parse)
     }
 }
 
-/// Engine configuration applied by every wrapper constructor
+/// Loro configuration applied by every wrapper constructor
 /// before any op is written or imported.
 pub(super) fn configure(doc: &LoroDoc, peer: Option<u64>) {
     doc.set_record_timestamp(true);
@@ -136,8 +136,8 @@ pub(super) fn commit_with(doc: &LoroDoc, ctx: &OpCtx) {
 mod tests {
     use super::*;
 
-    fn actor() -> UserId {
-        UserId::from_key_string("a".repeat(64))
+    fn actor() -> DeviceId {
+        DeviceId::from_key_string("a".repeat(64))
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
     fn commits_stay_distinct_and_survive_reload() {
         // The load-bearing fact: N applies = N changes in the oplog, with real
         // timestamps and messages, after an export/import round trip. Under
-        // engine defaults this collapses to ONE anonymous change.
+        // Loro's defaults this collapses to ONE anonymous change.
         let doc = LoroDoc::new();
         configure(&doc, Some(7));
         for i in 0..5 {

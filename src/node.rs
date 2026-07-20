@@ -53,19 +53,23 @@ use crate::{
         StatusInfo,
     },
     dto::{Candidate, JoinRequestDto, SeedDto},
-    ids::{SystemUlidSource, UserId},
-    index::{resolve_user_dir, KnownUser, UserResolution},
+    ids::{DeviceId, SystemUlidSource},
+    index::{resolve_device_dir, DeviceResolution, KnownDevice},
     presence::PeerState,
-    proto::{InviteGrant, Payload, SignedInvite, SignedMessage, WorkspaceTicket},
+    proto::{InviteGrant, Payload, SignedInvite, SignedMessage, SpaceTicket},
     replica::{DirtySet, Replica},
     store::Store,
 };
 
-// Presence-probe ALPN. Bumped to /1 in lockstep with the epoch-1 wire changes
-// (the workspace-identity rewrite + the sync `protocol_version` handshake) and
-// the gossip topic tag, so a version skew that partitions sync/gossip also
-// partitions the liveness probe rather than leaving cross-epoch peers half-visible.
-const PRESENCE_ALPN: &[u8] = b"lait/presence/1";
+/// Presence-probe ALPN. Moves in lockstep with [`crate::sync::SYNC_ALPN`] and
+/// the gossip topic tag, so a version skew that partitions sync/gossip also
+/// partitions the liveness probe rather than leaving cross-epoch peers
+/// half-visible. Epoch 1 carried the space-identity rewrite and the sync
+/// `protocol_version` handshake; epoch 2 carries the space-vocabulary flag day.
+///
+/// Public so transport tests negotiate the ALPN the daemon actually uses rather
+/// than a copy of its spelling that an epoch bump would silently strand.
+pub const PRESENCE_ALPN: &[u8] = b"lait/presence/2";
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REAP_INTERVAL: Duration = Duration::from_secs(5);
@@ -169,7 +173,7 @@ pub struct SeedRecord {
     #[serde(default)]
     pub nick: String,
     #[serde(default)]
-    pub workspace: String,
+    pub space: String,
 }
 
 fn seeds_path(home: &Path) -> PathBuf {
@@ -202,12 +206,12 @@ fn seed_ids(home: &Path, me: EndpointId) -> Vec<EndpointId> {
 }
 
 /// Upsert a seed into the registry keyed by endpoint id (the id is the identity;
-/// nick/workspace refresh in place). Returns true when it was newly pinned.
+/// nick/space refresh in place). Returns true when it was newly pinned.
 fn upsert_seed(home: &Path, rec: SeedRecord) -> bool {
     let mut seeds = load_seeds(home);
     if let Some(existing) = seeds.iter_mut().find(|s| s.id == rec.id) {
         existing.nick = rec.nick;
-        existing.workspace = rec.workspace;
+        existing.space = rec.space;
         save_seeds(home, &seeds);
         false
     } else {
@@ -279,11 +283,11 @@ fn upsert_alias(home: &Path, key: &str, name: &str) {
     save_aliases(home, &aliases);
 }
 
-/// Map ambiguous user matches into the shared [`Candidate`] shape so the CLI and
+/// Map ambiguous device matches into the shared [`Candidate`] shape so the CLI and
 /// `--json` render them through the same disambiguation path as issue refs
 /// `reff` is the short key, `key_alias` the optional nickname, and `title` the full
 /// key so the caller can copy an unambiguous value.
-fn user_candidates(cands: &[KnownUser]) -> Vec<Candidate> {
+fn device_candidates(cands: &[KnownDevice]) -> Vec<Candidate> {
     cands
         .iter()
         .map(|c| Candidate {
@@ -352,7 +356,7 @@ impl ProtocolHandler for SyncHandler {
 /// topic; binding the redeemer means a *copied* blob can only ever admit that
 /// actor, not an eavesdropper re-pairing it with its own inception.
 fn seal_bound_invite(
-    host: &UserId,
+    host: &DeviceId,
     invite: &SignedInvite,
     redeemer: &crate::ids::ActorId,
 ) -> Option<Vec<u8>> {
@@ -366,7 +370,7 @@ fn seal_bound_invite(
 /// inception is refused. `my_seed` is the host's identity seed.
 fn open_bound_invite(
     my_seed: &[u8; 32],
-    me: &UserId,
+    me: &DeviceId,
     sealed: &[u8],
     incept: &crate::actor::SignedEvent,
 ) -> Option<SignedInvite> {
@@ -450,7 +454,7 @@ fn subscribe_should_reset(cursor: u64, oldest: u64) -> bool {
 pub struct Shared {
     /// Our display nick. Mutable so a `ConfigReload` (from `lait config set
     /// user.nick`) applies live instead of waiting for a restart. There is no
-    /// room here: the gossip topic is a pure function of the workspace id.
+    /// room here: the gossip topic is a pure function of the space id.
     pub nick: Arc<Mutex<String>>,
     pub my_id: EndpointId,
     pub presence: Arc<Mutex<HashMap<EndpointId, Peer>>>,
@@ -473,9 +477,9 @@ pub struct Node {
     /// newly-seen peer id is registered here so the endpoint's bare-id dials
     /// resolve — a no-op under Public (n0 discovery), the mechanism under Local.
     peers: crate::net::PeerBook,
-    /// This daemon's workspace id (constant). Bound into every signed gossip
-    /// message so a message cannot be replayed onto another workspace's topic.
-    workspace: String,
+    /// This daemon's space id (constant). Bound into every signed gossip
+    /// message so a message cannot be replayed onto another space's topic.
+    space: String,
     router: Router,
     shared: Shared,
     shutdown: Arc<Notify>,
@@ -494,7 +498,7 @@ pub struct Node {
     /// Bounded and NEVER persisted here — an inception only enters the synced
     /// membership doc when an admin actually admits (redeem/approve), so an
     /// unauthenticated peer cannot grow the shared container (amplification DoS).
-    pending_incepts: Arc<Mutex<HashMap<UserId, crate::actor::SignedEvent>>>,
+    pending_incepts: Arc<Mutex<HashMap<DeviceId, crate::actor::SignedEvent>>>,
     /// This node's home dir, used to persist the bootstrap peer set across restarts.
     home: PathBuf,
 }
@@ -692,7 +696,7 @@ impl Node {
                 // unauthenticated peer cannot grow the container.
                 if let Some(incept) = &incept {
                     const MAX_PENDING_INCEPTS: usize = 256;
-                    let dev = UserId::from_key_string(from.to_string());
+                    let dev = DeviceId::from_key_string(from.to_string());
                     let mut pend = self.pending_incepts.lock().unwrap();
                     if pend.contains_key(&dev) || pend.len() < MAX_PENDING_INCEPTS {
                         pend.insert(dev, incept.clone());
@@ -709,17 +713,17 @@ impl Node {
                 self.clone().trigger_pull(from);
             }
             Payload::Announce {
-                workspace,
+                space,
                 catalog_head,
             } => {
                 self.touch(from, None);
                 let (our_ws, our_head) = {
                     let t = self.replica.lock().unwrap();
-                    (t.workspace_str(), t.sync_head_bytes())
+                    (t.space_str(), t.sync_head_bytes())
                 };
                 // Only pull when the peer's catalog head differs from ours — the
                 // An unchanged catalog head suppresses redundant pull storms.
-                if workspace == our_ws && catalog_head != our_head {
+                if space == our_ws && catalog_head != our_head {
                     self.clone().trigger_pull(from);
                 }
             }
@@ -771,12 +775,12 @@ impl Node {
 
     /// Broadcast our current catalog head so peers that are behind pull from us.
     async fn broadcast_announce(&self) -> Result<()> {
-        let (workspace, catalog_head) = {
+        let (space, catalog_head) = {
             let t = self.replica.lock().unwrap();
-            (t.workspace_str(), t.sync_head_bytes())
+            (t.space_str(), t.sync_head_bytes())
         };
         self.broadcast(Payload::Announce {
-            workspace,
+            space,
             catalog_head,
         })
         .await
@@ -810,7 +814,7 @@ impl Node {
 
     async fn broadcast(&self, payload: Payload) -> Result<()> {
         let bytes =
-            SignedMessage::sign_and_encode(&self.workspace, &self.secret_key.to_bytes(), &payload)?;
+            SignedMessage::sign_and_encode(&self.space, &self.secret_key.to_bytes(), &payload)?;
         let sender = self.sender.lock().unwrap().clone();
         sender
             .broadcast(bytes)
@@ -839,20 +843,20 @@ impl Node {
         Ok(())
     }
 
-    /// Connect to the bound workspace's mesh through a ticket: join the topic,
+    /// Connect to the bound space's mesh through a ticket: join the topic,
     /// broadcast our join request, announce, and eagerly pull from the host to
     /// backfill. The store was already bootstrapped by the CLI
-    /// ([`crate::replica::join_workspace_store`]) — a ticket for a *different*
-    /// workspace is a hard error, never an adoption: a daemon is only ever
-    /// subscribed to its own workspace's topic, so split-brain is structurally
+    /// ([`crate::replica::join_space_store`]) — a ticket for a *different*
+    /// space is a hard error, never an adoption: a daemon is only ever
+    /// subscribed to its own space's topic, so split-brain is structurally
     /// impossible.
-    async fn connect_workspace(self: &Arc<Self>, ticket: &WorkspaceTicket) -> Result<()> {
-        let bound = self.replica.lock().unwrap().workspace_str();
-        if ticket.workspace != bound {
+    async fn connect_space(self: &Arc<Self>, ticket: &SpaceTicket) -> Result<()> {
+        let bound = self.replica.lock().unwrap().space_str();
+        if ticket.space != bound {
             anyhow::bail!(
                 "this store is bound to space {bound}, but the invite is for {} — \
                  run `lait join` from a directory that isn't already a space",
-                ticket.workspace
+                ticket.space
             );
         }
         // Under Isolated the host is reachable only at the addresses the ticket
@@ -869,8 +873,8 @@ impl Node {
         let sealed_invite = match (&ticket.invite, &incept) {
             (Some(inv), Some(ic)) => {
                 let redeemer = crate::ids::ActorId::from_incept_hash(&ic.hash());
-                let host_user = UserId::from_key_string(ticket.host.to_string());
-                seal_bound_invite(&host_user, inv, &redeemer)
+                let host_device = DeviceId::from_key_string(ticket.host.to_string());
+                seal_bound_invite(&host_device, inv, &redeemer)
             }
             _ => None,
         };
@@ -890,7 +894,7 @@ impl Node {
     /// an admin approves us, we hold ciphertext and cannot read the board.
     /// So we tell the joiner the truth and point at the one next step, instead of
     /// implying success. If we resolved to an already-member (a re-join), say so.
-    fn join_message(&self, ticket: &WorkspaceTicket) -> String {
+    fn join_message(&self, ticket: &SpaceTicket) -> String {
         let host = if ticket.host_nick.is_empty() {
             "the space admin".to_string()
         } else {
@@ -918,32 +922,32 @@ impl Node {
         }
     }
 
-    /// Pin a seed. Accepts two forms: a full `WorkspaceTicket` for the
-    /// workspace this store is bound to (connect + backfill — the primary path),
-    /// or a bare endpoint id (pin only, for a peer we already share a workspace
-    /// with). A ticket for a *foreign* workspace is an error — join it first.
+    /// Pin a seed. Accepts two forms: a full `SpaceTicket` for the
+    /// space this store is bound to (connect + backfill — the primary path),
+    /// or a bare endpoint id (pin only, for a peer we already share a space
+    /// with). A ticket for a *foreign* space is an error — join it first.
     /// Either way the pin is persisted so restarts always dial and backfill.
     async fn seed_add(self: &Arc<Self>, arg: &str) -> Result<Response> {
         // Try the ticket form first; a bare id will not decode as a ticket.
-        if let Ok(ticket) = arg.parse::<WorkspaceTicket>() {
+        if let Ok(ticket) = arg.parse::<SpaceTicket>() {
             let id = ticket.host;
             if id == self.shared.my_id {
                 return Ok(Response::err("that ticket points at this node's own id"));
             }
-            let bound = self.replica.lock().unwrap().workspace_str();
-            if ticket.workspace != bound {
+            let bound = self.replica.lock().unwrap().space_str();
+            if ticket.space != bound {
                 return Ok(Response::err(format!(
                     "that ticket is for a different space ({}) — join it first: `lait join <ticket>`",
-                    ticket.workspace
+                    ticket.space
                 )));
             }
-            self.connect_workspace(&ticket).await?;
+            self.connect_space(&ticket).await?;
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
                     id,
                     nick: ticket.host_nick.clone(),
-                    workspace: ticket.workspace.clone(),
+                    space: ticket.space.clone(),
                 },
             );
             self.clone().trigger_pull(id);
@@ -958,13 +962,13 @@ impl Node {
             if id == self.shared.my_id {
                 return Ok(Response::err("that's this node's own id"));
             }
-            let workspace = self.replica.lock().unwrap().workspace_str();
+            let space = self.replica.lock().unwrap().space_str();
             let newly = upsert_seed(
                 &self.home,
                 SeedRecord {
                     id,
                     nick: String::new(),
-                    workspace,
+                    space,
                 },
             );
             self.clone().trigger_pull(id);
@@ -992,7 +996,7 @@ impl Node {
             match receiver.try_next().await {
                 Ok(Some(event)) => match event {
                     Event::Received(msg) => {
-                        match SignedMessage::verify_and_decode(&self.workspace, &msg.content) {
+                        match SignedMessage::verify_and_decode(&self.space, &msg.content) {
                             Ok((from, payload)) => self.handle_payload(from, payload).await,
                             // A decode failure here is almost always a version-skewed
                             // peer: postcard is not self-describing, so a payload whose
@@ -1131,13 +1135,13 @@ impl Node {
         }
     }
 
-    /// Our key as a [`UserId`]; the endpoint ID is the Ed25519 key.
-    fn my_userid(&self) -> UserId {
-        UserId::from_key_string(self.shared.my_id.to_string())
+    /// Our key as a [`DeviceId`]; the endpoint ID is the Ed25519 key.
+    fn my_device_id(&self) -> DeviceId {
+        DeviceId::from_key_string(self.shared.my_id.to_string())
     }
 
     /// Pattern A: try to auto-admit `joiner` against a presented invite. Verifies
-    /// the issuer signature, the workspace binding, and expiry here (transport
+    /// the issuer signature, the space binding, and expiry here (transport
     /// concerns), then hands the state-dependent checks + sealing to the replica's
     /// `redeem_invite`. Best-effort: any failure is a silent fallback to the
     /// classic pending-request flow, so a bad/expired/foreign invite never blocks
@@ -1155,7 +1159,7 @@ impl Node {
         // kept the nonce off the topic — and only for the actor it names, so a
         // blob copied off the wire cannot be re-paired with an eavesdropper's
         // inception.
-        let me = UserId::from_key_string(self.shared.my_id.to_string());
+        let me = DeviceId::from_key_string(self.shared.my_id.to_string());
         let Some(invite) = open_bound_invite(&self.secret_key.to_bytes(), &me, &sealed, &incept)
         else {
             return;
@@ -1170,8 +1174,8 @@ impl Node {
         }
         let (changed, dirty) = {
             let mut t = self.replica.lock().unwrap();
-            // Bind the grant to *our* workspace before doing anything.
-            if grant.workspace != t.workspace_str() {
+            // Bind the grant to *our* space before doing anything.
+            if grant.space != t.space_str() {
                 return;
             }
             let (_resp, dirty) = t.redeem_invite(&issuer, &incept, &grant.nonce, grant.single_use);
@@ -1188,7 +1192,7 @@ impl Node {
         }
     }
 
-    /// Assemble the user-reference resolution directory. Keys are gathered
+    /// Assemble the who-ref resolution directory. Keys are gathered
     /// from every place we've seen one — our own id, the live presence map, recent
     /// join requests, and the signed ACL members — so any of them resolves by
     /// `@me` / full key / id-prefix. **Names come only from the local alias store**
@@ -1196,20 +1200,20 @@ impl Node {
     /// unauthenticated name must never resolve to a key. A key with no alias is
     /// still resolvable, just not by name. This is what turns `members add bob`
     /// (after `--as bob`) and `assign ENG-1 c3ab21` into real keys.
-    fn user_directory(&self) -> Vec<KnownUser> {
-        let mut keys: HashSet<UserId> = HashSet::new();
-        keys.insert(self.my_userid());
+    fn device_directory(&self) -> Vec<KnownDevice> {
+        let mut keys: HashSet<DeviceId> = HashSet::new();
+        keys.insert(self.my_device_id());
         {
             let presence = self.shared.presence.lock().unwrap();
             for id in presence.keys() {
-                keys.insert(UserId::from_key_string(id.to_string()));
+                keys.insert(DeviceId::from_key_string(id.to_string()));
             }
         }
         {
             let (events, _) = self.shared.events.lock().unwrap().since(0);
             for e in &events {
                 if e.kind == EventKind::Join {
-                    keys.insert(UserId::from_key_string(e.id.clone()));
+                    keys.insert(DeviceId::from_key_string(e.id.clone()));
                 }
             }
         }
@@ -1226,7 +1230,7 @@ impl Node {
                     .find(|a| a.key == key.as_str())
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
-                KnownUser { key, nick }
+                KnownDevice { key, nick }
             })
             .collect()
     }
@@ -1264,7 +1268,7 @@ impl Node {
         out
     }
 
-    /// Resolve the user-refs carried by a request (local-alias / id-prefix → full
+    /// Resolve the who-refs carried by a request (local-alias / id-prefix → full
     /// key) against the directory, before the replica sees them. Returns
     /// the rewritten request, or an early `Response` (not-found / ambiguous) to
     /// send back verbatim. Only the ref-bearing requests are touched; everything
@@ -1280,16 +1284,16 @@ impl Node {
         ) {
             return Ok(req);
         }
-        let dir = self.user_directory();
-        let me = self.my_userid();
+        let dir = self.device_directory();
+        let me = self.my_device_id();
         let resolve = |who: &str| -> std::result::Result<String, Response> {
-            match resolve_user_dir(who, &me, &dir) {
-                UserResolution::One(u) => Ok(u.as_str().to_string()),
-                UserResolution::Zero => {
+            match resolve_device_dir(who, &me, &dir) {
+                DeviceResolution::One(u) => Ok(u.as_str().to_string()),
+                DeviceResolution::Zero => {
                     Err(Response::not_found(format!("no user matches '{who}'")))
                 }
-                UserResolution::Many(c) => Err(Response::Candidates {
-                    candidates: user_candidates(&c),
+                DeviceResolution::Many(c) => Err(Response::Candidates {
+                    candidates: device_candidates(&c),
                     near_miss_for: None,
                 }),
             }
@@ -1371,7 +1375,7 @@ impl Node {
     }
 
     async fn dispatch(self: Arc<Self>, req: Request) -> Result<Response> {
-        // Resolve nick / id-prefix user-refs to full keys before the replica sees
+        // Resolve nick / id-prefix who-refs to full keys before the replica sees
         // them; a not-found / ambiguous ref short-circuits with its own response.
         let req = match self.resolve_refs_in(req) {
             Ok(r) => r,
@@ -1438,7 +1442,7 @@ impl Node {
                 // If this device's inception was stashed from a join request,
                 // make it known now — admin-gated persistence, only on this
                 // explicit approve action (not on the raw request).
-                if let Some(dev) = UserId::parse(&who) {
+                if let Some(dev) = DeviceId::parse(&who) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
                         let _ = self.replica.lock().unwrap().import_inception(&incept);
@@ -1462,7 +1466,7 @@ impl Node {
             // Sponsor an agent: import its stashed inception (from the agent's
             // join) so the replica can resolve its actor, then dispatch.
             Request::AgentAdd { key } => {
-                if let Some(dev) = UserId::parse(&key) {
+                if let Some(dev) = DeviceId::parse(&key) {
                     let pending = self.pending_incepts.lock().unwrap().get(&dev).cloned();
                     if let Some(incept) = pending {
                         let _ = self.replica.lock().unwrap().import_inception(&incept);
@@ -1510,9 +1514,9 @@ impl Node {
             // against the full directory (alias / id-prefix / key), then records
             // the name locally — never synced, never a signed op.
             Request::MemberAlias { who, name } => {
-                let dir = self.user_directory();
-                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
-                    UserResolution::One(u) => {
+                let dir = self.device_directory();
+                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                    DeviceResolution::One(u) => {
                         let name = name.trim();
                         upsert_alias(&self.home, u.as_str(), name);
                         let msg = if name.is_empty() {
@@ -1522,11 +1526,11 @@ impl Node {
                         };
                         Ok(Response::Ok { message: Some(msg) })
                     }
-                    UserResolution::Zero => {
+                    DeviceResolution::Zero => {
                         Ok(Response::not_found(format!("no user matches '{who}'")))
                     }
-                    UserResolution::Many(c) => Ok(Response::Candidates {
-                        candidates: user_candidates(&c),
+                    DeviceResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: device_candidates(&c),
                         near_miss_for: None,
                     }),
                 }
@@ -1544,17 +1548,17 @@ impl Node {
                 // Key-first: resolve strictly by id-prefix / full key against the
                 // pending set. Empty nicks here mean the joiner's self-asserted name
                 // is NOT a resolution input — an unauthenticated nick must never
-                // select who gets sealed the workspace key. The approver attaches a
+                // select who gets sealed the space key. The approver attaches a
                 // *trusted* local petname via `as_name`.
-                let dir: Vec<KnownUser> = pending
+                let dir: Vec<KnownDevice> = pending
                     .iter()
-                    .map(|r| KnownUser {
-                        key: UserId::from_key_string(r.key.clone()),
+                    .map(|r| KnownDevice {
+                        key: DeviceId::from_key_string(r.key.clone()),
                         nick: String::new(),
                     })
                     .collect();
-                match resolve_user_dir(who.trim(), &self.my_userid(), &dir) {
-                    UserResolution::One(u) => {
+                match resolve_device_dir(who.trim(), &self.my_device_id(), &dir) {
+                    DeviceResolution::One(u) => {
                         let key = u.as_str().to_string();
                         // Import the joiner's stashed inception (from its join
                         // request) so the replica can resolve its actor — admin-
@@ -1577,12 +1581,12 @@ impl Node {
                         }
                         Ok(resp)
                     }
-                    UserResolution::Zero => Ok(Response::not_found(format!(
+                    DeviceResolution::Zero => Ok(Response::not_found(format!(
                         "no pending join request matches '{who}' — approve by key or \
                          id-prefix (see `lait members requests`)"
                     ))),
-                    UserResolution::Many(c) => Ok(Response::Candidates {
-                        candidates: user_candidates(&c),
+                    DeviceResolution::Many(c) => Ok(Response::Candidates {
+                        candidates: device_candidates(&c),
                         near_miss_for: None,
                     }),
                 }
@@ -1601,7 +1605,7 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let (workspace, name, issues, projects, membership) = {
+                let (space, name, issues, projects, membership) = {
                     let t = self.replica.lock().unwrap();
                     let membership = if t.am_i_admin() {
                         "admin"
@@ -1611,8 +1615,8 @@ impl Node {
                         "pending"
                     };
                     (
-                        Some(t.workspace_id().to_string()),
-                        t.workspace_name(),
+                        Some(t.space_id().to_string()),
+                        t.space_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
@@ -1628,7 +1632,7 @@ impl Node {
                     nick: self.shared.nick(),
                     name,
                     online_peers,
-                    workspace,
+                    space,
                     issues,
                     projects,
                     membership,
@@ -1637,7 +1641,7 @@ impl Node {
                     recovery,
                 })))
             }
-            Request::Diagnose { expected_workspace } => {
+            Request::Diagnose { expected_space } => {
                 // Gather the same live state `Status` does, then project it into
                 // the ordered onboarding gates (pure core, unit-tested separately).
                 let online_peers = self
@@ -1648,7 +1652,7 @@ impl Node {
                     .values()
                     .filter(|p| p.presence.is_online())
                     .count();
-                let (workspace, name, issues, projects, membership) = {
+                let (space, name, issues, projects, membership) = {
                     let t = self.replica.lock().unwrap();
                     let membership = if t.am_i_admin() {
                         "admin"
@@ -1658,8 +1662,8 @@ impl Node {
                         "pending"
                     };
                     (
-                        t.workspace_id().to_string(),
-                        t.workspace_name(),
+                        t.space_id().to_string(),
+                        t.space_name(),
                         t.issue_count(),
                         t.project_count(),
                         membership.to_string(),
@@ -1674,13 +1678,13 @@ impl Node {
                     )
                 };
                 let view = crate::diagnose::diagnose(crate::diagnose::DiagnoseInput {
-                    workspace: Some(workspace.as_str()),
+                    space: Some(space.as_str()),
                     name: name.as_str(),
                     membership: membership.as_str(),
                     online_peers,
                     projects,
                     issues,
-                    expected_workspace: expected_workspace.as_deref(),
+                    expected_space: expected_space.as_deref(),
                     degraded_recovery: &degraded_recovery,
                     rekey_pending: rekey_pending.as_deref(),
                     local_custody: Some(&local_custody),
@@ -1695,7 +1699,7 @@ impl Node {
                 reusable,
                 ttl_hours,
             } => {
-                let (workspace, name) = {
+                let (space, name) = {
                     let t = self.replica.lock().unwrap();
                     // Only an admin can meaningfully onboard: `redeem_invite`
                     // honors a pre-authorization only from an admin device, and a
@@ -1703,10 +1707,10 @@ impl Node {
                     // than hand back a ticket that can never admit anyone.
                     if !t.am_i_admin() {
                         return Ok(Response::err(
-                            "only an admin can mint an invite — ask a workspace admin",
+                            "only an admin can mint an invite — ask a space admin",
                         ));
                     }
-                    (t.workspace_str(), t.workspace_name())
+                    (t.space_str(), t.space_name())
                 };
                 // Default: embed a signed, single-use pre-authorization so the
                 // joiner is auto-admitted (Pattern A). `--require-approval` mints a
@@ -1716,12 +1720,11 @@ impl Node {
                 } else {
                     const DEFAULT_TTL_HOURS: u64 = 24 * 7;
                     let ttl_secs = ttl_hours.unwrap_or(DEFAULT_TTL_HOURS).saturating_mul(3600);
-                    let grant =
-                        InviteGrant::mint(workspace.clone(), now_secs(), ttl_secs, !reusable);
+                    let grant = InviteGrant::mint(space.clone(), now_secs(), ttl_secs, !reusable);
                     SignedInvite::sign(&self.secret_key.to_bytes(), &grant).ok()
                 };
                 // Carry the verifiable founding proof (salt + founder inception),
-                // NOT a bare anchor string. The joiner checks the workspace id
+                // NOT a bare anchor string. The joiner checks the space id
                 // commits to it, so a non-founder's invite still roots the joiner
                 // on the TRUE founder and a tampered anchor is rejected — every
                 // correctly-joined node holds the same proof (lait/space/1).
@@ -1730,7 +1733,7 @@ impl Node {
                         Some(p) => p,
                         None => {
                             return Ok(Response::err(
-                                "this workspace has no founding proof — cannot mint an invite",
+                                "this space has no founding proof — cannot mint an invite",
                             ))
                         }
                     };
@@ -1742,8 +1745,8 @@ impl Node {
                 } else {
                     vec![]
                 };
-                let ticket = WorkspaceTicket {
-                    workspace,
+                let ticket = SpaceTicket {
+                    space,
                     name,
                     host: self.shared.my_id,
                     host_nick: self.shared.nick(),
@@ -1758,12 +1761,12 @@ impl Node {
                 })
             }
             Request::Join { ticket } | Request::Connect { ticket } => {
-                let ticket: WorkspaceTicket = ticket.parse().context("parse workspace ticket")?;
+                let ticket: SpaceTicket = ticket.parse().context("parse space ticket")?;
                 // The CLI already bootstrapped this store from the ticket
-                // (`replica::join_workspace_store`) and registered it; the
+                // (`replica::join_space_store`) and registered it; the
                 // daemon's part is transport only — connect, request admission,
                 // backfill.
-                self.connect_workspace(&ticket).await?;
+                self.connect_space(&ticket).await?;
                 Ok(Response::Ok {
                     message: Some(self.join_message(&ticket)),
                 })
@@ -1784,7 +1787,7 @@ impl Node {
                         SeedDto {
                             id: s.id.to_string(),
                             nick: s.nick,
-                            workspace: s.workspace,
+                            space: s.space,
                             state: state.to_string(),
                             online,
                         }
@@ -1906,25 +1909,25 @@ impl Node {
         }
     }
 
-    /// Refresh this store's row in the machine-level workspace registry —
-    /// advisory navigation state (name + project keys for `lait workspaces`).
+    /// Refresh this store's row in the machine-level space registry —
+    /// advisory navigation state (name + project keys for `lait spaces`).
     /// Best-effort: registry failure never affects daemon operation. The
     /// registry's merge keeps `origin`/`host_nick` from the init/join upsert.
     fn refresh_registry_row(&self) {
-        let (workspace, name, projects) = {
+        let (space, name, projects) = {
             let t = self.replica.lock().unwrap();
-            (t.workspace_str(), t.workspace_name(), t.project_briefs())
+            (t.space_str(), t.space_name(), t.project_briefs())
         };
-        if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
-            workspace,
+        if let Err(e) = crate::spaces::upsert(crate::spaces::SpaceEntry {
+            space,
             name,
             path: self.home.display().to_string(),
-            origin: crate::workspaces::Origin::default(),
+            origin: crate::spaces::Origin::default(),
             host_nick: String::new(),
             last_opened: now_secs(),
             projects,
         }) {
-            tracing::debug!("workspace registry refresh failed: {e:#}");
+            tracing::debug!("space registry refresh failed: {e:#}");
         }
     }
 
@@ -1936,7 +1939,7 @@ impl Node {
         *self.last_active.lock().unwrap() = Instant::now();
     }
 
-    /// Whether this node belongs to a shared workspace it should stay online to
+    /// Whether this node belongs to a shared space it should stay online to
     /// serve (DUR-3). True if it currently tracks any peer, or has ever persisted
     /// one in `peers.json`, meaning it has meshed with someone at least once.
     /// A node that has never met a peer is solo/ephemeral and may idle out.
@@ -2098,12 +2101,12 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
 
     // Replica core: open the git-backed store. The store must already be
     // initialized (`lait init` / `lait join`) — a daemon never founds a
-    // workspace as a side effect of starting.
+    // space as a side effect of starting.
     let store = Store::open(&home)?;
     // The transport keypair is constructed from lait's identity seed here, at the
     // net edge — the seed itself is the identity (see config::load_or_create_identity).
     let secret_key = SecretKey::from_bytes(&identity_seed);
-    let me = UserId::from_key_string(secret_key.public().to_string());
+    let me = DeviceId::from_key_string(secret_key.public().to_string());
     let replica = Replica::open(
         store,
         me,
@@ -2111,20 +2114,20 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         identity_seed,
         Box::new(SystemUlidSource),
     )?;
-    // Register/refresh this store in the machine-level workspace registry so
-    // founders and joiners alike show up in `lait workspaces` and resolve via
+    // Register/refresh this store in the machine-level space registry so
+    // founders and joiners alike show up in `lait spaces` and resolve via
     // `-w`. Best-effort (navigation state, never a gate); the merge keeps the
     // origin/host_nick recorded by `lait init`/`lait join`.
-    if let Err(e) = crate::workspaces::upsert(crate::workspaces::WorkspaceEntry {
-        workspace: replica.workspace_str(),
-        name: replica.workspace_name(),
+    if let Err(e) = crate::spaces::upsert(crate::spaces::SpaceEntry {
+        space: replica.space_str(),
+        name: replica.space_name(),
         path: home.display().to_string(),
-        origin: crate::workspaces::Origin::default(),
+        origin: crate::spaces::Origin::default(),
         host_nick: String::new(),
         last_opened: now_secs(),
         projects: replica.project_briefs(),
     }) {
-        tracing::warn!("workspace registry upsert failed: {e:#}");
+        tracing::warn!("space registry upsert failed: {e:#}");
     }
     let replica = Arc::new(Mutex::new(replica));
 
@@ -2175,9 +2178,9 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         tracing::warn!("no home relay after 30s — continuing; peers may be unreachable");
     }
 
-    // The topic is a pure function of the workspace id — no user-settable
+    // The topic is a pure function of the space id — no user-settable
     // network name, so a cold boot can never subscribe to the wrong topic.
-    let topic = crate::proto::topic_for_workspace(&replica.lock().unwrap().workspace_str());
+    let topic = crate::proto::topic_for_space(&replica.lock().unwrap().space_str());
     // Seed gossip bootstrap from previously-seen peers so a restart actively
     // rejoins the mesh instead of waiting to be re-announced, unioned with the
     // explicit, sticky seed pins so a restart always dials its
@@ -2212,14 +2215,14 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         tracing::info!("running as an always-on seed — idle-shutdown disabled");
     }
 
-    let workspace = replica.lock().unwrap().workspace_str();
+    let space = replica.lock().unwrap().space_str();
     let node = Arc::new(Node {
         endpoint,
         gossip,
         sender: Mutex::new(sender),
         secret_key,
         peers,
-        workspace,
+        space,
         router,
         shared,
         shutdown: Arc::new(Notify::new()),
@@ -2266,8 +2269,8 @@ pub async fn run_daemon(home: PathBuf, seed: bool) -> Result<()> {
         let t = node.replica.lock().unwrap();
         tracing::info!(
             "lait daemon online as {my_id} in space '{}' ({})",
-            t.workspace_name(),
-            t.workspace_str()
+            t.space_name(),
+            t.space_str()
         );
     }
 
@@ -2327,13 +2330,13 @@ mod tests {
     #[test]
     fn a_sealed_invite_binds_to_its_redeemer_and_hides_from_the_topic() {
         use crate::actor::incept_single;
-        use crate::ids::{SystemUlidSource, WorkspaceId};
+        use crate::ids::{SpaceId, SystemUlidSource};
         use crate::proto::{InviteGrant, SignedInvite};
 
-        let ws = WorkspaceId::mint(&SystemUlidSource);
+        let ws = SpaceId::mint(&SystemUlidSource);
         let host_seed = [10u8; 32];
         let host_sk = SecretKey::from_bytes(&host_seed);
-        let host = UserId::from_key_string(host_sk.public().to_string());
+        let host = DeviceId::from_key_string(host_sk.public().to_string());
 
         // The legit joiner and an eavesdropper, each with their own actor.
         let (j_incept, j_actor) = incept_single(&[11u8; 32], &ws, [1u8; 16], [2u8; 16], None);
@@ -2356,10 +2359,10 @@ mod tests {
             "a copied blob cannot admit a different actor"
         );
         // And a non-host cannot even read the blob — the nonce stays off the topic.
-        let atk_user =
-            UserId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
+        let atk_device =
+            DeviceId::from_key_string(SecretKey::from_bytes(&[12u8; 32]).public().to_string());
         assert!(
-            open_bound_invite(&[12u8; 32], &atk_user, &sealed, &j_incept).is_none(),
+            open_bound_invite(&[12u8; 32], &atk_device, &sealed, &j_incept).is_none(),
             "only the host can open the sealed invite"
         );
     }
@@ -2448,7 +2451,7 @@ mod tests {
             SeedRecord {
                 id: a,
                 nick: "nas".into(),
-                workspace: "ws".into()
+                space: "ws".into()
             }
         ));
         assert!(!upsert_seed(
@@ -2456,7 +2459,7 @@ mod tests {
             SeedRecord {
                 id: a,
                 nick: "nas2".into(),
-                workspace: "ws".into()
+                space: "ws".into()
             }
         ));
         assert_eq!(load_seeds(&dir).len(), 1);
@@ -2467,7 +2470,7 @@ mod tests {
             SeedRecord {
                 id: b,
                 nick: String::new(),
-                workspace: "ws".into()
+                space: "ws".into()
             }
         ));
         // Bootstrap ids list both, but filter out our own id when we are `a`.

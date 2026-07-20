@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
+use crate::ids::{ActorId, DeviceId, DocId, LabelId, ProjectId, SpaceId};
 
 /// Schema version gate. Every top-level DTO carries it so a reader
 /// can detect drift; bump on any additive change.
@@ -22,7 +22,21 @@ use crate::ids::{ActorId, DocId, LabelId, ProjectId, UserId, WorkspaceId};
 /// v2: the actor-identity cutover (`lait/actor/1`) — members, assignees, and
 /// attribution are keyed by `ActorId` over a self-managed device set, replacing
 /// the `person ≡ key ≡ device` model.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3: the space-vocabulary flag day — `genesis.json` keys the space id under
+/// `space_id`, and every Loro document stamps it under `spaceId`. A v2 store
+/// spells both the old way, so a v3 reader would open it and then project an
+/// absent space id; see [`MIN_SUPPORTED_SCHEMA`].
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// The oldest on-disk schema this build will open.
+///
+/// A lower bound exists because "older is fine" is only true while every older
+/// shape is still *readable*. v2 stores are not: their space id sits under keys
+/// v3 does not look at, so opening one succeeds and then silently projects a
+/// store with no space. Refusing is the honest outcome — there is no migration,
+/// and a store that opens wrong is worse than a store that will not open.
+pub const MIN_SUPPORTED_SCHEMA: u32 = 3;
 
 /// Issue priority. Stored inside the issue document as a lowercase
 /// string leaf and projected here.
@@ -289,7 +303,7 @@ pub struct Row {
     /// The assignee keys behind that summary.
     ///
     /// Both, not one. `assignee_summary` is *rendered* — it resolves "you" against
-    /// the local `UserId` and collapses the tail into `+2`, which is exactly right
+    /// the local `DeviceId` and collapses the tail into `+2`, which is exactly right
     /// for a CLI row and useless to a client that wants to draw faces. The keys are
     /// already in `RowMeta` (cached viewer-neutrally, precisely so the summary can
     /// be computed per-viewer), so this projects them rather than making every
@@ -337,7 +351,7 @@ pub struct IssueView {
     pub schema_version: u32,
     pub reff: String,
     pub doc_id: DocId,
-    pub workspace_id: WorkspaceId,
+    pub space_id: SpaceId,
     pub project_id: ProjectId,
     pub project_key: Option<String>,
     pub key_alias: Option<String>,
@@ -376,7 +390,7 @@ pub struct ActivityEvent {
     pub reff: String,
     pub kind: String,
     pub changes: Vec<FieldChange>,
-    pub actor: Option<UserId>,
+    pub actor: Option<DeviceId>,
     pub actor_nick: String,
     pub text: String,
     pub ts: u64,
@@ -453,7 +467,7 @@ pub struct InboxEntry {
     pub actor_nick: Option<String>,
 }
 
-/// A workspace member projection. Roles come from the
+/// A space member projection. Roles come from the
 /// signed ACL graph — the only cryptographically-verified identity in the system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDto {
@@ -518,8 +532,8 @@ pub struct SeedDto {
     pub id: String,
     /// Advisory nick (empty when pinned by bare id).
     pub nick: String,
-    /// The workspace id the seed serves.
-    pub workspace: String,
+    /// The space id the seed serves.
+    pub space: String,
     /// "online" | "away" | "offline" from the live presence map.
     pub state: String,
     /// Whether the seed is currently reachable.

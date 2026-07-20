@@ -10,7 +10,7 @@
 //! **Two identities, deliberately not unified.** Anything this module reads
 //! *out of the document* — comment authors, assignees — is an [`ActorId`]: a
 //! person, stable across their devices. Anything read *off the change itself*
-//! (`DocChange::actor`, `ImportDelta::actors`) is a [`UserId`]: the device that
+//! (`DocChange::actor`, `ImportDelta::actors`) is a [`DeviceId`]: the device that
 //! committed, self-asserted in the commit message. The feed keeps them apart on
 //! purpose — "who wrote this" and "which device landed it" answer different
 //! questions, and collapsing the latter into an actor loses the fact you want
@@ -25,9 +25,10 @@ use std::collections::{HashMap, HashSet};
 use loro::{Container, Frontiers, LoroDoc, ID};
 
 use crate::dto::{self, CommentDto, CorruptRecord, FieldChange, Projected};
-use crate::ids::{ActorId, UserId};
+use crate::ids::{ActorId, DeviceId};
 
 use crate::issue::{project_comment, IssueDoc};
+use crate::loro_ext as lx;
 use crate::op::OpMeta;
 
 /// One oplog change of an issue doc, projected for the history feed.
@@ -38,7 +39,7 @@ pub struct DocChange {
     /// The **device** that committed, as claimed in the commit message — a
     /// `committedBy` stamp, not authorship. Advisory and self-asserted
     /// It is never resolved to an actor. See the module note.
-    pub actor: Option<UserId>,
+    pub actor: Option<DeviceId>,
     /// Unix seconds (0 for changes written without recorded timestamps).
     pub ts: u64,
     /// True when this change was made concurrently with another branch.
@@ -78,12 +79,12 @@ pub struct ImportDelta {
     pub collision: bool,
     /// Distinct committing **devices** of the incoming changes, from their
     /// commit messages. Advisory; see [`DocChange::actor`].
-    pub actors: Vec<UserId>,
+    pub actors: Vec<DeviceId>,
     /// Distinct request kinds of the incoming changes.
     pub kinds: Vec<String>,
 }
 
-/// Opaque pre-import capture (the engine's `loro::*` types never leave the module).
+/// Opaque pre-import capture (Loro's `loro::*` types never leave the module).
 pub struct ImportMark {
     frontiers: Frontiers,
     vv: loro::VersionVector,
@@ -239,7 +240,7 @@ fn set_changes(adds: &[ActorId], removes: &[ActorId]) -> Vec<FieldChange> {
 
 /// Root-map keys that are identity, not activity — creation constants whose
 /// presence in a diff is noise.
-const IDENTITY_KEYS: [&str; 4] = ["id", "workspaceId", "createdBy", "createdAt"];
+const IDENTITY_KEYS: [&str; 4] = ["id", lx::K_SPACE, "createdBy", "createdAt"];
 
 /// What one `diff(from, to)` batch yielded. A struct rather than a tuple: the
 /// corruption sidecar makes five fields, and positional returns stop being

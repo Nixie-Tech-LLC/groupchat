@@ -307,7 +307,7 @@ export function IssueDetail({
               options={members.map((m) => ({
                 id: m.key,
                 label: nameOf(m.key, m),
-                icon: <Avatar userKey={m.key} alias={m.alias} me={m.me} size="sm" />,
+                icon: <Avatar deviceKey={m.key} alias={m.alias} me={m.me} size="sm" />,
                 // The key prefix, because the petname is the *unverified* half of
                 // the identity — Members.tsx makes the same point at full width.
                 hint: m.key.slice(0, 6),
@@ -315,7 +315,7 @@ export function IssueDetail({
               }))}
               onToggle={(key) => {
                 const add = !issue.assignees.includes(key);
-                // `who` takes `me`/`@me` or a **full 64-hex key** — `index::resolve_user`
+                // `who` takes `me`/`@me` or a **full 64-hex key** — `index::resolve_device`
                 // does not consult the member directory, so a petname would 404. The
                 // key is what we hold and the key is what we send.
                 void send(() => rpc(spaceId, { cmd: "assign", reff, who: [key], add }));
@@ -620,7 +620,7 @@ type Entry =
  *
  * - **Comments come from the issue document.** They sync and carry a real author.
  * - **Events come from the durable oplog.** Real actors, real timestamps, no
- *   synthetic `synced` marker (that belongs to the workspace Activity feed).
+ *   synthetic `synced` marker (that belongs to the space Activity feed).
  *
  * `commented` events are dropped: a comment is already rendered from the document,
  * so keeping its event too would double-print it.
@@ -663,7 +663,7 @@ function Timeline({
         {/* Said once, quietly. This feed is durable and attributed now — worth
             saying, because it wasn't before. */}
         <span
-          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The workspace-wide Activity view is a lighter, per-session feed.)"
+          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The space-wide Activity view is a lighter, per-session feed.)"
           className="cursor-help"
         >
           <Info className="size-3" />
@@ -691,7 +691,7 @@ function Comment({ comment: c, member }: { comment: CommentDto; member: MemberDt
   return (
     <article className="flex gap-2">
       <Avatar
-        userKey={c.author}
+        deviceKey={c.author}
         // The in-doc `author_nick` is what the author *claimed*; the local alias is
         // what you decided they are. Prefer yours — it is the half that was verified.
         alias={member?.alias || c.author_nick || ""}

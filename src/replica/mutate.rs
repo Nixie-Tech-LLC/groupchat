@@ -80,7 +80,7 @@ impl Replica {
         let doc_id = DocId::mint(&*self.clock);
         let issue = IssueDoc::create(NewIssue {
             doc_id: doc_id.clone(),
-            workspace_id: self.workspace_id.clone(),
+            space_id: self.space_id.clone(),
             project_id: project.id.clone(),
             title: title.clone(),
             priority,
@@ -437,10 +437,10 @@ impl Replica {
             Ok(id) => id,
             Err(resp) => return Ok((resp, None)),
         };
-        let mut users = Vec::new();
+        let mut actors = Vec::new();
         for w in &who {
             match self.resolve_actor(w) {
-                Some(a) => users.push(a),
+                Some(a) => actors.push(a),
                 None => {
                     return Ok((
                         Response::not_found(format!("no known member matches '{w}'")),
@@ -455,7 +455,7 @@ impl Replica {
             let issue = self
                 .issue(&doc_id)?
                 .ok_or_else(|| anyhow!("issue body not present"))?;
-            for u in &users {
+            for u in &actors {
                 if add {
                     issue.add_assignee(u)?;
                 } else {
@@ -620,12 +620,7 @@ impl Replica {
             by: me_actor.clone(),
             actor_asof: self.membership.actor_heads(&me_actor),
         };
-        let signed = authz::sign_authz(
-            &self.seed,
-            &op,
-            self.catalog.authz_heads(),
-            &self.workspace_id,
-        );
+        let signed = authz::sign_authz(&self.seed, &op, self.catalog.authz_heads(), &self.space_id);
         self.catalog.add_authz_op(&signed)?;
         // The tombstone flag + board membership are a cache of the replay.
         let tombstoned = self.authz_state().is_tombstoned(&doc_id);
@@ -792,7 +787,7 @@ impl Replica {
             return Ok((Response::err("an issue cannot be its own parent"), None));
         }
         // validate-then-commit: reject a locally visible cycle before staging
-        // any op (the engine's CyclicMoveError is the backstop; concurrent
+        // any op (Loro's CyclicMoveError is the backstop; concurrent
         // cross-peer cycles are resolved by the merge itself).
         let mut cur = parent_id.clone();
         while let Some(p) = cur {

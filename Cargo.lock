@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "lait"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2864,7 +2864,7 @@ dependencies = [
  "iroh-base",
  "iroh-gossip",
  "iroh-relay",
- "lait-engine",
+ "lait-fabric",
  "lait-kernel",
  "libc",
  "n0-future",
@@ -2890,8 +2890,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "lait-engine"
-version = "0.5.2"
+name = "lait-fabric"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "lait-kernel"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
