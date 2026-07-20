@@ -2921,7 +2921,7 @@ impl Tracker {
     /// signature via a FROST ceremony and assembles the same event (the plane
     /// verifies one signature either way — the threshold is invisible here).
     ///
-    /// [`bootstrap_root_epoch_if_needed`]: Self::bootstrap_root_epoch_if_needed
+    /// The private `bootstrap_root_epoch_if_needed` helper performs the re-key.
     pub fn space_recover_cmd(&mut self) -> (Response, Option<DirtySet>) {
         let cur = crate::space::replay(
             &self.genesis,

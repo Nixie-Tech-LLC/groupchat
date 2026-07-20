@@ -110,7 +110,7 @@ daemon, or the wire changed.
   has always been `control.rs`, but every client so far was a local process that could
   speak a named pipe; a browser cannot. This is the one adapter that closes the gap —
   the same `Request`/`Response`, the same `Doorbell` stream, re-bound to a socket a
-  browser can reach. The engine grew a port, not a UI. See `docs/SERVE.md`.
+  browser can reach. The engine grew a port, not a UI. See `docs/UI.md`.
 - **The first surface that is global to the machine.** The control channel is keyed by
   home, so there is one daemon per space; a spaces picker means holding N. Listing only
   probes (opening the browser never wakes every daemon you have registered) — selecting

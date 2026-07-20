@@ -155,7 +155,7 @@ fn message_payload(domain: &[u8], workspace_id: &str, author: &UserId, msg: &[u8
 /// Sign arbitrary bytes with an ed25519 seed — a **detached** signature for the
 /// transport-authenticity plane (signed gossip, invite grants) that does not ride
 /// the hash-DAG. `domain` separates use-sites and `workspace_id` binds the message
-/// to its topic (see [`message_payload`]). Returns the seed's `author` and the
+/// to its topic (see the private `message_payload` helper). Returns the seed's `author` and the
 /// 64-byte signature. lait's own primitive — no scaffold signing type involved.
 pub fn sign_message(
     domain: &[u8],

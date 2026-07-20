@@ -167,7 +167,7 @@ pub struct IssueMoveArgs {
     /// New project (writes membership truth, S§5.5).
     #[serde(default)]
     pub project: Option<String>,
-    /// Board position: top | bottom | before:<ref> | after:<ref>.
+    /// Board position: `top` | `bottom` | `before:<ref>` | `after:<ref>`.
     #[serde(default)]
     pub position: Option<String>,
 }

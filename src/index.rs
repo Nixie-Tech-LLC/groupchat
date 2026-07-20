@@ -456,7 +456,7 @@ const USER_PREFIX_MIN: usize = 4;
 
 /// Resolve a `<userref>` (UI.md §3.1) against a directory: `@me`/`me`; a full
 /// 64-hex ed25519 key; a locally-set **alias** (case-insensitive, exact); or a
-/// **key id-prefix** (≥ [`USER_PREFIX_MIN`] hex chars). Alias and prefix are
+/// **key id-prefix** (at least `USER_PREFIX_MIN` hex chars). Alias and prefix are
 /// matched against `dir`, whose names come only from the local alias store — a
 /// self-asserted wire nick is never a resolution input. A full key always
 /// resolves even when absent from `dir`. Multiple distinct hits return `Many` so

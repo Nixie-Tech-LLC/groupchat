@@ -1,6 +1,6 @@
 //! The plaintext **membership layer** (P3, A§11 two-protocol split): a Loro doc
 //! holding the signed ACL op-graph ([`crate::acl`]) and, per key-epoch, the
-//! workspace key **sealed** to each member ([`crate::crypto::seal_to`]).
+//! workspace key **sealed** to each member (by the kernel's `crypto::seal_to`).
 //!
 //! It is synced **unencrypted** (everything in it is public: signed ops + sealed
 //! ciphertext key envelopes), *before* the encrypted catalog/issue docs. A member

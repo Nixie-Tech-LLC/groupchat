@@ -8,7 +8,7 @@
 //!
 //! Two invariants shape it.
 //!
-//! **Never spawn what you were not asked for.** [`list`] answers the picker by
+//! **Never spawn what you were not asked for.** `SpaceDirectory::list` answers the picker by
 //! probing (a short-timeout [`Request::Status`] that fails closed to `idle`),
 //! never by starting anything: opening the browser must not wake every daemon a
 //! user has ever registered. A space's daemon starts only when that space is

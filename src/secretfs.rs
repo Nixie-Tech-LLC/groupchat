@@ -25,7 +25,7 @@
 //!
 //! # Legacy compatibility is lazy, not a migration
 //!
-//! Wrapped payloads carry [`DPAPI_MAGIC`]; unprefixed files read back verbatim,
+//! Wrapped payloads carry the private `DPAPI_MAGIC` prefix; unprefixed files read back verbatim,
 //! so a store written before this module existed still opens. That is **lazy
 //! compatibility only**: a legacy plaintext artifact is wrapped when something
 //! rewrites it, and a completed DKG share may never be written again. Nothing

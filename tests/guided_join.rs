@@ -1,5 +1,5 @@
 //! Guided-join verifier + directory-trap fix, end-to-end (see
-//! `docs/GUIDED-JOIN.md`). Two real nodes exercise the `Diagnose` control verb
+//! `docs/UI.md`, joining). Two real nodes exercise the `Diagnose` control verb
 //! across the onboarding lifecycle, and a CLI-level test proves the read-command
 //! decoy-store guard. Drives daemons over the Layer-B control channel like
 //! `invite_ergonomics.rs`; the CLI guard test shells the binary because it is

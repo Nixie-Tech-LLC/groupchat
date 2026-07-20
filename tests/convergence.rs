@@ -11,7 +11,7 @@
 //!   * `catalog_docs_grow_set_converges`   — S§4  the `docs` grow-only key set
 //!
 //! Post-contract note: these tests exercise the sealed engine surface only
-//! (LAIT-DATA-CONTRACT §6) — replicas fork via `from_snapshot`, mutate through
+//! (`docs/DATA-CONTRACT.md`) — replicas fork via `from_snapshot`, mutate through
 //! the typed writers, land ops with `apply(OpCtx)`, and exchange bytes through
 //! `oplog_vv_bytes`/`export_from_bytes`/`import`. No raw kernel handle exists
 //! out here, which is itself part of what is under test.

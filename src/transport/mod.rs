@@ -6,7 +6,7 @@
 //! connections through [`Transport`] in lait's vocabulary ([`PeerId`], [`Topic`],
 //! framed [`Stream`]s, [`GossipEvent`]s) — not through `iroh::Endpoint`/`Gossip`/
 //! `Router`/`Connection` directly. iroh becomes one implementation
-//! ([`iroh::IrohTransport`], TODO), and a deterministic in-process one
+//! (the planned iroh transport), and a deterministic in-process one
 //! ([`mem::MemTransport`]) lets the *real daemon* run hermetically in tests.
 //!
 //! **The daemon is the consumer, not the transport.** `node.rs` stays the

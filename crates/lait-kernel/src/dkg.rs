@@ -475,7 +475,7 @@ thread_local! {
 ///
 /// Note this establishes *authenticity*, not *authorization*: a validly signed
 /// proposal from any device still lands here. Accepting it is
-/// [`ProposalAuth`]'s job, applied by the caller.
+/// the caller's proposal-authorization check, applied before acting on the board.
 pub fn parse_board(events: &[SignedNode], ws: &WorkspaceId) -> CeremonyBoard {
     let mut board = CeremonyBoard::default();
     for ev in events {

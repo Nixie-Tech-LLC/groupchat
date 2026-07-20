@@ -101,7 +101,7 @@ pub struct CompiledPolicy {
     pub target: Vec<Fe>,
 }
 
-/// A [`CompiledPolicy`] that has passed [`CompiledPolicy::validate`]. Only this
+/// A [`CompiledPolicy`] that has passed [`CompiledPolicy::validate_structure`]. Only this
 /// type exposes reconstruction and witness verification, so those paths are never
 /// reached with an unvalidated (possibly hostile) structure.
 #[derive(Debug, Clone, PartialEq, Eq)]

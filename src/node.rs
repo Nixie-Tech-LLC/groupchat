@@ -997,7 +997,8 @@ impl Node {
                             // A decode failure here is almost always a version-skewed
                             // peer: postcard is not self-describing, so a payload whose
                             // shape changed across releases fails to deserialize (see
-                            // docs/HARDENING.md — "all nodes must upgrade together").
+                            // `docs/PROTOCOL.md` — incompatible wire epochs require
+                            // all nodes to upgrade together).
                             // Swallowing it silently made mixed-version fleets
                             // undiagnosable; log at debug with the error so the drop is
                             // at least visible under `RUST_LOG=lait=debug`.

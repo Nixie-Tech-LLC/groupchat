@@ -81,7 +81,7 @@ getrandom = "0.3"
 
 # Terminal rendering for the inline `lait members` picker (`members_ui`), and the
 # width probe the invite QR uses. The full-screen TUI these were introduced for is
-# gone — the browser is the interactive surface now (docs/SERVE.md) — but the
+# gone — the browser is the interactive surface now (`docs/UI.md`) — but the
 # members picker is a CLI ergonomic in its own right, so both stay.
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -146,7 +146,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # at compile time, which is why the built bundle is COMMITTED and lives under
 # `src/` rather than in the excluded `viewer/`: `cargo install lait` must not need
 # npm (same reproducibility bar `build.rs` holds by never shelling out to git),
-# and the published crate drops `viewer/` entirely. See docs/SERVE.md.
+# and the published crate drops `viewer/` entirely. See `docs/UI.md`.
 include_dir = "0.7"
 
 # mcp server (stdio)

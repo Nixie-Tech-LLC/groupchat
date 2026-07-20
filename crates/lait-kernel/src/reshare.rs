@@ -26,7 +26,7 @@
 //!
 //! The recomputed key `Σ_i λ_i S_i` must equal the old `Y`, and each `C^(i)_0`
 //! must equal the old public share `S_i` — so a dishonest old holder cannot
-//! substitute a different sub-secret. The result is a fresh [`gdkg::GroupKey`]
+//! substitute a different sub-secret. The result is a fresh [`crate::gdkg::GroupKey`]
 //! under the same `Y`, holding new shares over the new leaves.
 //!
 //! # ⚠ Review boundary — UNREVIEWED functional prototype, and NOT revocation
