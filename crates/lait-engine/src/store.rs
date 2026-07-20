@@ -1,22 +1,22 @@
-//! Layer A durability — the **git-backed local store** (ARCHITECTURE §6, SCHEMA
-//! §8). One repo per node whose only role is durable local persistence; git
-//! **never** transports between nodes. Layout:
+//! Git-backed local durability and inspection. Each node owns one repository;
+//! Git never transports state between nodes. The durable layout is:
 //!
 //! ```text
 //! <home>/repo/
 //!   genesis.json        // workspaceId + founding admin keys (public only)
 //!   catalog.loro        // export(Snapshot) of the Catalog doc
+//!   membership.loro     // signed authority inputs and sealed envelopes
 //!   docs/<DocId>.loro   // per-issue snapshot, lazily loaded
-//!   heads               // DocId -> head-hash table (cache; recomputed on load)
-//!   acl.loro            // persisted signed ACL log (P3; empty at P0)
+//!   peer_id              // stable Loro peer id for this store
 //! ```
 //!
-//! Only **public keys, signed ops, and Loro snapshots/updates** are stored —
-//! **never secrets** (A§6). git is used via the `git` CLI as a best-effort
+//! The repository contains public genesis material, Loro snapshots, signed
+//! events, and sealed envelopes. Device private keys, actor recovery material,
+//! custody plaintext, configuration, and navigation state live outside it.
+//! Git is used via the `git` CLI as a best-effort
 //! durability/inspectability layer: the store is correct on the filesystem alone
-//! and never *requires* git at runtime (keeps the build pure-Rust, no C deps —
-//! decision log). Snapshots are written whole per save at P0 (incremental
-//! `export(updates)` is a deferred optimization).
+//! and never requires Git at runtime. Snapshots are currently written whole per
+//! save; incremental `export(updates)` is a deferred optimization.
 
 use std::fs;
 use std::io::Write;
@@ -154,7 +154,7 @@ impl Store {
         Ok(())
     }
 
-    // ---- membership (plaintext ACL + sealed key envelopes, A§11) ----
+    // ---- membership (plaintext authority inputs and sealed envelopes) ----
 
     fn membership_path(&self) -> PathBuf {
         self.repo.join("membership.loro")

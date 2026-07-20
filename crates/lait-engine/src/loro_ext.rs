@@ -1,4 +1,4 @@
-//! Small read helpers over Loro containers, so the Layer-A wrappers
+//! Small read helpers over Loro containers, so the document wrappers
 //! ([`crate::issue`], [`crate::catalog`]) stay readable. All merge semantics
 //! live in Loro itself; these helpers only read leaf values back out.
 
@@ -46,7 +46,7 @@ pub fn map_keys(m: &LoroMap) -> Vec<String> {
     out
 }
 
-/// The keys of a map whose value is `true` (present-key set semantics, S§5.2).
+/// The keys whose stored value is `true`, representing a present-key set.
 pub fn present_keys(m: &LoroMap) -> Vec<String> {
     let mut out = Vec::new();
     m.for_each(|k, v| {

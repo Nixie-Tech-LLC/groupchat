@@ -1,15 +1,14 @@
-//! The operation contract (`docs/DATA-CONTRACT.md`): every commit in
-//! lait carries a request kind, an (advisory) actor, and a **trust tier** — and
-//! the engine is configured so those commits survive as distinct, timestamped,
+//! Every commit carries a request kind, an advisory committing-device claim,
+//! and a trust tier. The engine is configured so those commits survive as distinct, timestamped,
 //! self-labelled changes in the oplog instead of fusing into one anonymous blob.
 //!
-//! Kernel configuration facts this module encodes (verified empirically against
-//! `loro =1.13.6` — see the contract's "gotchas"):
-//! - `record_timestamp` defaults **off** → every change stamps ts 0.
-//! - with ts 0, the default merge interval check (`0 ≤ 1000`) is *always* true:
+//! The crate pins Loro 1.13.6, whose configuration makes these details
+//! load-bearing:
+//! - `record_timestamp` defaults off, producing timestamp zero.
+//! - with timestamp zero, the default merge interval check is always true:
 //!   consecutive same-peer changes fuse into one. `set_change_merge_interval(0)`
-//!   does NOT fix this (same-second stamps give `0 ≤ 0`); only **-1** disables
-//!   fusion. A *constant* commit message doesn't help either (equal messages
+//!   does not fix this because same-second stamps still compare equal; only
+//!   `-1` disables fusion. A *constant* commit message doesn't help either (equal messages
 //!   still merge) — the interval is the granularity guarantee, the message is
 //!   pure semantics.
 //! - a fresh doc draws a **random peer id per session**, growing every doc's
@@ -24,10 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::UserId;
 
-/// Trust tier of an operation (contract §2). The tier is a property of the
-/// *request kind*, never a caller choice; the I-confluence law (§2.1) bounds
-/// what `Authority` may enforce (monotone grant, remove-wins revoke, append-only
-/// membership, soft-delete) — anything needing consensus is unrepresentable.
+/// Trust tier of an operation. The tier is a property of the request kind,
+/// never a caller choice. Authority operations still require signed replay;
+/// metadata alone does not grant authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tier {
     /// T0 — collaborative content (title, description, comments, labels,
@@ -51,15 +49,15 @@ impl Tier {
     }
 }
 
-/// The metadata every commit must carry (contract §5). Constructed per Request
-/// at the Layer-B boundary and consumed exactly once by a wrapper's `apply()`.
+/// Metadata carried by every commit, constructed at the request boundary and
+/// consumed once by a document wrapper's `apply()`.
 #[derive(Debug, Clone)]
 pub struct OpCtx {
     /// Request kind (`"created"`, `"edited"`, `"member_add"`, …) — the semantic
     /// label a peer or a later session reads back out of the oplog.
     pub request: String,
-    /// Advisory actor claim (non-goal 6: self-asserted, not provenance). Rides
-    /// the commit message so remote changes arrive attributed.
+    /// Advisory committing-device claim, not proof of authorship. It travels in
+    /// the commit message so remote changes retain device attribution.
     pub actor: UserId,
     pub tier: Tier,
 }
@@ -95,7 +93,7 @@ impl OpCtx {
 }
 
 /// The parsed form of a commit message read back from the oplog. Absent or
-/// unparseable (legacy pre-contract changes) fields degrade to `None`.
+/// unparseable fields degrade to `None` for compatibility with older changes.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpMeta {
     #[serde(rename = "r")]
@@ -117,7 +115,7 @@ impl OpMeta {
     }
 }
 
-/// Contract §5 engine configuration — applied by every wrapper constructor,
+/// Engine configuration applied by every wrapper constructor
 /// before any op is written or imported.
 pub(super) fn configure(doc: &LoroDoc, peer: Option<u64>) {
     doc.set_record_timestamp(true);
@@ -128,7 +126,7 @@ pub(super) fn configure(doc: &LoroDoc, peer: Option<u64>) {
     }
 }
 
-/// The single commit path (contract §6): stamp the op metadata, then commit.
+/// Stamp operation metadata and commit the staged change.
 pub(super) fn commit_with(doc: &LoroDoc, ctx: &OpCtx) {
     doc.set_next_commit_message(&ctx.commit_message());
     doc.commit();

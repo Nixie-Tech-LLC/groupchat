@@ -1,18 +1,15 @@
-//! The plaintext **membership layer** (P3, A§11 two-protocol split): a Loro doc
-//! holding the signed ACL op-graph ([`crate::acl`]) and, per key-epoch, the
-//! workspace key **sealed** to each member (by the kernel's `crypto::seal_to`).
+//! The plaintext membership document transports signed authority inputs and
+//! sealed key material needed before encrypted collaborative state can open.
 //!
-//! It is synced **unencrypted** (everything in it is public: signed ops + sealed
-//! ciphertext key envelopes), *before* the encrypted catalog/issue docs. A member
-//! replays the ACL, unseals its copy of the current-epoch key, and can then
-//! decrypt the workspace. A non-member sees the signed ops + envelopes it cannot
-//! open — and therefore only ciphertext for the actual issue data.
+//! It carries actor and membership events, content-key epochs and envelopes,
+//! and ceremony, recovery, custody, and space-authority records. It is synced
+//! before encrypted catalog and issue documents so an authorized device can
+//! obtain the content key needed to decrypt them.
 //!
-//! This doc is the signed-authority transport surface (`docs/DATA-CONTRACT.md`): its
-//! Loro layer only *moves* the signed ops; trust comes from `acl::replay`.
-//! Commits go through [`MembershipDoc::apply`] like every other doc — note the
-//! commit metadata here is **plaintext on the wire** (fine: it names ACL ops
-//! whose authors are already public).
+//! Plaintext means routable without the workspace content key, not trusted.
+//! Loro only transports records; kernel replay validates signed inputs, and
+//! malformed or unauthorized inputs remain inert. Commit metadata is likewise
+//! visible to peers that receive this document.
 
 use anyhow::{anyhow, Result};
 use loro::{Container, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, ValueOrContainer};
@@ -61,7 +58,7 @@ impl MembershipDoc {
         Ok(Self { doc })
     }
 
-    /// Load from stored snapshot bytes, applying the contract's engine config.
+    /// Load stored snapshot bytes with the engine's required Loro configuration.
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
@@ -78,7 +75,7 @@ impl MembershipDoc {
         Self { doc }
     }
 
-    /// Land staged ops as one metadata-carrying change (contract §6).
+    /// Land staged operations as one metadata-bearing change.
     pub fn apply(&self, ctx: &OpCtx) {
         op::commit_with(&self.doc, ctx);
     }
@@ -97,7 +94,7 @@ impl MembershipDoc {
     pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
-    /// The raw encoded frontiers (input to the combined sync head, A§8).
+    /// Encoded membership frontiers used in the combined synchronization head.
     pub fn head_bytes(&self) -> Vec<u8> {
         self.head().encode()
     }
@@ -142,7 +139,7 @@ impl MembershipDoc {
 
     // ---- ACL ops (grow-only) ----
 
-    /// Append a signed op (idempotent by op hash — the grow-only set, S§6).
+    /// Append a signed operation idempotently by hash to the grow-only event set.
     pub fn add_op(&self, op: &SignedOp) -> Result<()> {
         let hash = op.hash();
         if self.ops().iter().any(|o| o.hash() == hash) {
@@ -173,7 +170,7 @@ impl MembershipDoc {
     }
 
     /// The current op-graph heads (ops that are nobody's parent) — the parents
-    /// for the next op (S§6 hash-chain).
+    /// for the next operation.
     pub fn heads(&self) -> Vec<String> {
         let ops = self.ops();
         let mut is_parent = std::collections::HashSet::new();

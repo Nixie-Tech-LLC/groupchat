@@ -1,19 +1,19 @@
-//! Layer A — the issue document. One Loro document per issue,
+//! One Loro document per issue,
 //! addressed by [`DocId`]. This wrapper owns the container layout and exposes
-//! typed reads/writes; **all merge semantics live in Loro** (S§1). A "register"
+//! typed reads and writes. CRDT merge semantics live in Loro. A "register"
 //! is a single key in the root `LoroMap` resolved by Lamport order (LWW).
 //!
-//! Fields (S§5):
+//! Stored fields:
 //! - `id`, `workspaceId`, `projectId`, `createdBy`, `createdAt` — value leaves.
 //! - `title`, `status`, `priority` — LWW value leaves.
 //! - `description` — `LoroText` (RGA char-merge, co-editable; writes are a
 //!   **splice**, never a full-buffer replace — see [`IssueDoc::set_description`]).
-//! - `assignees`, `labels` — `LoroMap<Id, true>` present-key sets (S§5.2).
-//! - `comments` — `LoroList<Comment>`, insertion-order union (S§5.3).
+//! - `assignees`, `labels` — `LoroMap<Id, true>` present-key sets.
+//! - `comments` — `LoroList<Comment>`, insertion-order union.
 //!
-//! `projectId` is the **single source of project membership** (S§5.5).
+//! `projectId` is the source of project membership; board lists store order only.
 //!
-//! Mutation contract (`docs/DATA-CONTRACT.md`): callers stage typed writes and
+//! Callers stage typed writes and
 //! land them with exactly one [`IssueDoc::apply`] per Request — the only commit
 //! path, and it stamps the op metadata every change must carry.
 
@@ -85,11 +85,11 @@ pub struct NewIssue {
     pub priority: Priority,
     /// The authoring **actor** (identity), stable across the author's devices.
     pub created_by: ActorId,
-    /// The device that committed (the advisory commit stamp — non-goal 6).
+    /// The device that committed, recorded as an advisory stamp.
     pub committed_by: UserId,
     pub created_at: u64,
     pub body: Option<String>,
-    /// The store's stable peer id (contract §5): one version-vector entry per
+    /// The store's stable peer id: one version-vector entry per
     /// store lifetime instead of one per session. `None` (tests, replicas)
     /// keeps the engine's fresh random peer.
     pub peer: Option<u64>,
@@ -131,7 +131,7 @@ impl IssueDoc {
     }
 
     /// Load from stored/synced snapshot bytes (the only public constructor from
-    /// bytes — it applies the contract's engine configuration before any write
+    /// bytes; it applies the engine's required Loro configuration before any write
     /// can happen on the loaded doc).
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
@@ -141,13 +141,13 @@ impl IssueDoc {
         Ok(Self { doc })
     }
 
-    /// The raw engine handle — never leaves the engine (contract §6).
+    /// The raw engine handle, restricted to engine internals.
     pub(crate) fn raw(&self) -> &LoroDoc {
         &self.doc
     }
 
     /// Export a full snapshot (durable store / cold-start sync). Retains the
-    /// full oplog: the snapshot IS the history (contract §5).
+    /// full oplog, which is the durable history source.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
         self.doc
             .export(ExportMode::Snapshot)
@@ -168,17 +168,17 @@ impl IssueDoc {
         self.doc.oplog_frontiers()
     }
 
-    /// The opaque `DocMeta.head` digest of this doc (S§3.2).
+    /// The opaque `DocMeta.head` digest of this document.
     pub fn head_hash(&self) -> Vec<u8> {
         crate::catalog::head_hash(&self.head())
     }
 
-    /// This doc's oplog version vector, wire-encoded (per-doc VV-diff sync, A§8).
+    /// This document's wire-encoded oplog version vector.
     pub fn oplog_vv_bytes(&self) -> Vec<u8> {
         self.doc.oplog_vv().encode()
     }
 
-    /// Export only the ops a peer lacks, from its wire-encoded VV (A§8).
+    /// Export operations absent from a peer's encoded version vector.
     pub fn export_from_bytes(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
         let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
         self.doc
@@ -246,9 +246,8 @@ impl IssueDoc {
             .unwrap_or_default()
     }
 
-    /// Assignee **actors** present in the set (S§5.2). Actor-keyed since the
-    /// lait/actor/1 cutover, so an actor's assignment is stable across its
-    /// devices.
+    /// Assignee actors present in the set. Actor-keying keeps assignment stable
+    /// across device changes.
     pub fn assignees(&self) -> Vec<ActorId> {
         let mut out: Vec<ActorId> = lx::get_map(&self.root(), C_ASSIGNEES)
             .map(|m| lx::present_keys(&m))
@@ -260,7 +259,7 @@ impl IssueDoc {
         out
     }
 
-    /// Label ids present in the set (S§5.2).
+    /// Label ids present in the set.
     pub fn labels(&self) -> Vec<LabelId> {
         let mut out: Vec<LabelId> = lx::get_map(&self.root(), C_LABELS)
             .map(|m| lx::present_keys(&m))
@@ -272,7 +271,7 @@ impl IssueDoc {
         out
     }
 
-    /// Comments in insertion order (S§5.3), each either projected or reported
+    /// Comments in insertion order, each either projected or reported
     /// corrupt. Nothing is dropped: a malformed element keeps its position in
     /// the sequence, so the caller's counts stay right and a peer writing bad
     /// records stays visible instead of silently vanishing.
@@ -303,7 +302,7 @@ impl IssueDoc {
         out
     }
 
-    // ---- writes (staged; landed by exactly one `apply` per Request, S§7.1) ----
+    // ---- staged writes, landed by one `apply` per accepted request ----
 
     pub fn set_title(&self, title: &str) -> Result<()> {
         self.root().insert(K_TITLE, title)?;
@@ -324,8 +323,7 @@ impl IssueDoc {
 
     /// Set the description as a **splice**: the engine computes the minimal
     /// edit, so a concurrent edit by another peer RGA-merges cleanly instead of
-    /// concatenating both full bodies (the P0 full-buffer replace did exactly
-    /// that — contract §3.1), and the oplog records the actual edit instead of
+    /// concatenating both full bodies, and the oplog records the actual edit instead of
     /// a delete-all/insert-all pair per save.
     pub fn set_description(&self, body: &str) -> Result<()> {
         let t = self
@@ -365,7 +363,7 @@ impl IssueDoc {
         Ok(())
     }
 
-    /// Append an immutable comment (S§5.3). `author` is the **actor**, not the
+    /// Append an immutable comment. `author` is the actor, not the
     /// signing device: a comment is authored by a person, so attribution must
     /// survive that person adding, rotating, or recovering a device. The device
     /// that committed is still recorded — advisorily, on the change itself, via
@@ -383,7 +381,7 @@ impl IssueDoc {
     }
 
     /// Land the staged ops as one metadata-carrying change — the only commit
-    /// path (one Request = one apply = one change; S§7.1, contract §6).
+    /// path: one accepted request becomes one apply and one change.
     pub fn apply(&self, ctx: &OpCtx) {
         op::commit_with(&self.doc, ctx);
     }
@@ -559,7 +557,7 @@ mod tests {
 
     #[test]
     fn description_splices_and_merges_concurrent_edits() {
-        // The contract §3.1 fix: a splice write means two peers editing
+        // A splice write lets two peers editing
         // different parts of the body RGA-merge cleanly, instead of the
         // full-buffer replace concatenating both bodies.
         let i = sample();
@@ -596,7 +594,7 @@ mod tests {
 
     #[test]
     fn history_survives_snapshot_roundtrip_with_metadata() {
-        // Contract §5: per-request changes with kind/actor/ts, durable on disk.
+        // Per-request changes retain kind, committing device, and timestamp.
         let i = sample();
         i.set_status("in_progress").unwrap();
         i.apply(&ctx("started"));

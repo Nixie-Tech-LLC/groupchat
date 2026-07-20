@@ -1,10 +1,10 @@
-//! Derived history (`docs/DATA-CONTRACT.md`): the activity/history feed read
-//! **from the oplog on disk**, not from a per-session ring. Every change in an
+//! Derived history read from an issue document's durable oplog rather than a
+//! process-local ring. Every change in an
 //! issue doc's causal DAG carries a timestamp and an [`OpMeta`] commit message
-//! (post-contract writes), so `lait history` survives daemon restarts and
+//! when metadata is present, so `lait history` survives daemon restarts and
 //! attributes remote changes — the message travels with the ops.
 //!
-//! Legacy changes (written before the contract) surface honestly: ts 0, no
+//! Older changes without commit metadata surface honestly: timestamp 0, no
 //! kind, no actor, possibly many fields fused into one change.
 //!
 //! **Two identities, deliberately not unified.** Anything this module reads
@@ -17,9 +17,8 @@
 //! when a single device is misbehaving.
 //!
 //! Collision detection is the DAG fact, not a heuristic: a change whose deps
-//! differ from the walk's running head-set sits on a concurrent branch
-//! (SCHEMA A§9's LWW collision note — the compensating control for LWW
-//! `title`/`status` being allowed to drop a concurrent write).
+//! differ from the walk's running head-set sits on a concurrent branch. This
+//! makes otherwise-hidden concurrent LWW writes visible in history.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,13 +33,13 @@ use crate::op::OpMeta;
 /// One oplog change of an issue doc, projected for the history feed.
 #[derive(Debug, Clone)]
 pub struct DocChange {
-    /// Request kind from the commit message (`None` for legacy changes).
+    /// Request kind from the commit message (`None` for changes without metadata).
     pub kind: Option<String>,
     /// The **device** that committed, as claimed in the commit message — a
     /// `committedBy` stamp, not authorship. Advisory and self-asserted
-    /// (non-goal 6); never resolved to an actor. See the module note.
+    /// It is never resolved to an actor. See the module note.
     pub actor: Option<UserId>,
-    /// Unix seconds (0 on legacy changes written before `record_timestamp`).
+    /// Unix seconds (0 for changes written without recorded timestamps).
     pub ts: u64,
     /// True when this change was made concurrently with another branch.
     pub collision: bool,
@@ -54,10 +53,10 @@ pub struct DocChange {
     pub corrupt_records: Vec<CorruptRecord>,
 }
 
-/// What an import brought in, derived from `diff(before, after)` — positional
-/// and CRDT-correct, unlike index arithmetic over a merged list (the
-/// `skip(prior_comments)` bug this replaces: a concurrent comment merging
-/// mid-list both duplicated an old notification and dropped the new one).
+/// What an import brought in, derived from `diff(before, after)`.
+///
+/// The causal diff identifies comments independently of their merged list
+/// positions, so concurrent insertion cannot duplicate or hide notifications.
 #[derive(Debug, Clone, Default)]
 pub struct ImportDelta {
     /// Field transitions (to-values; `from` is the pre-import state the caller
@@ -71,14 +70,14 @@ pub struct ImportDelta {
     /// silently would be worst: this is the audit trail for a peer writing
     /// records that don't conform.
     pub corrupt_records: Vec<CorruptRecord>,
-    /// Assignees are **actors** (S§5.2) — assignment follows the person, not
+    /// Assignees are actors: assignment follows the person, not
     /// the device they happened to be on.
     pub assignee_added: Vec<ActorId>,
     pub assignee_removed: Vec<ActorId>,
     /// DAG concurrency: the import created (or extended) a concurrent branch.
     pub collision: bool,
     /// Distinct committing **devices** of the incoming changes, from their
-    /// commit messages. Advisory (non-goal 6); see [`DocChange::actor`].
+    /// commit messages. Advisory; see [`DocChange::actor`].
     pub actors: Vec<UserId>,
     /// Distinct request kinds of the incoming changes.
     pub kinds: Vec<String>,

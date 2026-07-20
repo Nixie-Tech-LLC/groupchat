@@ -1,32 +1,33 @@
-//! Layer A — the catalog document: the workspace's **structure
-//! doc**. ONE Loro document per workspace holding the authoritative registry of
-//! which issue docs exist, project/label config, board ordering, the workflow
-//! columns, the sub-issue hierarchy, the issue-link edge set, and the `DocMeta`
+//! The catalog document stores workspace structure in one Loro document: the
+//! registry of issue documents, project and label configuration, board
+//! ordering, workflow columns, the sub-issue hierarchy, the issue-link edge
+//! set, and the `DocMeta`
 //! row cache that lets lists/boards render without opening issue docs.
 //!
 //! The catalog is the multi-document container the engine structurally lacks
 //! (one Loro doc = one tree): issue docs are *content*, the catalog is *nodes,
 //! ordering, hierarchy, and edges* (`docs/DATA-CONTRACT.md`, catalog document).
 //!
-//! **Authority (S§3).** `Catalog.docs` existence, `projects`, `labels`,
-//! `workflow`, board *ordering*, `subs`, `edges`, and `acl` are authoritative.
-//! `DocMeta` row fields are a **one-directional cache** of the issue doc
-//! (S§3.1): the issue doc is always truth; every local edit and every import
+//! **Structural ownership.** Issue registration, projects, labels, workflow,
+//! board ordering, hierarchy, and links are structural state: they control
+//! navigation but grant no authority. `DocMeta` row fields are a one-directional
+//! cache of the issue doc; every local edit and every import
 //! recomputes the row via [`CatalogDoc::upsert_row`]. Nothing writes a row
-//! field as if it were authoritative.
+//! field back into issue content. Signed content-authority events are replayed
+//! separately from this structural state.
 //!
-//! **`head` (S§3.2).** `DocMeta.head` is a cache of the issue-doc frontiers —
+//! **Cached heads.** `DocMeta.head` is a cache of the issue-doc frontiers:
 //! `blake3(frontiers.encode())`. Because mirroring it is a second write to a
 //! second doc, the store recomputes every head from the real issue frontiers on
 //! load ([`CatalogDoc::upsert_row`] is the single writer of it).
 //!
-//! **`subs` (contract §3.2).** Sub-issue hierarchy as a real tree-move CRDT,
+//! **Sub-issues.** The hierarchy is a tree-move CRDT,
 //! never an LWW `parentId`: two peers concurrently moving A under B and B under
 //! A each perform a locally-legal write whose combination is a cycle — only the
 //! merge can adjudicate, and the engine's move algorithm (Kleppmann et al.,
 //! IEEE TPDS 2022) converges it to a valid tree on every replica.
 //!
-//! **`edges` (contract §3.2).** Issue links as an add-wins set keyed
+//! **Links.** Issue links form an add-wins set keyed
 //! `"<from>|<kind>|<to>"`. Referential integrity is filtered at read time (an
 //! edge may name a tombstoned or not-yet-synced doc).
 
@@ -60,7 +61,7 @@ const C_SUBS: &str = "subs";
 const C_EDGES: &str = "edges";
 /// The content-authority DAG (`crate::authz`): signed tombstone ops et al.
 /// Encrypted with the rest of the catalog — the blind relay learns nothing,
-/// and old builds never parse it (the data contract's authority-tier rule).
+/// while signed replay determines which operations carry authority.
 const C_AUTHZ: &str = "authz";
 /// The tree-node meta key carrying the issue DocId a `subs` node stands for.
 const META_DOC: &str = "docId";
@@ -77,19 +78,16 @@ pub struct RowMeta {
     pub title: String,
     pub status: String,
     pub priority: Priority,
-    /// Full assignee keys (viewer-neutral cache; the "you +2" summary and the ●
-    /// dot are computed at projection time from the local `UserId`). This is a
-    /// faithful extension of the S§4 `assigneeSummary` cache: a shared cache
-    /// cannot store a viewer-relative "you", so we cache the keys and render the
-    /// summary per-viewer (recorded in the decision log).
+    /// Full assignee actor ids. Viewer-relative summaries such as "you +2" are
+    /// computed during projection rather than stored in this replicated cache.
     pub assignees: Vec<ActorId>,
     pub head: Vec<u8>,
-    /// True when the issue doc itself hasn't been loaded yet (post-P1); the row
-    /// is provisional (UI.md §3.3). At P0 every doc is local, so always false.
+    /// True when the issue document has not been loaded. Such a row is
+    /// provisional until issue content arrives.
     pub provisional: bool,
 }
 
-/// One issue link (contract §3.2): `from --kind--> to`.
+/// One issue link: `from --kind--> to`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
     pub from: DocId,
@@ -135,7 +133,7 @@ impl CatalogDoc {
         Ok(Self { doc })
     }
 
-    /// Load from stored snapshot bytes, applying the contract's engine config.
+    /// Load stored snapshot bytes with the engine's required Loro configuration.
     pub fn from_snapshot(bytes: &[u8], peer: Option<u64>) -> Result<Self> {
         let doc = LoroDoc::new();
         op::configure(&doc, peer);
@@ -144,7 +142,7 @@ impl CatalogDoc {
         Ok(Self { doc })
     }
 
-    /// A bare, uninitialized catalog — used by a JOINER (A§10). A joiner must NOT
+    /// A bare, uninitialized catalog for a joining replica. It must not
     /// `create()` its own containers: `create` mints peer-specific attached
     /// child containers (`docs`/`projects`/…), and merging the founder's ops
     /// would then LWW-resolve the root's child registers non-deterministically to
@@ -156,7 +154,7 @@ impl CatalogDoc {
         Self { doc }
     }
 
-    /// Land staged ops as one metadata-carrying change (contract §6).
+    /// Land staged operations as one metadata-bearing change.
     pub fn apply(&self, ctx: &OpCtx) {
         op::commit_with(&self.doc, ctx);
     }
@@ -172,25 +170,25 @@ impl CatalogDoc {
             .map(|_| ())
             .map_err(|e| anyhow!("import catalog update: {e}"))
     }
-    /// The catalog's own oplog frontiers — the catalog-first sync digest (A§8).
+    /// The catalog oplog frontiers used for catalog-first synchronization.
     pub(crate) fn head(&self) -> Frontiers {
         self.doc.oplog_frontiers()
     }
-    /// The catalog head digest, wire form (gossip announce, A§8).
+    /// The catalog head digest used in gossip announcements.
     pub fn head_hash(&self) -> Vec<u8> {
         head_hash(&self.head())
     }
-    /// The raw encoded frontiers (input to the combined sync head, A§8).
+    /// Encoded catalog frontiers used in the combined synchronization head.
     pub fn head_bytes(&self) -> Vec<u8> {
         self.head().encode()
     }
 
-    /// The catalog's oplog version vector, wire-encoded (A§8).
+    /// The catalog's wire-encoded oplog version vector.
     pub fn oplog_vv_bytes(&self) -> Vec<u8> {
         self.doc.oplog_vv().encode()
     }
 
-    /// Export only the catalog ops a peer lacks, from its wire-encoded VV (A§8).
+    /// Export the catalog operations absent from a peer's encoded version vector.
     pub fn export_from_bytes(&self, peer_vv: &[u8]) -> Result<Vec<u8>> {
         let vv = loro::VersionVector::decode(peer_vv).unwrap_or_default();
         self.doc
@@ -236,7 +234,7 @@ impl CatalogDoc {
     }
 
     /// The sub-issue tree. Lazily created on first write so catalogs founded
-    /// before the container existed keep working (additive change, S§9 rule 1).
+    /// before the container existed keep working across this additive change.
     fn subs_tree(&self, create: bool) -> Option<LoroTree> {
         match self.root().get(C_SUBS) {
             Some(ValueOrContainer::Container(Container::Tree(t))) => Some(t),
@@ -261,7 +259,7 @@ impl CatalogDoc {
         }
     }
 
-    // ---- content-authority ops (the encrypted signed DAG, contract §3.4) ----
+    // ---- content-authority operations (encrypted signed DAG) ----
 
     /// Append a signed content-authority op (idempotent by op hash — the same
     /// grow-only-set rule as the membership plane).
@@ -491,10 +489,10 @@ impl CatalogDoc {
             .collect()
     }
 
-    /// **The writer-direction invariant (S§3.1).** Recompute a doc's `DocMeta`
+    /// Recompute a document's `DocMeta`
     /// row *from the issue doc* — the only writer of the cache fields. Called on
     /// every local edit and every import. Creates the row if absent (preserving
-    /// `seq`/`tombstone`). `head` is `blake3(issue.frontiers.encode())` (S§3.2).
+    /// `seq`/`tombstone`). `head` is `blake3(issue.frontiers.encode())`.
     pub fn upsert_row(&self, issue: &IssueDoc) -> Result<()> {
         let doc_id = issue
             .doc_id()
@@ -514,7 +512,7 @@ impl CatalogDoc {
                 m
             }
         };
-        // cache fields (issue-doc is truth)
+        // Cache fields flow only from issue content into the catalog row.
         m.insert("projectId", project_id.as_str())?;
         m.insert("title", issue.title().as_str())?;
         m.insert("status", issue.status().as_str())?;
@@ -531,7 +529,7 @@ impl CatalogDoc {
         Ok(())
     }
 
-    /// Set (or clear) the deletion tombstone (S§5.6). The doc still exists.
+    /// Set or clear the deletion tombstone without removing the document.
     pub fn set_tombstone(&self, doc_id: &DocId, tombstone: bool) -> Result<()> {
         let m = self
             .row_map(doc_id)
@@ -541,7 +539,7 @@ impl CatalogDoc {
     }
 
     /// Assign the KEY-n alias seq for a fresh doc: read the project high-water,
-    /// increment, persist, and stamp the row (S§5.4). Two offline nodes can
+    /// increment, persist, and stamp the row. Two offline nodes can
     /// assign the same seq; collisions disambiguate at projection time.
     pub fn assign_alias_seq(&self, doc_id: &DocId, project_id: &ProjectId) -> Result<u32> {
         let current = lx::get_u64(&self.aliases(), project_id.as_str()).unwrap_or(0) as u32;
@@ -552,7 +550,7 @@ impl CatalogDoc {
     }
 
     /// Directly stamp a doc's KEY-n `seq` (used by sync reconciliation and
-    /// tests to reproduce an offline double-assign collision, S§5.4).
+    /// tests to reproduce an offline double-assignment collision).
     pub fn set_seq(&self, doc_id: &DocId, seq: u32) -> Result<()> {
         if let Some(m) = self.row_map(doc_id) {
             m.insert("seq", seq as i64)?;
@@ -560,7 +558,7 @@ impl CatalogDoc {
         Ok(())
     }
 
-    // ---- boards (movable list = ordering only, S§5.5) ----
+    // ---- boards (movable list stores ordering only) ----
 
     fn board_list(&self, project_id: &ProjectId) -> Result<LoroMovableList> {
         match self.boards().get(project_id.as_str()) {
@@ -573,7 +571,7 @@ impl CatalogDoc {
 
     /// The board's stored ordering (raw movable list). The render rule (dedup,
     /// append-belonging-unlisted, ignore-not-belonging) is applied at projection
-    /// time (S§5.5), not here.
+    /// time, not here.
     pub fn board_order(&self, project_id: &ProjectId) -> Vec<DocId> {
         match self.boards().get(project_id.as_str()) {
             Some(ValueOrContainer::Container(Container::MovableList(l))) => lx::list_strings(&l)
@@ -607,10 +605,9 @@ impl CatalogDoc {
     }
 
     /// Move `doc_id` to just before/after `anchor` in the board (a real
-    /// `IssueMove` reorder, UI.md §5.1). When the doc is already listed this uses
-    /// the movable list's native `mov` (a single conflict-free move op — the A§9
-    /// "native movable-list win") rather than delete-then-insert; that matters
-    /// under concurrency: two peers concurrently moving the **same** doc converge
+    /// `IssueMove` reorder). When the document is already listed this uses
+    /// the movable list's native `mov` rather than delete-then-insert. Under
+    /// concurrency, two peers moving the **same** doc converge
     /// to one position with **no duplicate** in the raw list, instead of each
     /// contributing a surviving insert. Inserts if not yet present.
     pub fn board_move(
@@ -662,7 +659,7 @@ impl CatalogDoc {
         Ok(())
     }
 
-    // ---- subs (sub-issue hierarchy — tree-move CRDT, contract §3.2) ----
+    // ---- subs (sub-issue hierarchy as a tree-move CRDT) ----
 
     /// Find the tree node standing for `doc_id`, skipping deleted nodes.
     fn node_for(&self, tree: &LoroTree, doc_id: &DocId) -> Option<TreeID> {
@@ -689,7 +686,7 @@ impl CatalogDoc {
     /// Parent `child` under `parent`, or unparent it (`None` → back to root).
     /// A *locally visible* cycle is rejected with a friendly error; a cycle
     /// formed only by concurrent moves is resolved by the engine's merge
-    /// (greater-timestamped move ignored — Kleppmann et al. §3.5).
+    /// (the greater-timestamped move is ignored by the tree-move algorithm).
     pub fn set_parent(&self, child: &DocId, parent: Option<&DocId>) -> Result<()> {
         let tree = self
             .subs_tree(true)
@@ -768,7 +765,7 @@ impl CatalogDoc {
             .collect()
     }
 
-    // ---- edges (issue links — add-wins set, contract §3.2) ----
+    // ---- edges (issue links as an add-wins set) ----
 
     fn edge_key(from: &DocId, kind: &str, to: &DocId) -> String {
         format!("{from}|{kind}|{to}")
@@ -1008,9 +1005,8 @@ mod tests {
 
     #[test]
     fn concurrent_same_doc_move_converges_without_duplicate() {
-        // The finding from the adversarial convergence pass: a delete-then-insert
-        // board_move duplicates a doc when two peers move the SAME doc; the native
-        // `mov` converges to one position with no raw-list duplicate (A§9).
+        // Native moves must converge without duplicating an item when replicas
+        // concurrently move that same item to different positions.
         let (c, w, p) = cat();
         let ids: Vec<DocId> = ["a", "b", "d", "e"]
             .iter()
@@ -1084,9 +1080,9 @@ mod tests {
 
     #[test]
     fn concurrent_cycle_converges_to_a_valid_tree() {
-        // The contract §3.2 guarantee (Kleppmann et al. TPDS 2022): A→B and B→A
-        // performed concurrently converge on every replica to a tree, never a
-        // cycle — the exact scenario an LWW parentId cannot survive.
+        // The tree-move convergence guarantee (Kleppmann et al., TPDS 2022):
+        // A→B and B→A performed concurrently converge on every replica to a
+        // tree, never a cycle — the exact scenario an LWW parentId cannot survive.
         let (c, w, p) = cat();
         let a = make_issue(&w, &p, "a").doc_id().unwrap();
         let b = make_issue(&w, &p, "b").doc_id().unwrap();
