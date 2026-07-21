@@ -35,7 +35,10 @@ pub mod transaction;
 pub use body::{
     BodyDescriptor, BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel,
 };
-pub use convergence::{ConvergenceOutcome, IncorporationClass};
+pub use convergence::{
+    AuthorityIncorporator, AuthorityReceipt, ConvergenceOutcome, IncorporationClass,
+    StagedContactMaterial, ValidatedContactBundle,
+};
 pub use fabric::{CollaborativeView, ListElement};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
@@ -50,8 +53,8 @@ pub use protected::{
 };
 pub use receipt::{ReceiptError, RequestReceiptV1, MAX_EFFECT_BYTES};
 pub use replica::{
-    ActionOutcome, BodyBinding, CommitContext, ExportedMaterial, Replica, ReplicaCommitError,
-    SupportedSchemas, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
+    ActionOutcome, BodyBinding, CommitContext, ExportedMaterial, QuotaConfig, Replica,
+    ReplicaCommitError, SupportedSchemas, MUTATION_ATOMIC, MUTATION_COLLABORATIVE,
 };
 pub use transaction::{
     AuthoritySource, BodyDescriptorV1, BodyTransactionV1, SeedSigner, TransactionError,

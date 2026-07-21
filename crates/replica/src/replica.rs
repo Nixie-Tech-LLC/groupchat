@@ -113,6 +113,13 @@ pub enum ReplicaCommitError {
     /// The application effect exceeded [`crate::receipt::MAX_EFFECT_BYTES`].
     /// Nothing was committed.
     EffectTooLarge,
+    /// The Space material quota (bytes or Body count) would be exceeded.
+    /// Nothing was committed and no staging was retained.
+    QuotaExceeded,
+    /// The unknown-World retention subquota would be exceeded. No eviction is
+    /// performed, neither manifest nor frontier changes, and no staging
+    /// objects are retained.
+    OpaqueQuotaExceeded,
 }
 
 impl std::fmt::Display for ReplicaCommitError {
@@ -157,6 +164,58 @@ pub struct BodyBinding {
 /// per-Body sealed payload bytes, byte-identical to what was committed or
 /// incorporated.
 pub type ExportedMaterial = Vec<(BodyTransactionV1, Vec<(BodyKey, Vec<u8>)>)>;
+
+/// The Space material quotas, enforced transactionally under the Replica
+/// writer. The ledger counts canonical material bytes — protected Body
+/// envelopes, distinct transaction records, and idempotency receipts;
+/// manifests and journal bookkeeping are derived from ledgered material and
+/// bounded proportionally by it. Operator configuration may **lower** any
+/// protocol maximum but never raise it, and the configured limits persist in
+/// the store meta so a restart cannot accidentally increase capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaConfig {
+    /// Per-Body protected envelope maximum (protocol max 64 MiB).
+    pub max_body_bytes: u64,
+    /// Per-Space material bytes (protocol max 4 GiB).
+    pub max_space_bytes: u64,
+    /// Per-Space Body count (protocol max 100,000).
+    pub max_space_bodies: u64,
+    /// Retained-unknown-World material bytes, logical per World (1 GiB).
+    pub max_unknown_world_bytes: u64,
+    /// Retained-unknown-World Body count, logical per World (25,000).
+    pub max_unknown_world_bodies: u64,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: MAX_BODY_BYTES as u64,
+            max_space_bytes: 4 * 1024 * 1024 * 1024,
+            max_space_bodies: 100_000,
+            max_unknown_world_bytes: 1024 * 1024 * 1024,
+            max_unknown_world_bodies: 25_000,
+        }
+    }
+}
+
+impl QuotaConfig {
+    /// Clamp every limit to its protocol maximum (lowering is allowed,
+    /// raising is not).
+    pub fn clamped(self) -> Self {
+        let max = Self::default();
+        Self {
+            max_body_bytes: self.max_body_bytes.min(max.max_body_bytes),
+            max_space_bytes: self.max_space_bytes.min(max.max_space_bytes),
+            max_space_bodies: self.max_space_bodies.min(max.max_space_bodies),
+            max_unknown_world_bytes: self
+                .max_unknown_world_bytes
+                .min(max.max_unknown_world_bytes),
+            max_unknown_world_bodies: self
+                .max_unknown_world_bodies
+                .min(max.max_unknown_world_bodies),
+        }
+    }
+}
 
 /// The commit attribution a durable transaction is signed with: the Space, the
 /// committing device's signing capability, and the authority frontier the
@@ -221,6 +280,11 @@ struct BodyRecord {
     protected: Option<ObjectRef>,
     /// The signed transaction record object (durable stores only).
     transaction: Option<ObjectRef>,
+    /// The sealed envelope length (quota ledger input).
+    protected_len: u64,
+    /// The signed transaction record length (quota ledger input; distinct
+    /// transactions count once).
+    tx_len: u64,
     /// Whether the Body is interpreted by the local engine. `false` is the
     /// opaque branch: retained byte-identically, absent from reads.
     interpreted: bool,
@@ -233,6 +297,7 @@ struct StoreMetaV1 {
     version: u8,
     space: Option<SpaceId>,
     frontier: ReplicaFrontier,
+    quota: QuotaConfig,
     bodies: Vec<(BodyKey, BodyRecord)>,
     receipts: Vec<(Vec<u8>, ObjectRef)>,
     manifest_root: Option<ObjectRef>,
@@ -248,6 +313,7 @@ pub struct Replica {
     keys: Option<Arc<dyn BodyKeySource>>,
     space: Option<SpaceId>,
     supported: SupportedSchemas,
+    quota: QuotaConfig,
     bodies: BTreeMap<BodyKey, BodyRecord>,
     receipts: BTreeMap<Vec<u8>, (RequestReceiptV1, Option<ObjectRef>)>,
     /// Opaque retained material kept in memory for non-durable replicas (a
@@ -327,6 +393,7 @@ impl Replica {
             keys: None,
             space: None,
             supported: SupportedSchemas::default(),
+            quota: QuotaConfig::default(),
             bodies: BTreeMap::new(),
             receipts: BTreeMap::new(),
             raw_material: BTreeMap::new(),
@@ -354,6 +421,48 @@ impl Replica {
     /// Remote material outside this set takes the opaque branch.
     pub fn set_supported(&mut self, supported: SupportedSchemas) {
         self.supported = supported;
+    }
+
+    /// Configure the Space quotas (clamped to the protocol maxima; the
+    /// configured limits persist with the next commit).
+    pub fn set_quota(&mut self, quota: QuotaConfig) {
+        self.quota = quota.clamped();
+    }
+
+    /// The effective quota configuration.
+    pub fn quota(&self) -> &QuotaConfig {
+        &self.quota
+    }
+
+    /// The material-ledger usage: canonical material bytes (protected
+    /// envelopes + distinct transaction records + receipts) and Body count.
+    pub fn usage(&self) -> (u64, u64) {
+        let mut bytes: u64 = 0;
+        let mut tx_seen: std::collections::BTreeMap<[u8; 16], u64> = BTreeMap::new();
+        for record in self.bodies.values() {
+            bytes = bytes.saturating_add(record.protected_len);
+            tx_seen.entry(record.tx).or_insert(record.tx_len);
+        }
+        for len in tx_seen.values() {
+            bytes = bytes.saturating_add(*len);
+        }
+        for (receipt, _) in self.receipts.values() {
+            bytes = bytes.saturating_add(receipt.encode().len() as u64);
+        }
+        (bytes, self.bodies.len() as u64)
+    }
+
+    /// The retained-unknown-World usage for one World: (bytes, bodies).
+    pub fn opaque_usage(&self, world: &WorldId) -> (u64, u64) {
+        let mut bytes: u64 = 0;
+        let mut count: u64 = 0;
+        for (key, record) in &self.bodies {
+            if !record.interpreted && &key.world == world {
+                bytes = bytes.saturating_add(record.protected_len);
+                count += 1;
+            }
+        }
+        (bytes, count)
     }
 
     /// Open the durable Replica at a journaled store root: run crash recovery,
@@ -386,6 +495,7 @@ impl Replica {
         }
         replica.frontier = meta.frontier;
         replica.space = meta.space.clone();
+        replica.quota = meta.quota.clamped();
         for (key, mut record) in meta.bodies {
             let (Some(protected_ref), Some(tx_ref)) = (record.protected, record.transaction) else {
                 return Err(ReplicaCommitError::Integrity(
@@ -577,6 +687,14 @@ impl Replica {
                 _ => {}
             }
         }
+        // Body-count quota, reserved under the writer BEFORE anything applies.
+        let new_bodies = touched
+            .iter()
+            .filter(|k| !self.bodies.contains_key(*k))
+            .count() as u64;
+        if (self.bodies.len() as u64).saturating_add(new_bodies) > self.quota.max_space_bodies {
+            return Err(ReplicaCommitError::QuotaExceeded);
+        }
         // A durable commit needs sealing material before the engine moves; a
         // non-durable Replica with keys still seals (so its material can be
         // exported), and one without keys commits locally-only.
@@ -636,6 +754,8 @@ impl Replica {
                             tx_commitment: [0u8; 32],   // filled below
                             protected: None,
                             transaction: None,
+                            protected_len: envelope.len() as u64,
+                            tx_len: 0, // filled once the transaction is signed
                             interpreted: true,
                         }),
                     );
@@ -691,6 +811,28 @@ impl Replica {
                 scopes: scopes.clone(),
                 frontier: next_frontier,
             };
+            // Space material quota — the full ledger delta: envelopes,
+            // the transaction record, and the receipt. The engine has already
+            // applied in memory, so an overflow is fail-stop: nothing durable
+            // changes, the frontier does not advance, and the handle must be
+            // reopened.
+            let (mut projected, _) = self.usage();
+            for (key, envelope, _) in &sealed {
+                if envelope.len() as u64 > self.quota.max_body_bytes {
+                    self.poisoned = true;
+                    return Err(ReplicaCommitError::QuotaExceeded);
+                }
+                projected = projected.saturating_add(envelope.len() as u64);
+                if let Some(old) = self.bodies.get(key) {
+                    projected = projected.saturating_sub(old.protected_len);
+                }
+            }
+            projected = projected.saturating_add(tx.encode().len() as u64);
+            projected = projected.saturating_add(receipt_record.encode().len() as u64);
+            if projected > self.quota.max_space_bytes {
+                self.poisoned = true;
+                return Err(ReplicaCommitError::QuotaExceeded);
+            }
             if self.durable.is_some() {
                 Some(self.persist_transaction(
                     ctx,
@@ -707,6 +849,13 @@ impl Replica {
                 for (key, envelope, _) in &sealed {
                     self.raw_material
                         .insert(key.clone(), (envelope.clone(), tx_bytes.clone()));
+                    if let Some(Some(record)) = new_records.get_mut(key) {
+                        record.tx_len = tx_bytes.len() as u64;
+                        record.tx_commitment = tx_commitment(&tx_bytes);
+                        if let Some(d) = tx.descriptors.iter().find(|d| &d.key() == key) {
+                            record.descriptor_hash = descriptor_hash(d);
+                        }
+                    }
                 }
                 Some(receipt_record)
             }
@@ -804,6 +953,69 @@ impl Replica {
                 ));
             }
             resolved.push((descriptor, payload));
+        }
+
+        // Quota reservation BEFORE any byte reaches the engine or staging:
+        // project the post-incorporation ledger; overflow refuses the whole
+        // transaction with nothing staged, no eviction, and no frontier
+        // change.
+        {
+            let (mut projected_bytes, mut projected_bodies) = self.usage();
+            let mut opaque_delta: BTreeMap<WorldId, (u64, u64)> = BTreeMap::new();
+            let mut counted_tx = false;
+            for (descriptor, envelope) in &resolved {
+                let key = descriptor.key();
+                if envelope.len() as u64 > self.quota.max_body_bytes {
+                    return Err(ReplicaCommitError::QuotaExceeded);
+                }
+                let old = self.bodies.get(&key);
+                // Byte-identical known material costs nothing.
+                if let Some(old_record) = old {
+                    if old_record.protected.map(|r| r.hash) == Some(object_ref(envelope).hash) {
+                        continue;
+                    }
+                }
+                projected_bytes = projected_bytes.saturating_add(envelope.len() as u64);
+                match old {
+                    Some(old_record) => {
+                        projected_bytes = projected_bytes.saturating_sub(old_record.protected_len);
+                    }
+                    None => projected_bodies += 1,
+                }
+                if !counted_tx {
+                    projected_bytes = projected_bytes.saturating_add(tx.encode().len() as u64);
+                    counted_tx = true;
+                }
+                // The opaque-branch prediction mirrors the classification
+                // below (both are pure).
+                let supported = self
+                    .supported
+                    .lookup(&key.world, &descriptor.schema, descriptor.schema_version)
+                    .is_some();
+                let openable = mechanics::crypto::body_epoch_id(envelope)
+                    .and_then(|epoch| self.keys.as_ref().and_then(|k| k.opening_key(&epoch)))
+                    .is_some();
+                if !supported || !openable {
+                    let entry = opaque_delta.entry(key.world.clone()).or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(envelope.len() as u64);
+                    if old.is_none() {
+                        entry.1 += 1;
+                    }
+                }
+            }
+            if projected_bytes > self.quota.max_space_bytes
+                || projected_bodies > self.quota.max_space_bodies
+            {
+                return Err(ReplicaCommitError::QuotaExceeded);
+            }
+            for (world, (dbytes, dbodies)) in opaque_delta {
+                let (cur_bytes, cur_bodies) = self.opaque_usage(&world);
+                if cur_bytes.saturating_add(dbytes) > self.quota.max_unknown_world_bytes
+                    || cur_bodies.saturating_add(dbodies) > self.quota.max_unknown_world_bodies
+                {
+                    return Err(ReplicaCommitError::OpaqueQuotaExceeded);
+                }
+            }
         }
 
         let previous = self.frontier;
@@ -904,6 +1116,8 @@ impl Replica {
                                     tx_commitment: [0u8; 32], // filled at persist
                                     protected: None,
                                     transaction: None,
+                                    protected_len: envelope.len() as u64,
+                                    tx_len: tx.encode().len() as u64,
                                     interpreted: true,
                                 }),
                             ));
@@ -958,6 +1172,8 @@ impl Replica {
                             tx_commitment: [0u8; 32],
                             protected: None,
                             transaction: None,
+                            protected_len: envelope.len() as u64,
+                            tx_len: tx.encode().len() as u64,
                             interpreted: false,
                         }),
                     ));
@@ -1013,6 +1229,180 @@ impl Replica {
         self.frontier = next_frontier;
         outcome.current = next_frontier;
         Ok(outcome)
+    }
+
+    /// Validate a completed Contact's staged material into a **sealed**
+    /// [`crate::convergence::ValidatedContactBundle`] — the only input
+    /// [`Replica::incorporate_bundle`] accepts. Order matters and is durable:
+    ///
+    /// 1. the staged records split into mechanics authority material and
+    ///    canonical signed transactions;
+    /// 2. the authority batch is incorporated **first** as its own durable
+    ///    phase via the mechanics [`crate::convergence::AuthorityIncorporator`]
+    ///    (legitimate authority advancement is independently valid Space
+    ///    history and may survive a later Body failure);
+    /// 3. the manifest root must be canonical, correctly signed, and its
+    ///    signer authorized at its authority frontier;
+    /// 4. the pages must be complete, canonical, and exactly the root's;
+    /// 5. every transaction must verify with signer standing at its referenced
+    ///    historical frontier;
+    /// 6. every received Body payload must resolve to exactly one descriptor
+    ///    of a provided transaction, match its ciphertext commitment, and be
+    ///    named by a manifest entry binding both the descriptor and the
+    ///    transaction — **no received object outside the verified graph is
+    ///    admitted**.
+    ///
+    /// Any failure rejects the whole staging with nothing retained (the
+    /// already-durable authority receipt excepted, by design).
+    pub fn validate_contact(
+        &self,
+        staged: &crate::convergence::StagedContactMaterial,
+        authority: &dyn AuthoritySource,
+        incorporator: &mut dyn crate::convergence::AuthorityIncorporator,
+    ) -> Result<crate::convergence::ValidatedContactBundle, ReplicaCommitError> {
+        let illegit = |m: String| ReplicaCommitError::Illegitimate(m);
+        // 1. Split the authority section.
+        let mut transactions: Vec<(BodyTransactionV1, Vec<u8>)> = Vec::new();
+        let mut authority_material: Vec<Vec<u8>> = Vec::new();
+        for record in &staged.authority_records {
+            match BodyTransactionV1::decode_canonical(record) {
+                Ok(tx) => transactions.push((tx, record.clone())),
+                Err(_) => authority_material.push(record.clone()),
+            }
+        }
+        // 2. Authority first — an explicit durable phase with its receipt.
+        let authority_receipt = incorporator
+            .incorporate_authority(&authority_material)
+            .map_err(|e| illegit(format!("authority batch: {e}")))?;
+        // 3. + 4. Authority-verified manifest root and its complete pages.
+        let root = ManifestRootV1::decode_canonical(&staged.manifest_root_bytes)
+            .map_err(|e| illegit(format!("manifest root: {e}")))?;
+        let root_space = root.space;
+        let authorized = root
+            .verify_authorized(authority)
+            .map_err(|e| illegit(format!("manifest root: {e}")))?;
+        let mut pages = Vec::with_capacity(staged.manifest_pages.len());
+        for bytes in &staged.manifest_pages {
+            pages.push(
+                ManifestPageV1::decode_canonical(bytes)
+                    .map_err(|e| illegit(format!("manifest page: {e}")))?,
+            );
+        }
+        authorized
+            .root()
+            .verify_pages(&pages)
+            .map_err(|e| illegit(format!("manifest pages: {e}")))?;
+        let entries: BTreeMap<BodyKey, &ManifestEntryV1> = pages
+            .iter()
+            .flat_map(|p| p.entries.iter())
+            .map(|e| (e.key.clone(), e))
+            .collect();
+        // 5. Every provided transaction verifies with historical standing,
+        //    bound to the root's Space.
+        for (tx, _) in &transactions {
+            tx.verify_authorized(authority)
+                .map_err(|e| illegit(format!("transaction: {e}")))?;
+            if tx.space != root_space {
+                return Err(illegit("transaction outside the root's Space".into()));
+            }
+        }
+        // 6. Every received Body payload resolves through the verified graph.
+        let mut units: BTreeMap<[u8; 16], (BodyTransactionV1, Vec<(BodyKey, Vec<u8>)>)> =
+            BTreeMap::new();
+        for (tx_id, key, envelope) in &staged.bodies {
+            if envelope.len() > MAX_BODY_BYTES {
+                return Err(illegit("payload exceeds the Body maximum".into()));
+            }
+            let Some((tx, tx_bytes)) = transactions.iter().find(|(t, _)| &t.transaction == tx_id)
+            else {
+                return Err(illegit("payload without a provided transaction".into()));
+            };
+            let Some(descriptor) = tx.descriptors.iter().find(|d| &d.key() == key) else {
+                return Err(illegit("payload without a matching descriptor".into()));
+            };
+            if !descriptor.commits_to(envelope) {
+                return Err(illegit(
+                    "payload does not match the signed commitment".into(),
+                ));
+            }
+            let Some(entry) = entries.get(key) else {
+                return Err(illegit("payload outside the advertised manifest".into()));
+            };
+            if entry.descriptor_hash != descriptor_hash(descriptor)
+                || entry.transaction_commitment != tx_commitment(tx_bytes)
+            {
+                return Err(illegit(
+                    "manifest entry does not bind this descriptor/transaction".into(),
+                ));
+            }
+            units
+                .entry(*tx_id)
+                .or_insert_with(|| (tx.clone(), Vec::new()))
+                .1
+                .push((key.clone(), envelope.clone()));
+        }
+        Ok(crate::convergence::ValidatedContactBundle {
+            authority_receipt,
+            units: units.into_values().collect(),
+        })
+    }
+
+    /// Incorporate a sealed validated bundle — the only Convergence entry for
+    /// Contact-received material. Everything the bundle names was verified by
+    /// [`Replica::validate_contact`]; per-transaction incorporation still
+    /// re-verifies legitimacy (defense in depth) and enforces quotas before
+    /// any byte reaches the engine.
+    pub fn incorporate_bundle(
+        &mut self,
+        ctx: &CommitContext<'_>,
+        bundle: crate::convergence::ValidatedContactBundle,
+        authority: &dyn AuthoritySource,
+    ) -> Result<ConvergenceOutcome, ReplicaCommitError> {
+        let mut total = ConvergenceOutcome::unchanged(self.frontier);
+        for (tx, payloads) in &bundle.units {
+            let o = self.incorporate(ctx, tx, payloads, authority)?;
+            total.accepted += o.accepted;
+            total.unchanged += o.unchanged;
+            total.rejected += o.rejected;
+            total.unsupported_retained += o.unsupported_retained;
+            total.retryable += o.retryable;
+            total.current = o.current;
+        }
+        Ok(total)
+    }
+
+    /// Build and sign the current Manifest (root + pages) over the full Body
+    /// set — the advertisement a Contact serves. Deterministic for a given
+    /// state and signer.
+    pub fn export_manifest(
+        &self,
+        ctx: &CommitContext<'_>,
+    ) -> Result<(Vec<u8>, Vec<Vec<u8>>), ReplicaCommitError> {
+        let entries: Vec<ManifestEntryV1> = self
+            .bodies
+            .iter()
+            .map(|(key, r)| ManifestEntryV1 {
+                key: key.clone(),
+                descriptor_hash: r.descriptor_hash,
+                transaction_commitment: r.tx_commitment,
+            })
+            .collect();
+        let mut pages: Vec<ManifestPageV1> = Vec::new();
+        for (i, chunk) in entries.chunks(MAX_ENTRIES_PER_PAGE).enumerate() {
+            pages.push(
+                ManifestPageV1::new(ctx.space, i as u32, chunk.to_vec())
+                    .ok_or_else(|| ReplicaCommitError::Illegitimate("space id shape".into()))?,
+            );
+        }
+        let root = ManifestRootV1::sign_with(
+            ctx.space,
+            self.frontier,
+            &pages,
+            ctx.authority_frontier.clone(),
+            ctx.signer,
+        )
+        .ok_or_else(|| ReplicaCommitError::Illegitimate("sign manifest root".into()))?;
+        Ok((root.encode(), pages.iter().map(|p| p.encode()).collect()))
     }
 
     /// Export this Replica's current material for a peer: for each Body, its
@@ -1116,6 +1506,8 @@ impl Replica {
                         tx_commitment: [0u8; 32],
                         protected: None,
                         transaction: None,
+                        protected_len: 0,
+                        tx_len: 0,
                         interpreted: true,
                     };
                     self.bodies.insert(key, record);
@@ -1179,6 +1571,8 @@ impl Replica {
                 record.protected = Some(object_ref(envelope));
                 record.transaction = Some(tx_ref);
                 record.tx_commitment = commitment;
+                record.protected_len = envelope.len() as u64;
+                record.tx_len = tx_bytes.len() as u64;
                 if record.descriptor_hash == [0u8; 32] {
                     if let Some(d) = tx.descriptors.iter().find(|d| &d.key() == key) {
                         record.descriptor_hash = descriptor_hash(d);
@@ -1285,6 +1679,7 @@ impl Replica {
             version: 1,
             space: Some(space.clone()),
             frontier: next_frontier,
+            quota: self.quota,
             bodies: bodies.clone().into_iter().collect(),
             receipts: receipt_meta.clone(),
             manifest_root: Some(object_ref(&root_bytes)),

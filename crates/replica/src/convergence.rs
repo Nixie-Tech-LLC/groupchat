@@ -63,6 +63,69 @@ impl ConvergenceOutcome {
     }
 }
 
+/// The staged material a completed Contact hands to validation — raw,
+/// **untrusted** bytes exactly as received. The transport (Contact machine)
+/// has proven only transcript completeness; every legitimacy property is
+/// established by [`crate::Replica::validate_contact`].
+#[derive(Debug, Clone)]
+pub struct StagedContactMaterial {
+    /// The authority-section records: mechanics authority material and the
+    /// signed `BodyTransactionV1` records, byte-canonical.
+    pub authority_records: Vec<Vec<u8>>,
+    /// The signed manifest root, byte-canonical.
+    pub manifest_root_bytes: Vec<u8>,
+    /// The manifest pages, ordered by page index, byte-canonical.
+    pub manifest_pages: Vec<Vec<u8>>,
+    /// Received protected Body payloads: `(transaction id, key, envelope)`.
+    pub bodies: Vec<([u8; 16], crate::ids::BodyKey, Vec<u8>)>,
+}
+
+/// The durable receipt of an authority-batch incorporation — the explicit
+/// **first** durable phase of Convergence. Mechanics commits the canonical
+/// authority batch idempotently and names the resulting historical frontier;
+/// the Body/Manifest phase then requires this receipt, so Bodies never commit
+/// under authority that is not durably established. A replay of the same
+/// batch returns the same receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityReceipt {
+    pub frontier: crate::frontier::AuthorityFrontier,
+}
+
+/// The mechanics-owned authority incorporation seam. The composition root
+/// implements it over the durable signed-history store; the fixture
+/// implementation for tests records batches in memory.
+pub trait AuthorityIncorporator {
+    /// Durably, idempotently commit a canonical authority batch. Legitimate
+    /// authority advancement may survive a later Body failure — it is
+    /// independently valid Space history.
+    fn incorporate_authority(&mut self, records: &[Vec<u8>]) -> Result<AuthorityReceipt, String>;
+}
+
+/// A **sealed** validated Contact bundle: constructible only by
+/// [`crate::Replica::validate_contact`], after every check passed — transcript
+/// -complete staging, durable authority receipt, authority-verified manifest
+/// root, complete verified pages, per-entry authorized transactions,
+/// descriptor-bound payloads, and no received object outside the verified
+/// graph. [`crate::Replica::incorporate_bundle`] accepts only this.
+pub struct ValidatedContactBundle {
+    pub(crate) authority_receipt: AuthorityReceipt,
+    pub(crate) units: Vec<(
+        crate::transaction::BodyTransactionV1,
+        Vec<(crate::ids::BodyKey, Vec<u8>)>,
+    )>,
+}
+
+impl ValidatedContactBundle {
+    /// The durable authority receipt this bundle's Body phase rests on.
+    pub fn authority_receipt(&self) -> &AuthorityReceipt {
+        &self.authority_receipt
+    }
+    /// How many validated transactions the bundle carries.
+    pub fn transaction_count(&self) -> usize {
+        self.units.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
