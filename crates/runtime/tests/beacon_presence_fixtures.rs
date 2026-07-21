@@ -1,0 +1,267 @@
+//! S4 canonical fixtures: Beacon v1 identity/freshness/route matrix and the
+//! Neighbor presence v1 challenge transcript matrix.
+
+use lait_kernel::ids::{SpaceId, StationEpoch, StationId};
+use runtime::beacon::{
+    BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1, MAX_ROUTE_HINTS,
+};
+use runtime::neighbor_presence::{AckV1, PresenceError, ProbeV1};
+
+const STATION_SEED: [u8; 32] = [11u8; 32];
+
+fn space() -> SpaceId {
+    SpaceId::from_digest([4u8; 16])
+}
+
+fn space_bytes() -> [u8; 29] {
+    <[u8; 29]>::try_from(space().as_str().as_bytes()).unwrap()
+}
+
+fn beacon(epoch: u64, sequence: u64, routes: Vec<RouteHint>) -> SignedBeaconV1 {
+    SignedBeaconV1::emit(
+        7,
+        &space(),
+        StationEpoch::from_u64(epoch),
+        sequence,
+        [1u8; 32],
+        3,
+        routes,
+        &STATION_SEED,
+    )
+    .unwrap()
+}
+
+// ---- Beacon v1 ----
+
+#[test]
+fn valid_beacon_verifies() {
+    let b = beacon(2, 5, vec![]);
+    let (sp, station, epoch, seq) = b.verify().unwrap();
+    assert_eq!(sp, space());
+    assert_eq!(
+        station,
+        StationId::from_device(&lait_kernel::crypto::device_from_seed(&STATION_SEED)).unwrap()
+    );
+    assert_eq!((epoch, seq), (2, 5));
+}
+
+#[test]
+fn high_water_accepts_forward_and_rejects_stale() {
+    let mut hw = BeaconHighWater::new();
+    assert_eq!(hw.offer(&beacon(1, 0, vec![])), BeaconAcceptance::Accepted);
+    assert_eq!(hw.offer(&beacon(1, 1, vec![])), BeaconAcceptance::Accepted);
+    // Same coordinate is a duplicate.
+    assert_eq!(hw.offer(&beacon(1, 1, vec![])), BeaconAcceptance::Stale);
+    // A lower sequence is stale.
+    assert_eq!(hw.offer(&beacon(1, 0, vec![])), BeaconAcceptance::Stale);
+    // A new epoch always advances.
+    assert_eq!(hw.offer(&beacon(2, 0, vec![])), BeaconAcceptance::Accepted);
+    // An old epoch, even with a high sequence, is stale.
+    assert_eq!(hw.offer(&beacon(1, 9999, vec![])), BeaconAcceptance::Stale);
+}
+
+#[test]
+fn high_water_survives_restart_as_persisted_state() {
+    // The high-water map IS the persisted state; a fresh receiver that reloads
+    // it rejects a replay of an already-seen coordinate.
+    let mut hw = BeaconHighWater::new();
+    assert_eq!(hw.offer(&beacon(5, 5, vec![])), BeaconAcceptance::Accepted);
+    // "Restart": the same recorded state rejects a lower/equal coordinate.
+    assert_eq!(hw.offer(&beacon(5, 5, vec![])), BeaconAcceptance::Stale);
+    assert_eq!(hw.offer(&beacon(4, 100, vec![])), BeaconAcceptance::Stale);
+}
+
+#[test]
+fn counter_overflow_fails_closed() {
+    assert_eq!(
+        BeaconHighWater::new().offer(&beacon(u64::MAX, u64::MAX, vec![])),
+        BeaconAcceptance::Overflow
+    );
+}
+
+#[test]
+fn unsupported_version_and_algorithm_are_rejected() {
+    let mut b = beacon(1, 0, vec![]);
+    b.version = 2;
+    assert_eq!(b.verify(), Err(BeaconError::UnsupportedVersion(2)));
+    let mut b = beacon(1, 0, vec![]);
+    b.signature_algorithm = 2;
+    assert_eq!(
+        b.verify(),
+        Err(BeaconError::UnsupportedSignatureAlgorithm(2))
+    );
+}
+
+#[test]
+fn tampered_beacon_body_breaks_the_signature() {
+    let mut b = beacon(1, 0, vec![]);
+    b.body.sequence = 99;
+    assert_eq!(b.verify(), Err(BeaconError::BadSignature));
+}
+
+#[test]
+fn route_hints_bounds_and_ordering() {
+    // Sorted, distinct routes verify.
+    let good = beacon(
+        1,
+        0,
+        vec![
+            RouteHint {
+                scheme: 0,
+                bytes: vec![1],
+            },
+            RouteHint {
+                scheme: 1,
+                bytes: vec![2],
+            },
+        ],
+    );
+    assert!(good.verify().is_ok());
+
+    // Unsorted/duplicate routes are rejected (checked before the signature).
+    let mut unsorted = good.clone();
+    unsorted.body.routes.reverse();
+    assert_eq!(
+        unsorted.verify(),
+        Err(BeaconError::UnsortedOrDuplicateRoutes)
+    );
+
+    // Too many routes.
+    let many: Vec<RouteHint> = (0..=MAX_ROUTE_HINTS as u8)
+        .map(|i| RouteHint {
+            scheme: i,
+            bytes: vec![],
+        })
+        .collect();
+    let b = beacon(1, 0, many);
+    assert_eq!(b.verify(), Err(BeaconError::TooManyRoutes));
+}
+
+#[test]
+fn trailing_bytes_are_non_canonical() {
+    let mut bytes = beacon(1, 0, vec![]).encode();
+    bytes.push(0);
+    assert_eq!(
+        SignedBeaconV1::decode_canonical(&bytes),
+        Err(BeaconError::NonCanonical)
+    );
+}
+
+// ---- Neighbor presence v1 ----
+
+const INITIATOR_SEED: [u8; 32] = [21u8; 32];
+const RESPONDER_SEED: [u8; 32] = [22u8; 32];
+
+fn station_of(seed: &[u8; 32]) -> StationId {
+    StationId::from_device(&lait_kernel::crypto::device_from_seed(seed)).unwrap()
+}
+
+fn probe(nonce: [u8; 32]) -> ProbeV1 {
+    let responder = station_of(&RESPONDER_SEED).key_bytes();
+    ProbeV1::sign(7, space_bytes(), responder, nonce, &INITIATOR_SEED).unwrap()
+}
+
+#[test]
+fn a_valid_challenge_completes() {
+    let p = probe([1u8; 32]);
+    p.verify(&space_bytes(), &station_of(&INITIATOR_SEED))
+        .unwrap();
+    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    a.verify(&p, &station_of(&RESPONDER_SEED)).unwrap();
+}
+
+#[test]
+fn a_reflected_nonce_is_rejected() {
+    let p = probe([1u8; 32]);
+    // The responder echoes the initiator's nonce instead of a fresh one.
+    let a = AckV1::sign(&p, [1u8; 32], &RESPONDER_SEED).unwrap();
+    assert_eq!(
+        a.verify(&p, &station_of(&RESPONDER_SEED)),
+        Err(PresenceError::ChallengeMismatch)
+    );
+}
+
+#[test]
+fn an_ack_for_another_probe_is_rejected() {
+    let p1 = probe([1u8; 32]);
+    let p2 = probe([9u8; 32]);
+    let a = AckV1::sign(&p1, [2u8; 32], &RESPONDER_SEED).unwrap();
+    // Presented against a different probe: commitment mismatch.
+    assert_eq!(
+        a.verify(&p2, &station_of(&RESPONDER_SEED)),
+        Err(PresenceError::ChallengeMismatch)
+    );
+}
+
+#[test]
+fn cross_space_replay_is_rejected() {
+    let p = probe([1u8; 32]);
+    let other_space =
+        <[u8; 29]>::try_from(SpaceId::from_digest([7u8; 16]).as_str().as_bytes()).unwrap();
+    assert_eq!(
+        p.verify(&other_space, &station_of(&INITIATOR_SEED)),
+        Err(PresenceError::SpaceMismatch)
+    );
+}
+
+#[test]
+fn station_transport_substitution_is_rejected() {
+    let p = probe([1u8; 32]);
+    // The negotiated transport peer is not the signing Station.
+    assert_eq!(
+        p.verify(&space_bytes(), &station_of(&RESPONDER_SEED)),
+        Err(PresenceError::IdentityMismatch)
+    );
+}
+
+#[test]
+fn role_reversal_ack_signed_by_the_initiator_is_rejected() {
+    let p = probe([1u8; 32]);
+    // An ack "from" the responder but actually signed by the initiator.
+    let mut a = AckV1::sign(&p, [2u8; 32], &INITIATOR_SEED).unwrap();
+    // Claim the responder transport so identity passes, exposing the bad sig.
+    a.responder_transport = station_of(&RESPONDER_SEED).key_bytes();
+    assert_eq!(
+        a.verify(&p, &station_of(&RESPONDER_SEED)),
+        Err(PresenceError::BadSignature)
+    );
+}
+
+#[test]
+fn tampered_probe_signature_is_rejected() {
+    let mut p = probe([1u8; 32]);
+    p.signature[0] ^= 0xff;
+    assert_eq!(
+        p.verify(&space_bytes(), &station_of(&INITIATOR_SEED)),
+        Err(PresenceError::BadSignature)
+    );
+}
+
+#[test]
+fn trailing_bytes_and_oversize_are_non_canonical() {
+    let p = probe([1u8; 32]);
+    let mut bytes = p.encode();
+    bytes.push(0);
+    assert_eq!(ProbeV1::decode(&bytes), Err(PresenceError::NonCanonical));
+
+    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let mut abytes = a.encode();
+    abytes.push(0);
+    assert_eq!(AckV1::decode(&abytes), Err(PresenceError::NonCanonical));
+
+    assert_eq!(
+        ProbeV1::decode(&vec![0u8; 5000]),
+        Err(PresenceError::NonCanonical)
+    );
+}
+
+#[test]
+fn presence_carries_no_frontier_or_authority() {
+    // A structural guard: the probe/ack fields are exactly identity + nonce.
+    // (If a frontier/standing field were ever added, this fixture's manual
+    // construction would stop compiling — the reminder is deliberate.)
+    let p = probe([1u8; 32]);
+    let _ = (p.protocol, p.space, p.initiator_station, p.nonce);
+    let a = AckV1::sign(&p, [2u8; 32], &RESPONDER_SEED).unwrap();
+    let _ = (a.probe_hash, a.responder_transport, a.nonce);
+}

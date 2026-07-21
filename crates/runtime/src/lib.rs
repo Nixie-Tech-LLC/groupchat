@@ -26,22 +26,27 @@
 //! consumption semantics.
 
 pub mod action;
+pub mod beacon;
 pub mod coordinates;
 #[cfg(test)]
 mod dispatch_tests;
 pub mod error;
 pub mod lifecycle;
+pub mod neighbor_presence;
 pub mod registry;
 pub mod session;
+pub(crate) mod wire;
 pub mod world;
 
 pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
+pub use beacon::{BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1};
 pub use coordinates::{
     AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
 };
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
 pub use lifecycle::{ContactOutcome, Neighbor, Orbit, OrbitObservation, Runtime, Station};
+pub use neighbor_presence::{AckV1, PresenceError, ProbeV1};
 pub use registry::{RuntimeBuilder, WorldRegistry};
 pub use session::{Observation, ObservationCursor, Session};
 pub use world::{
