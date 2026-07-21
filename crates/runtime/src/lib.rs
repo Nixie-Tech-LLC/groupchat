@@ -54,8 +54,8 @@ pub use lifecycle::{
 };
 pub use neighbor_presence::{AckV1, PresenceError, ProbeV1};
 pub use registry::{RuntimeBuilder, WorldRegistry};
-pub use session::{Observation, ObservationCursor, Session};
+pub use session::{CommittedEffect, Observation, ObservationCursor, Session};
 pub use world::{
-    PrincipalFacts, Standing, World, WorldContext, WorldEffect, WorldIntent, WorldLimits,
-    WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
+    BodyReader, PrincipalFacts, Standing, World, WorldContext, WorldEffect, WorldIntent,
+    WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
 };

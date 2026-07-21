@@ -63,6 +63,53 @@ pub struct Observation {
     pub frontier: ReplicaFrontier,
 }
 
+/// The result of a durable [`Session::submit`]: the application-defined effect
+/// bytes, the **committed** Replica frontier the change advanced to, and the
+/// Observation Runtime published. A `CommittedEffect` is proof of durability —
+/// it is returned only after the Replica advanced from a real Fabric receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedEffect {
+    pub effect: Vec<u8>,
+    pub frontier: ReplicaFrontier,
+    pub observation: Observation,
+}
+
+/// The Station's exclusive committing state, shared with its Sessions. It holds
+/// the single Replica writer (so all commits serialize) and the monotonic
+/// Observation sequence. Held behind an `Arc` by the Station and every Session;
+/// a Session can commit through it but never stop the Station.
+pub(crate) struct StationCore {
+    replica: std::sync::Mutex<replica::Replica>,
+    obs_seq: std::sync::atomic::AtomicU64,
+    epoch: StationEpoch,
+}
+
+impl StationCore {
+    pub(crate) fn new(epoch: StationEpoch) -> Self {
+        Self {
+            replica: std::sync::Mutex::new(replica::Replica::in_memory()),
+            obs_seq: std::sync::atomic::AtomicU64::new(0),
+            epoch,
+        }
+    }
+
+    pub(crate) fn frontier(&self) -> ReplicaFrontier {
+        self.replica
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frontier()
+    }
+}
+
+/// A [`BodyReader`] over a locked Replica, handed to a World during a query.
+struct ReplicaReader<'a>(&'a replica::Replica);
+
+impl crate::world::BodyReader for ReplicaReader<'_> {
+    fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>> {
+        self.0.read(key)
+    }
+}
+
 /// A local caller's handle to a hosted World.
 pub struct Session {
     world_id: WorldId,
@@ -76,6 +123,8 @@ pub struct Session {
     /// A shared flag: `false` once the Station is going dormant or has exited.
     /// A Session only *reads* it — it can never stop the Station.
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The Station's exclusive committing state.
+    core: Arc<StationCore>,
 }
 
 impl Session {
@@ -88,6 +137,7 @@ impl Session {
         limits: WorldLimits,
         schemas: Vec<BodySchema>,
         alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        core: Arc<StationCore>,
     ) -> Self {
         Self {
             world_id,
@@ -97,6 +147,7 @@ impl Session {
             limits,
             schemas,
             alive,
+            core,
         }
     }
 
@@ -157,32 +208,68 @@ impl Session {
         self.epoch
     }
 
-    /// Submit an application intent. Runtime derives the principal facts; the
-    /// caller cannot assert them. The World stages Body operations; durable
-    /// commit and Observation publication land in S5.
-    pub fn submit(&self, intent: WorldIntent) -> Result<WorldEffect, WorldError> {
+    /// Submit an application intent and **durably commit** its effect. Runtime
+    /// derives the principal facts (the caller cannot assert them), validates the
+    /// request, runs the World to stage Body operations, then commits them
+    /// through the Station's exclusive Replica writer and publishes an
+    /// Observation. The returned [`CommittedEffect`] is proof of durability: it
+    /// exists only after the Replica advanced from a real Fabric receipt. A
+    /// refused request commits nothing.
+    pub fn submit(&self, intent: WorldIntent) -> Result<CommittedEffect, WorldError> {
         self.ensure_live()?;
         self.ensure_within_limit(intent.payload.len())?;
         self.ensure_writable_schema(&intent.schema, intent.schema_version)?;
         let world = &self.world;
         let principal = &self.principal;
-        // Contain a World panic as a typed error — it never ends the Station.
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let label = intent.schema.as_str().to_string();
+        // Run the World callback, containing a panic as a typed error.
+        let effect: WorldEffect = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let mut ctx = WorldContext::new(principal);
             world.submit(&mut ctx, intent)
         }))
-        .unwrap_or(Err(WorldError::WorldImplementationFailed))
+        .unwrap_or(Err(WorldError::WorldImplementationFailed))?;
+
+        // Durably commit the staged operations through the exclusive writer.
+        let mut replica = self.core.replica.lock().unwrap_or_else(|p| p.into_inner());
+        let frontier = replica
+            .commit(&label, &effect.operations)
+            .map_err(|_| WorldError::Persistence)?;
+        drop(replica);
+
+        // Publish the Observation for the committed change.
+        let sequence = self
+            .core
+            .obs_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        Ok(CommittedEffect {
+            effect: effect.effect,
+            frontier,
+            observation: Observation {
+                epoch: self.core.epoch,
+                sequence,
+                reset: false,
+                world: self.world_id.clone(),
+                scopes: effect.scopes,
+                frontier,
+            },
+        })
     }
 
-    /// Query the World over the stable committed snapshot.
+    /// Query the World over the stable committed snapshot. The World reads
+    /// committed Bodies through the bounded context; the snapshot is held for the
+    /// duration of the call so the projection is derived from one consistent
+    /// frontier.
     pub fn query(&self, query: WorldQuery) -> Result<WorldProjection, WorldError> {
         self.ensure_live()?;
         self.ensure_within_limit(query.payload.len())?;
         self.ensure_readable_schema(&query.schema, query.schema_version)?;
         let world = &self.world;
         let principal = &self.principal;
+        let replica = self.core.replica.lock().unwrap_or_else(|p| p.into_inner());
+        let reader = ReplicaReader(&replica);
         std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let ctx = WorldContext::new(principal);
+            let ctx = WorldContext::with_reads(principal, &reader);
             world.query(&ctx, query)
         }))
         .unwrap_or(Err(WorldError::WorldImplementationFailed))

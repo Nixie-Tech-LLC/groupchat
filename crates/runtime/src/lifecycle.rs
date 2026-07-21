@@ -281,6 +281,7 @@ impl Orbit {
             cancel: CancelToken::new(),
             handles: Mutex::new(Vec::new()),
             drain_deadline: options.drain_deadline,
+            core: Arc::new(crate::session::StationCore::new(epoch)),
         })
     }
 
@@ -325,6 +326,10 @@ pub struct Station {
     /// The one tracked task set.
     handles: Mutex<Vec<JoinHandle<()>>>,
     drain_deadline: Duration,
+    /// The exclusive committing state (Replica writer + Observation sequence),
+    /// shared with docked Sessions so their commits serialize through the one
+    /// Replica. Sessions hold a clone but can never stop the Station.
+    core: Arc<crate::session::StationCore>,
 }
 
 impl std::fmt::Debug for Station {
@@ -396,7 +401,13 @@ impl Station {
             registration.limits,
             registration.schemas.clone(),
             self.alive.clone(),
+            self.core.clone(),
         ))
+    }
+
+    /// The current committed Replica frontier (advances as Sessions submit).
+    pub fn frontier(&self) -> replica::frontier::ReplicaFrontier {
+        self.core.frontier()
     }
 
     /// Known/discoverable Neighbors. Reachability is advisory. Populated in S4/S5.

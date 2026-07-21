@@ -111,26 +111,52 @@ pub struct WorldProjection {
     pub frontier: replica::frontier::ReplicaFrontier,
 }
 
-/// The bounded capability handed to World callbacks. It exposes authorized reads
-/// of the stable committed snapshot and staged LAIT-owned Body operations, and
-/// **nothing** below the boundary: no Loro, no mutable storage, no keys, no
-/// network. The concrete read/stage surface is implemented in S5; S0 fixes the
-/// principal-facts accessor and the borrow shape (`WorldContext<'_>`).
+/// A read view of the committed Body snapshot, handed to a World during a query.
+/// It exposes only authorized canonical reads — no Loro, no mutation, no keys.
+/// Runtime backs it with the Station's Replica.
+pub trait BodyReader {
+    /// The committed canonical bytes of a Body, if present.
+    fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>>;
+}
+
+/// The bounded capability handed to World callbacks. It exposes the principal
+/// facts, authorized reads of the stable committed snapshot (during a query),
+/// and **nothing** below the boundary: no Loro, no mutable storage, no keys, no
+/// network. A World stages Body operations by *returning* them in a
+/// [`WorldEffect`]; Runtime — not the World — performs the durable commit.
 pub struct WorldContext<'a> {
     principal: &'a PrincipalFacts,
+    reads: Option<&'a dyn BodyReader>,
 }
 
 impl<'a> WorldContext<'a> {
-    /// Construct a context over a principal's facts. Runtime owns construction;
-    /// World code only reads.
+    /// Construct a context over a principal's facts with no read access (submit
+    /// authorizes and stages; it does not read the snapshot).
     pub fn new(principal: &'a PrincipalFacts) -> Self {
-        Self { principal }
+        Self {
+            principal,
+            reads: None,
+        }
+    }
+
+    /// Construct a context with committed-snapshot read access (for a query).
+    pub fn with_reads(principal: &'a PrincipalFacts, reads: &'a dyn BodyReader) -> Self {
+        Self {
+            principal,
+            reads: Some(reads),
+        }
     }
 
     /// The derived facts for the docked principal. A World authorizes against
     /// these; it cannot replace them.
     pub fn principal(&self) -> &PrincipalFacts {
         self.principal
+    }
+
+    /// Read a Body from the stable committed snapshot. Returns `None` if the
+    /// Body is absent or this context has no read access (e.g. during submit).
+    pub fn read_body(&self, key: &BodyKey) -> Option<Vec<u8>> {
+        self.reads.and_then(|r| r.read_body(key))
     }
 }
 

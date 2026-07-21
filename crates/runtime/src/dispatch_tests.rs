@@ -78,14 +78,17 @@ impl World for NoteWorld {
     }
     fn query(
         &self,
-        _ctx: &WorldContext<'_>,
+        ctx: &WorldContext<'_>,
         query: WorldQuery,
     ) -> Result<WorldProjection, WorldError> {
         if query.schema.as_str() != "note" {
             return Err(WorldError::UnsupportedSchema);
         }
-        // Deterministic projection: uppercase the query payload as UTF-8.
-        let text = String::from_utf8(query.payload).map_err(|_| WorldError::InvalidRequest)?;
+        // Read the committed Body from the stable snapshot and uppercase it. An
+        // absent Body reads as empty.
+        let key = BodyKey::new(self.id.clone(), BodyId::from_bytes([0u8; 16]));
+        let committed = ctx.read_body(&key).unwrap_or_default();
+        let text = String::from_utf8(committed).map_err(|_| WorldError::InvalidRequest)?;
         Ok(WorldProjection {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
@@ -148,28 +151,36 @@ fn test_world_submits_and_queries_through_dispatch() {
         .dock(&world_id, principal(vec![Grant::Write]))
         .unwrap();
 
-    // Submit an intent and observe the staged operation + scope.
-    let effect = session
+    // A query before any submit reads the empty committed snapshot.
+    let empty = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(empty.bytes, b"");
+
+    // Submit an intent: it is durably committed and advances the frontier.
+    let committed = session
         .submit(WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
             payload: b"hello".to_vec(),
         })
         .unwrap();
-    assert_eq!(effect.operations.len(), 1);
-    assert_eq!(effect.scopes.len(), 1);
-    assert_eq!(effect.effect, b"hello");
-    assert!(matches!(
-        &effect.operations[0].1,
-        BodyOp::ReplaceAtomic { value } if value == b"hello"
-    ));
+    assert_eq!(committed.effect, b"hello");
+    assert_eq!(committed.frontier.transaction_count, 1);
+    assert_eq!(committed.observation.sequence, 1);
+    assert_eq!(committed.observation.scopes.len(), 1);
+    assert_ne!(committed.frontier, ReplicaFrontier::EMPTY);
 
-    // Query is deterministic for identical inputs.
+    // The query now reads back the committed Body.
     let proj = session
         .query(WorldQuery {
             schema: SchemaId::parse("note").unwrap(),
             schema_version: 1,
-            payload: b"hello".to_vec(),
+            payload: vec![],
         })
         .unwrap();
     assert_eq!(proj.bytes, b"HELLO");
