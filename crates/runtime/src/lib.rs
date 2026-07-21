@@ -27,6 +27,7 @@
 
 pub mod action;
 pub mod beacon;
+pub mod contact;
 pub mod coordinates;
 #[cfg(test)]
 mod dispatch_tests;
@@ -42,6 +43,10 @@ pub mod world;
 pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
 pub use beacon::{
     BeaconAcceptance, BeaconError, BeaconHighWater, RouteHint, SignedBeaconV1, VerifiedBeacon,
+};
+pub use contact::{
+    AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1, ContactHelloV1, ContactId,
+    ContactWireError, InitiatorReceiver, InitiatorState, Progress, ReceivedMaterial,
 };
 pub use coordinates::{
     AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
