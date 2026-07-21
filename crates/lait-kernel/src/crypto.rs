@@ -55,6 +55,30 @@ pub fn device_from_seed(seed: &[u8; 32]) -> DeviceId {
     DeviceId::from_key_string(data_encoding::HEXLOWER.encode(pk.as_bytes()))
 }
 
+/// Sign an **already-built preimage** with an identity seed's Ed25519 key,
+/// returning the detached 64-byte signature. Mechanics owns key operations; a
+/// higher layer (e.g. runtime's World-action envelope) builds the canonical
+/// length-framed preimage and hands it here, so no upper crate names a signature
+/// primitive. Domain separation and framing are the caller's responsibility.
+pub fn sign_detached(seed: &[u8; 32], preimage: &[u8]) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+    sk.sign(preimage).to_bytes()
+}
+
+/// Verify a detached Ed25519 signature over a preimage against a 32-byte public
+/// key (the raw bytes a [`DeviceId`]/`StationId` *is*). Never panics on a
+/// malformed key or signature — a bad input is a failed verification, not a
+/// crash.
+pub fn verify_detached(public_key: &[u8; 32], preimage: &[u8], signature: &[u8; 64]) -> bool {
+    use ed25519_dalek::Verifier;
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(signature);
+    vk.verify(preimage, &sig).is_ok()
+}
+
 fn random_nonce() -> [u8; NONCE_LEN] {
     let mut n = [0u8; NONCE_LEN];
     getrandom::fill(&mut n).expect("getrandom");

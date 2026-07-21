@@ -25,12 +25,16 @@
 //! World/Session/Contact in S5); their signatures here fix ownership and
 //! consumption semantics.
 
+pub mod action;
+#[cfg(test)]
+mod dispatch_tests;
 pub mod error;
 pub mod lifecycle;
 pub mod registry;
 pub mod session;
 pub mod world;
 
+pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
 pub use lifecycle::{ContactOutcome, Neighbor, Orbit, OrbitObservation, Runtime, Station};
 pub use registry::{RuntimeBuilder, WorldRegistry};

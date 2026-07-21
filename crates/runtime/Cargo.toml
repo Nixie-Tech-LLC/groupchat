@@ -16,6 +16,13 @@ replica = { path = "../replica" }
 lait-net = { path = "../lait-net" }
 
 serde = { version = "1", features = ["derive"] }
+# `[u8; 64]` signature fields: serde only derives arrays up to length 32.
+serde-byte-array = "0.1"
+# Canonical wire encoding for the signed World-action envelope (and later public
+# envelopes). postcard is the workspace-pinned canonical codec.
+postcard = { version = "1", features = ["use-std"] }
+# Payload commitment in the World-action header.
+blake3 = "1"
 anyhow = "1"
 
 [dev-dependencies]

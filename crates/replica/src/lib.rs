@@ -18,6 +18,7 @@
 //! planning and Fabric translation land in later stages (S5); the algebra is
 //! frozen as an S1 fixture.
 
+pub mod algebra;
 pub mod body;
 pub mod convergence;
 pub mod frontier;

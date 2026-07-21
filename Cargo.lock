@@ -4648,10 +4648,13 @@ name = "runtime"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "lait-kernel",
  "lait-net",
+ "postcard",
  "replica",
  "serde",
+ "serde-byte-array",
 ]
 
 [[package]]
