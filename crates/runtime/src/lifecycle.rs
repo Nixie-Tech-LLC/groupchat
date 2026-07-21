@@ -104,6 +104,9 @@ pub struct ActivationOptions {
     /// seams, and gossip. `None` activates an offline Station (valid; grants
     /// no new authority; `neighbors` still serves the persisted registry).
     pub comms: Option<crate::contact_driver::CommsOptions>,
+    /// The Observation ring capacity (`0` = the default 1024; hard maximum
+    /// 65,536).
+    pub observation_capacity: usize,
 }
 
 impl ActivationOptions {
@@ -112,6 +115,7 @@ impl ActivationOptions {
         Self {
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
             comms: None,
+            observation_capacity: 0,
         }
     }
 }
@@ -407,7 +411,12 @@ impl Orbit {
             crate::neighbors::NeighborRegistry::load(self.store.dir(), self.store.space())
                 .map_err(|e| LifecycleError::IntegrityFailure(e.to_string()))?,
         ));
-        let core = Arc::new(crate::session::StationCore::new(replica));
+        let capacity = if options.observation_capacity == 0 {
+            crate::session::DEFAULT_OBSERVATION_CAPACITY
+        } else {
+            options.observation_capacity
+        };
+        let core = Arc::new(crate::session::StationCore::new(epoch, capacity, replica));
         let station = Station {
             store: self.store,
             registry: self.registry,
@@ -926,7 +935,7 @@ mod tests {
         let space = orbit.space_id().clone();
         let opts = ActivationOptions {
             drain_deadline: Duration::from_millis(20),
-            comms: None,
+            ..Default::default()
         };
         let station = orbit.activate(opts).unwrap();
         let stop2 = stop.clone();

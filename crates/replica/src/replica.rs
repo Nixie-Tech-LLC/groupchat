@@ -1185,6 +1185,7 @@ impl Replica {
             outcome.current = previous;
             return Ok(outcome);
         }
+        outcome.scopes = changed.iter().map(|(k, _, _)| k.clone()).collect();
 
         // Advance the frontier from the transaction + engine evidence.
         let mut causal = Vec::with_capacity(16 + engine_causal.len());
@@ -1366,6 +1367,7 @@ impl Replica {
             total.rejected += o.rejected;
             total.unsupported_retained += o.unsupported_retained;
             total.retryable += o.retryable;
+            total.scopes.extend(o.scopes);
             total.current = o.current;
         }
         Ok(total)

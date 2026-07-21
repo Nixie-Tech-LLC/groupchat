@@ -280,6 +280,7 @@ fn a_real_iroh_contact_converges_two_stations() {
         .activate(ActivationOptions {
             drain_deadline: Duration::from_secs(5),
             comms: Some(comms_options(ta, STATION_A_SEED)),
+            observation_capacity: 0,
         })
         .unwrap();
     submit_kv(&station_a, "wire=real-iroh");
@@ -290,6 +291,7 @@ fn a_real_iroh_contact_converges_two_stations() {
         .activate(ActivationOptions {
             drain_deadline: Duration::from_secs(5),
             comms: Some(comms_options(tb, STATION_B_SEED)),
+            observation_capacity: 0,
         })
         .unwrap();
 

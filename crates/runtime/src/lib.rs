@@ -65,7 +65,10 @@ pub use lifecycle::{
 pub use neighbor_presence::{AckV1, PresenceError, ProbeV1, PRESENCE_ALPN_V1};
 pub use neighbors::{NeighborRecordV1, NeighborRegistry, RegistryError, StoredRoute};
 pub use registry::{RuntimeBuilder, WorldRegistry};
-pub use session::{CommittedEffect, Observation, ObservationCursor, Session};
+pub use session::{
+    CommittedEffect, Observation, ObservationCursor, ObservationStream, ObservationStreamError,
+    Session, DEFAULT_OBSERVATION_CAPACITY, MAX_OBSERVATION_CAPACITY,
+};
 pub use world::{
     AuthorityView, BodyReader, LocalIdentity, PrincipalFacts, PrincipalResolution, Standing, World,
     WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection, WorldQuery,

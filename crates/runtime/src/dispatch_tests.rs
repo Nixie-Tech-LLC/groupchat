@@ -1114,5 +1114,8 @@ fn observation_cursor_starts_at_a_reset_boundary() {
     let session = station.dock(&world_id, &writer()).unwrap();
     let cursor = ObservationCursor::start(session.epoch());
     assert_eq!(cursor.sequence, 0);
-    assert_eq!(session.observe(cursor), cursor);
+    // First use rebaselines: exactly one reset record.
+    let mut stream = session.observe(None);
+    let first = stream.try_next().unwrap().unwrap();
+    assert!(first.reset);
 }

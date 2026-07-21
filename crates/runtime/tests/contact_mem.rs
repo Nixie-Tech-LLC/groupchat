@@ -236,6 +236,7 @@ fn activate_with(
         .activate(ActivationOptions {
             drain_deadline: Duration::from_secs(5),
             comms: Some(comms_options(transport, seed, gossip)),
+            observation_capacity: 0,
         })
         .unwrap()
 }
@@ -295,12 +296,26 @@ fn two_stations_converge_through_the_public_contact_api() {
     submit_kv(&station_a, "farewell=bye");
 
     let station_b = activate_with(&rt_b, &coords, tb, STATION_B_SEED, None);
+    // Subscribe BEFORE the contact: remote convergence must publish exactly
+    // one live-epoch Observation after durable incorporation.
+    let world_id = WorldId::parse("dev.example.kv").unwrap();
+    let writer = Runtime::identity_from_seed(&WRITER_SEED);
+    let obs_session = station_b.dock(&world_id, &writer).unwrap();
+    let mut obs = obs_session.observe(None);
+    assert!(obs.try_next().unwrap().unwrap().reset);
     // The privileged administrative Contact, through the public API.
     let outcome = station_b
         .contact(&station_id(&STATION_A_SEED), ContactOptions)
         .unwrap();
     assert!(outcome.bytes_moved > 0, "bytes accounted separately");
     assert!(outcome.convergence.accepted >= 1);
+    let remote_record = obs
+        .next_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("remote convergence publishes");
+    assert!(!remote_record.reset);
+    assert!(!remote_record.scopes.is_empty());
+    obs_session.undock();
     assert_eq!(read_kv(&station_b, "greeting"), b"hello");
     assert_eq!(read_kv(&station_b, "farewell"), b"bye");
 
@@ -324,6 +339,7 @@ fn two_stations_converge_through_the_public_contact_api() {
         .activate(ActivationOptions {
             drain_deadline: Duration::from_secs(5),
             comms: Some(comms_options(tb2, STATION_B_SEED, None)),
+            observation_capacity: 0,
         })
         .unwrap();
     assert_eq!(read_kv(&station_b, "greeting"), b"hello");

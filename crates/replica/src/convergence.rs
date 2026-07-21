@@ -41,6 +41,9 @@ pub struct ConvergenceOutcome {
     pub rejected: u32,
     pub unsupported_retained: u32,
     pub retryable: u32,
+    /// The Body keys this pass changed (accepted or opaquely retained) — the
+    /// Observation scopes for remote convergence.
+    pub scopes: Vec<crate::ids::BodyKey>,
 }
 
 impl ConvergenceOutcome {
@@ -54,6 +57,7 @@ impl ConvergenceOutcome {
             rejected: 0,
             unsupported_retained: 0,
             retryable: 0,
+            scopes: Vec::new(),
         }
     }
 

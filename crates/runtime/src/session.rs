@@ -92,22 +92,204 @@ struct CoreInner {
     closed: bool,
 }
 
+/// The default Observation ring capacity, and its hard maximum.
+pub const DEFAULT_OBSERVATION_CAPACITY: usize = 1024;
+pub const MAX_OBSERVATION_CAPACITY: usize = 65_536;
+
+/// Why an Observation stream ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationStreamError {
+    /// The Station has gone dormant or exited; re-dock after reactivation.
+    StationDormant,
+}
+
+impl std::fmt::Display for ObservationStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ObservationStreamError {}
+
+/// The Station-owned Observation broadcaster: a bounded ring of published
+/// records plus the sequence source. Publication and cursor replay happen
+/// under ONE lock, so a subscription can never fall between a commit and its
+/// record.
+pub(crate) struct Broadcaster {
+    state: std::sync::Mutex<BroadcastState>,
+    wake: std::sync::Condvar,
+    epoch: StationEpoch,
+}
+
+struct BroadcastState {
+    next_seq: u64,
+    ring: std::collections::VecDeque<Observation>,
+    capacity: usize,
+    last_frontier: ReplicaFrontier,
+    closed: bool,
+}
+
+impl Broadcaster {
+    fn new(epoch: StationEpoch, capacity: usize, frontier: ReplicaFrontier) -> Self {
+        Self {
+            state: std::sync::Mutex::new(BroadcastState {
+                next_seq: 1,
+                ring: std::collections::VecDeque::new(),
+                capacity: capacity.clamp(1, MAX_OBSERVATION_CAPACITY),
+                last_frontier: frontier,
+                closed: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            epoch,
+        }
+    }
+
+    /// Publish one record for a durable commit. Sequences are monotonic within
+    /// the activation epoch; the ring discards its oldest record past
+    /// capacity (slow consumers rebaseline, memory never grows unbounded).
+    pub(crate) fn publish(&self, world: WorldId, scopes: Vec<BodyKey>, frontier: ReplicaFrontier) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return;
+        }
+        let sequence = state.next_seq;
+        state.next_seq += 1;
+        state.last_frontier = frontier;
+        let record = Observation {
+            epoch: self.epoch,
+            sequence,
+            reset: false,
+            world,
+            scopes,
+            frontier,
+        };
+        if state.ring.len() == state.capacity {
+            state.ring.pop_front();
+        }
+        state.ring.push_back(record);
+        self.wake.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        self.wake.notify_all();
+    }
+}
+
+/// A bounded Observation stream: invalidation records, never state. First use,
+/// a cursor from another epoch, or a ring overrun delivers exactly one reset
+/// record (consumers re-query from the committed frontier); an in-window
+/// cursor replays retained records and then follows live delivery. Dormancy
+/// ends the stream with a typed [`ObservationStreamError::StationDormant`].
+pub struct ObservationStream {
+    broadcaster: Arc<Broadcaster>,
+    world: WorldId,
+    /// The last delivered sequence (exclusive replay position); `None` before
+    /// the first delivery when no valid cursor was presented.
+    position: Option<u64>,
+}
+
+impl ObservationStream {
+    fn pull(&mut self, state: &BroadcastState) -> Option<Observation> {
+        if let Some(position) = self.position {
+            let oldest_retained = state.ring.front().map(|o| o.sequence);
+            let newest = state.next_seq - 1;
+            if position >= newest {
+                return None; // caught up — wait for live delivery
+            }
+            // The next record we owe is position+1; if it is no longer
+            // retained, that is an overrun: one reset, gap discarded.
+            match oldest_retained {
+                Some(oldest) if position + 1 >= oldest => {
+                    state.ring.iter().find(|o| o.sequence > position).cloned()
+                }
+                _ => Some(self.reset_record(state)),
+            }
+        } else {
+            Some(self.reset_record(state))
+        }
+    }
+
+    fn reset_record(&self, state: &BroadcastState) -> Observation {
+        Observation {
+            epoch: self.broadcaster.epoch,
+            sequence: state.next_seq - 1,
+            reset: true,
+            world: self.world.clone(),
+            scopes: Vec::new(),
+            frontier: state.last_frontier,
+        }
+    }
+
+    /// The next record, waiting up to `timeout`. `Ok(None)` on timeout;
+    /// [`ObservationStreamError::StationDormant`] once the Station closed.
+    pub fn next_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Observation>, ObservationStreamError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let broadcaster = self.broadcaster.clone();
+        let mut state = broadcaster.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.closed {
+                return Err(ObservationStreamError::StationDormant);
+            }
+            if let Some(record) = self.pull(&state) {
+                self.position = Some(record.sequence);
+                return Ok(Some(record));
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let (next, timed_out) = broadcaster
+                .wake
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|p| {
+                    let inner = p.into_inner();
+                    (inner.0, inner.1)
+                });
+            state = next;
+            if timed_out.timed_out() {
+                if state.closed {
+                    return Err(ObservationStreamError::StationDormant);
+                }
+                if let Some(record) = self.pull(&state) {
+                    self.position = Some(record.sequence);
+                    return Ok(Some(record));
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    /// The next already-published record without waiting.
+    pub fn try_next(&mut self) -> Result<Option<Observation>, ObservationStreamError> {
+        self.next_timeout(std::time::Duration::ZERO)
+    }
+}
+
 /// The Station's exclusive committing state, shared with its Sessions. Held
 /// behind an `Arc` by the Station and every Session; a Session can commit
 /// through it but never stop the Station.
 pub(crate) struct StationCore {
     inner: std::sync::Mutex<CoreInner>,
-    obs_seq: std::sync::atomic::AtomicU64,
+    pub(crate) broadcaster: Arc<Broadcaster>,
 }
 
 impl StationCore {
-    pub(crate) fn new(replica: replica::Replica) -> Self {
+    pub(crate) fn new(
+        epoch: StationEpoch,
+        observation_capacity: usize,
+        replica: replica::Replica,
+    ) -> Self {
+        let frontier = replica.frontier();
         Self {
             inner: std::sync::Mutex::new(CoreInner {
                 replica,
                 closed: false,
             }),
-            obs_seq: std::sync::atomic::AtomicU64::new(0),
+            broadcaster: Arc::new(Broadcaster::new(epoch, observation_capacity, frontier)),
         }
     }
 
@@ -137,9 +319,11 @@ impl StationCore {
     /// Close the core to further commits, as one transition under the writer
     /// mutex: an in-flight submit either completed its journaled durable commit
     /// before the close or observes it and is refused. Every acknowledged
-    /// commit is already on disk, so closing needs no checkpoint.
+    /// commit is already on disk, so closing needs no checkpoint. Observation
+    /// streams end with a typed `StationDormant`.
     pub(crate) fn close(&self) {
         self.lock().closed = true;
+        self.broadcaster.close();
     }
 }
 
@@ -537,15 +721,21 @@ impl Session {
                 | replica::ReplicaCommitError::OutcomeUnknown
                 | replica::ReplicaCommitError::Poisoned => WorldError::Persistence,
             })?;
+        // Publish the Observation for a FRESH durable commit while still
+        // holding the writer lock: publication order equals commit order, and
+        // nothing is ever published before durability. A replay publishes
+        // nothing (nothing committed).
+        if let replica::ActionOutcome::Committed(receipt) = &outcome {
+            self.core.broadcaster.publish(
+                self.world_id.clone(),
+                receipt.scopes.clone(),
+                receipt.frontier,
+            );
+        }
         drop(inner);
         let receipt = match outcome {
             replica::ActionOutcome::Committed(r) | replica::ActionOutcome::Replayed(r) => r,
         };
-        // Count the committed change for the Observation sequence (the C3
-        // stream surface publishes from this counter).
-        self.core
-            .obs_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(CommittedEffect {
             effect: receipt.effect,
             frontier: receipt.frontier,
@@ -583,13 +773,24 @@ impl Session {
         Ok(projection)
     }
 
-    /// Begin observing from a cursor. **Incomplete surface**: the bounded
-    /// Observation stream (ring buffer, reset semantics, backpressure) is
-    /// completion package C3 of `docs/plans/02-runtime-world-carve.md`; until
-    /// it lands this echoes the input cursor and delivers nothing, and the
-    /// public lifecycle is not claimed complete.
-    pub fn observe(&self, cursor: ObservationCursor) -> ObservationCursor {
-        cursor
+    /// Begin observing invalidation records. `None` (or a cursor from another
+    /// activation epoch) rebaselines: the stream's first record is a single
+    /// reset at the current sequence and committed frontier, after which live
+    /// records follow. A cursor from THIS epoch replays every retained record
+    /// with a greater sequence, then follows live delivery; a cursor pointing
+    /// into a discarded gap yields one reset instead. Records carry scopes and
+    /// the committed frontier — never state; consumers re-query after every
+    /// reset. Dormancy ends the stream with a typed error.
+    pub fn observe(&self, cursor: Option<ObservationCursor>) -> ObservationStream {
+        let position = match cursor {
+            Some(c) if c.epoch == self.epoch => Some(c.sequence),
+            _ => None,
+        };
+        ObservationStream {
+            broadcaster: self.core.broadcaster.clone(),
+            world: self.world_id.clone(),
+            position,
+        }
     }
 
     /// Close this Session, consuming it. Never affects the Station.

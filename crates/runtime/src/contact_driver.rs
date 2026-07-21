@@ -395,6 +395,23 @@ async fn contact_neighbor(
             })
             .map_err(|e| ContactError::Transfer(e.to_string()))?
     };
+    // Publish Observations only AFTER durable incorporation, grouped per
+    // World (remote changes share the local commits' delivery path).
+    if convergence.advanced() {
+        let mut by_world: std::collections::BTreeMap<replica::WorldId, Vec<replica::BodyKey>> =
+            Default::default();
+        for key in &convergence.scopes {
+            by_world
+                .entry(key.world.clone())
+                .or_default()
+                .push(key.clone());
+        }
+        for (world, scopes) in by_world {
+            ctx.core
+                .broadcaster
+                .publish(world, scopes, convergence.current);
+        }
+    }
     Ok(ContactOutcome {
         bytes_moved,
         convergence,

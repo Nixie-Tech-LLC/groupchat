@@ -64,7 +64,7 @@ fn the_target_lifecycle_methods_have_their_frozen_signatures() {
     let _: fn(&Session, SignedWorldActionV1) -> Result<CommittedEffect, WorldError> =
         Session::submit;
     let _: fn(&Session, WorldQuery) -> Result<WorldProjection, WorldError> = Session::query;
-    let _: fn(&Session, ObservationCursor) -> ObservationCursor = Session::observe;
+    let _: fn(&Session, Option<ObservationCursor>) -> runtime::ObservationStream = Session::observe;
     let _: fn(Session) = Session::undock;
 }
 
