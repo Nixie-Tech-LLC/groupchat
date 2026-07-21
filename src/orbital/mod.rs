@@ -1,7 +1,10 @@
 //! The product's adoption of the orbital lifecycle — **mechanics only**.
 //!
-//! This module is deliberately thin: it fixes where the product keeps its
-//! orbital store and composes a [`Runtime`] from parts supplied by the caller.
+//! It fixes where the product keeps its orbital store, composes a [`Runtime`]
+//! from parts supplied by the caller, and (C5) supplies the mechanics
+//! composition — authority view/source, key source, and authority
+//! incorporation — over the Space's signed membership material
+//! ([`mechanics::OrbitalMechanics`]).
 //! It defines **no World**: per the program's settled decisions (O13/O23), no
 //! consumer-specific World becomes first-party inside LAIT, and the current
 //! Issues behavior adopts the public API as an *adapter over the existing
@@ -33,4 +36,15 @@ pub fn open_orbital_runtime(
     keys: Arc<dyn BodyKeySource>,
 ) -> Runtime {
     Runtime::open(orbital_store_root(home), registry, authority, keys)
+}
+
+pub mod mechanics;
+
+pub use mechanics::{AuthorityRecord, OrbitalMechanics};
+
+/// A random 16-byte value (salts, epoch ids, nonces).
+pub(crate) fn rand16() -> [u8; 16] {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).expect("getrandom");
+    raw
 }

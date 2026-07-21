@@ -886,6 +886,7 @@ impl Replica {
         };
 
         // Apply the record updates in memory.
+        let durable = self.durable.is_some();
         for (key, record) in new_records {
             match record {
                 None => {
@@ -893,6 +894,11 @@ impl Replica {
                     self.raw_material.remove(&key);
                 }
                 Some(record) => {
+                    if durable {
+                        // Durable stores serve exports from their object
+                        // refs; a stale raw copy would shadow this commit.
+                        self.raw_material.remove(&key);
+                    }
                     self.bodies.insert(key, record);
                 }
             }
@@ -1084,21 +1090,26 @@ impl Replica {
                         continue;
                     }
                     let current_chain = self.bodies.get(&key).map(|r| r.chain);
-                    let apply = match (&payload.payload, current_chain) {
-                        // Fresh body: apply.
-                        (_, None) => true,
-                        // Already known (chain equality): unchanged.
-                        (_, Some(chain)) if chain == payload.resulting_frontier => false,
-                        // Descends our current chain: apply.
-                        (_, Some(chain)) if chain == payload.base_frontier => true,
-                        // Concurrent atomic: the deterministic maximum wins.
-                        (BodyExport::Atomic(_), Some(chain)) => {
-                            chain_order(&payload.resulting_frontier, &chain)
-                                == std::cmp::Ordering::Greater
-                        }
-                        // Concurrent collaborative: the engine merges causally.
-                        (BodyExport::Collaborative(_), Some(_)) => true,
-                    };
+                    // Material retained opaquely upgrades to interpreted the
+                    // first time a supported schema AND its key epoch are both
+                    // available — this IS the revalidation path.
+                    let was_opaque = self.bodies.get(&key).is_some_and(|r| !r.interpreted);
+                    let apply = was_opaque
+                        || match (&payload.payload, current_chain) {
+                            // Fresh body: apply.
+                            (_, None) => true,
+                            // Already known (chain equality): unchanged.
+                            (_, Some(chain)) if chain == payload.resulting_frontier => false,
+                            // Descends our current chain: apply.
+                            (_, Some(chain)) if chain == payload.base_frontier => true,
+                            // Concurrent atomic: the deterministic maximum wins.
+                            (BodyExport::Atomic(_), Some(chain)) => {
+                                chain_order(&payload.resulting_frontier, &chain)
+                                    == std::cmp::Ordering::Greater
+                            }
+                            // Concurrent collaborative: the engine merges causally.
+                            (BodyExport::Collaborative(_), Some(_)) => true,
+                        };
                     if !apply {
                         outcome.unchanged += 1;
                         continue;
@@ -1235,6 +1246,11 @@ impl Replica {
                             self.raw_material
                                 .insert(key.clone(), (bytes.clone(), tx.encode()));
                         }
+                    } else {
+                        // An interpreted (or upgraded) Body serves from its
+                        // durable object refs; stale raw retention would
+                        // desynchronize the export from the manifest.
+                        self.raw_material.remove(&key);
                     }
                     self.bodies.insert(key, record);
                 }
