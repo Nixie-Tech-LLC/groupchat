@@ -17,6 +17,8 @@ lait-kernel = { path = "../lait-kernel" }
 lait-fabric = { path = "../lait-fabric" }
 
 serde = { version = "1", features = ["derive"] }
+# `[u8; 64]` signature fields on the S5 Body-transaction records.
+serde-byte-array = "0.1"
 postcard = { version = "1", features = ["use-std"] }
 blake3 = "1"
 data-encoding = "2.6"

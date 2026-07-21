@@ -4537,6 +4537,7 @@ dependencies = [
  "lait-kernel",
  "postcard",
  "serde",
+ "serde-byte-array",
  "serde_json",
 ]
 

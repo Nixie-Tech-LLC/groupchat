@@ -23,6 +23,8 @@ pub mod body;
 pub mod convergence;
 pub mod frontier;
 pub mod ids;
+pub mod marker;
+pub mod transaction;
 
 pub use body::{
     BodyDescriptor, BodyOp, BodySchema, CollaborativeSchema, ContentCommitment, MutationModel,
@@ -30,3 +32,5 @@ pub use body::{
 pub use convergence::{ConvergenceOutcome, IncorporationClass};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
+pub use marker::{MarkerError, StoreMarkerV1};
+pub use transaction::{BodyDescriptorV1, BodyTransactionV1, TransactionError};
