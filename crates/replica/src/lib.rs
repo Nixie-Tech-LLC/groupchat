@@ -23,6 +23,7 @@ pub mod body;
 pub mod convergence;
 pub mod frontier;
 pub mod ids;
+pub mod manifest;
 pub mod marker;
 pub mod replica;
 pub mod transaction;
@@ -34,6 +35,9 @@ pub use convergence::{ConvergenceOutcome, IncorporationClass};
 pub use frontier::{AuthorityFrontier, ReplicaFrontier, TransactionId};
 pub use ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 pub use lait_fabric::{CollaborativeView, ListElement};
+pub use manifest::{
+    ManifestBook, ManifestEntryV1, ManifestError, ManifestPageV1, ManifestRootV1, RootObservation,
+};
 pub use marker::{MarkerError, StoreMarkerV1};
 pub use replica::{DurabilitySink, Replica, ReplicaCommitError};
 pub use transaction::{AuthoritySource, BodyDescriptorV1, BodyTransactionV1, TransactionError};
