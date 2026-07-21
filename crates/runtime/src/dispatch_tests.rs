@@ -7,19 +7,52 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId, StationId};
+use lait_kernel::ids::{ActorId, DeviceId};
 
 use crate::error::WorldError;
 use crate::lifecycle::{ActivationOptions, Runtime, SpaceFormationOptions};
 use crate::registry::RuntimeBuilder;
 use crate::session::ObservationCursor;
 use crate::world::{
-    PrincipalFacts, Standing, World, WorldContext, WorldEffect, WorldIntent, WorldLimits,
-    WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
+    AuthorityView, LocalIdentity, PrincipalResolution, Standing, World, WorldContext, WorldEffect,
+    WorldIntent, WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
 };
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
+
+/// The writing test device (granted Write by [`SeedAuthority`]).
+const WRITER_SEED: [u8; 32] = [41u8; 32];
+/// A second device with no grants (resolves, but has empty standing).
+const READER_SEED: [u8; 32] = [42u8; 32];
+
+/// A test mechanics view: the writer device gets Write standing, any other
+/// known-shaped device resolves with empty standing.
+struct SeedAuthority;
+
+impl AuthorityView for SeedAuthority {
+    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
+        let writer = lait_kernel::crypto::device_from_seed(&WRITER_SEED);
+        let grants = if device == &writer {
+            vec![Grant::Write]
+        } else {
+            vec![]
+        };
+        Some(PrincipalResolution {
+            actor: ActorId::from_incept_hash(&"a".repeat(64)),
+            standing: Standing::new(grants),
+            authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
+        })
+    }
+}
+
+fn writer() -> LocalIdentity {
+    Runtime::identity_from_seed(&WRITER_SEED)
+}
+
+fn reader() -> LocalIdentity {
+    Runtime::identity_from_seed(&READER_SEED)
+}
 
 /// A minimal note World: intents carry UTF-8 text; `submit` stages an atomic
 /// replacement and reports the touched scope; `query` echoes a deterministic
@@ -98,16 +131,6 @@ impl World for NoteWorld {
     }
 }
 
-fn principal(grants: Vec<Grant>) -> PrincipalFacts {
-    PrincipalFacts {
-        actor: ActorId::from_incept_hash(&"a".repeat(64)),
-        device: DeviceId::from_key_bytes(&[1u8; 32]),
-        station: StationId::from_key_bytes([1u8; 32]),
-        standing: Standing::new(grants),
-        authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
-    }
-}
-
 fn note_registration() -> (WorldRegistration, Arc<dyn World>) {
     let world = NoteWorld::new();
     let reg = WorldRegistration {
@@ -131,7 +154,7 @@ fn temp_root() -> PathBuf {
 
 fn station_with(reg: WorldRegistration, world: Arc<dyn World>) -> crate::lifecycle::Station {
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry);
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
     rt.form_space(SpaceFormationOptions::default())
         .unwrap()
         .activate(ActivationOptions::default())
@@ -147,9 +170,7 @@ fn station() -> crate::lifecycle::Station {
 fn test_world_submits_and_queries_through_dispatch() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
 
     // A query before any submit reads the empty committed snapshot.
     let empty = session
@@ -191,7 +212,7 @@ fn authorization_is_checked_per_request() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
     // A principal with no Write standing is denied at submit, not at dock.
-    let session = station.dock(&world_id, principal(vec![])).unwrap();
+    let session = station.dock(&world_id, &reader()).unwrap();
     let denied = session.submit(WorldIntent {
         schema: SchemaId::parse("note").unwrap(),
         schema_version: 1,
@@ -204,12 +225,8 @@ fn authorization_is_checked_per_request() {
 fn many_sessions_dock_independently_without_owning_the_station() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let s1 = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
-    let s2 = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let s1 = station.dock(&world_id, &writer()).unwrap();
+    let s2 = station.dock(&world_id, &writer()).unwrap();
     assert_eq!(s1.epoch(), s2.epoch());
     // Undocking one Session leaves the Station and the other Session intact.
     s1.undock();
@@ -228,9 +245,7 @@ fn many_sessions_dock_independently_without_owning_the_station() {
 fn dormancy_terminates_sessions() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     // Going dormant terminates the Session: further requests fail closed.
     let _orbit = station.go_dormant().unwrap();
     assert_eq!(
@@ -249,13 +264,9 @@ fn a_session_cannot_stop_the_station() {
     let world_id = WorldId::parse("com.example.notes").unwrap();
     // Dock a Session and drop it (undock) — the Station is unaffected and can
     // still serve new Sessions.
-    let s = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let s = station.dock(&world_id, &writer()).unwrap();
     s.undock();
-    let s2 = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let s2 = station.dock(&world_id, &writer()).unwrap();
     assert!(s2
         .query(WorldQuery {
             schema: SchemaId::parse("note").unwrap(),
@@ -321,7 +332,7 @@ fn a_world_panic_is_contained_and_does_not_end_the_station() {
         schemas,
     });
     let station = station_with(reg, world);
-    let session = station.dock(&id, principal(vec![Grant::Write])).unwrap();
+    let session = station.dock(&id, &writer()).unwrap();
     let r = session.submit(WorldIntent {
         schema: SchemaId::parse("note").unwrap(),
         schema_version: 1,
@@ -340,9 +351,7 @@ fn payload_over_the_declared_limit_is_rejected_before_the_callback() {
     };
     let station = station_with(reg, world);
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     let r = session.submit(WorldIntent {
         schema: SchemaId::parse("note").unwrap(),
         schema_version: 1,
@@ -355,9 +364,7 @@ fn payload_over_the_declared_limit_is_rejected_before_the_callback() {
 fn unregistered_schema_and_version_are_rejected() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     // Unknown schema.
     assert_eq!(
         session.submit(WorldIntent {
@@ -387,15 +394,13 @@ fn an_acknowledged_commit_survives_a_crash_without_dormancy() {
     // durability happened AT COMMIT, not at shutdown.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry);
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     session
         .submit(WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
@@ -412,9 +417,7 @@ fn an_acknowledged_commit_survives_a_crash_without_dormancy() {
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     let proj = session
         .query(WorldQuery {
             schema: SchemaId::parse("note").unwrap(),
@@ -431,7 +434,7 @@ fn commits_made_during_an_activation_survive_wait_exit() {
     // Per-commit durability means nothing made during the activation is lost.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry);
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let station = rt
@@ -440,9 +443,7 @@ fn commits_made_during_an_activation_survive_wait_exit() {
         .activate(ActivationOptions::default())
         .unwrap();
     let space = station.space_id().clone();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     session
         .submit(WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
@@ -459,9 +460,7 @@ fn commits_made_during_an_activation_survive_wait_exit() {
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     let proj = session
         .query(WorldQuery {
             schema: SchemaId::parse("note").unwrap(),
@@ -478,15 +477,13 @@ fn committed_bodies_survive_dormancy_and_reactivation() {
     // → re-acquire → activate → the committed Body is read back.
     let (reg, world) = note_registration();
     let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
-    let rt = Runtime::open(temp_root(), registry);
+    let rt = Runtime::open(temp_root(), registry, Arc::new(SeedAuthority));
     let world_id = WorldId::parse("com.example.notes").unwrap();
 
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     session
         .submit(WorldIntent {
             schema: SchemaId::parse("note").unwrap(),
@@ -504,9 +501,7 @@ fn committed_bodies_survive_dormancy_and_reactivation() {
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     let proj = session
         .query(WorldQuery {
             schema: SchemaId::parse("note").unwrap(),
@@ -517,13 +512,193 @@ fn committed_bodies_survive_dormancy_and_reactivation() {
     assert_eq!(proj.bytes, b"DURABLE");
 }
 
+/// A hostile World that stages an operation against ANOTHER World's namespace.
+struct RogueWorld {
+    id: WorldId,
+    schemas: Vec<BodySchema>,
+}
+impl World for RogueWorld {
+    fn id(&self) -> WorldId {
+        self.id.clone()
+    }
+    fn schemas(&self) -> &[BodySchema] {
+        &self.schemas
+    }
+    fn submit(
+        &self,
+        _ctx: &mut WorldContext<'_>,
+        intent: WorldIntent,
+    ) -> Result<WorldEffect, WorldError> {
+        // Attempt to overwrite a Body belonging to com.example.notes.
+        let foreign = BodyKey::new(
+            WorldId::parse("com.example.notes").unwrap(),
+            BodyId::from_bytes([0u8; 16]),
+        );
+        Ok(WorldEffect {
+            operations: vec![(
+                foreign.clone(),
+                BodyOp::ReplaceAtomic {
+                    value: intent.payload,
+                },
+            )],
+            scopes: vec![foreign],
+            effect: vec![],
+        })
+    }
+    fn query(
+        &self,
+        _ctx: &WorldContext<'_>,
+        _query: WorldQuery,
+    ) -> Result<WorldProjection, WorldError> {
+        Err(WorldError::InvalidRequest)
+    }
+}
+
+#[test]
+fn a_world_cannot_write_outside_its_namespace() {
+    let id = WorldId::parse("com.example.rogue").unwrap();
+    let schemas = vec![BodySchema {
+        id: SchemaId::parse("note").unwrap(),
+        version: 1,
+        encoding: EncodingId::parse("text.utf8").unwrap(),
+        mutation: MutationModel::Atomic,
+        readable_predecessors: vec![],
+    }];
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: schemas.clone(),
+        limits: WorldLimits::default(),
+    };
+    let world: Arc<dyn World> = Arc::new(RogueWorld {
+        id: id.clone(),
+        schemas,
+    });
+    let station = station_with(reg, world);
+    let session = station.dock(&id, &writer()).unwrap();
+    let before = station.frontier();
+    let r = session.submit(WorldIntent {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        payload: b"overwrite you".to_vec(),
+    });
+    assert_eq!(r, Err(WorldError::ContractViolation));
+    // Nothing was committed.
+    assert_eq!(station.frontier(), before);
+}
+
+/// An authority view whose frontier can be flipped mid-flight — for the CAS test.
+struct FlippingAuthority {
+    frontier: std::sync::Mutex<Vec<u8>>,
+}
+impl AuthorityView for FlippingAuthority {
+    fn resolve(&self, _device: &DeviceId) -> Option<PrincipalResolution> {
+        Some(PrincipalResolution {
+            actor: ActorId::from_incept_hash(&"a".repeat(64)),
+            standing: Standing::new(vec![Grant::Write]),
+            authority_frontier: AuthorityFrontier::from_canonical_bytes(
+                self.frontier.lock().unwrap().clone(),
+            ),
+        })
+    }
+}
+
+#[test]
+fn a_changed_authority_frontier_refuses_the_commit() {
+    // A World that flips the shared authority frontier DURING its callback —
+    // modelling a concurrent membership change landing between authorization
+    // and commit. The commit-side CAS must catch it.
+    struct FlipDuringSubmit {
+        inner: NoteWorld,
+        authority: Arc<FlippingAuthority>,
+    }
+    impl World for FlipDuringSubmit {
+        fn id(&self) -> WorldId {
+            self.inner.id()
+        }
+        fn schemas(&self) -> &[BodySchema] {
+            self.inner.schemas()
+        }
+        fn submit(
+            &self,
+            ctx: &mut WorldContext<'_>,
+            intent: WorldIntent,
+        ) -> Result<WorldEffect, WorldError> {
+            *self.authority.frontier.lock().unwrap() = vec![9, 9];
+            self.inner.submit(ctx, intent)
+        }
+        fn query(
+            &self,
+            ctx: &WorldContext<'_>,
+            query: WorldQuery,
+        ) -> Result<WorldProjection, WorldError> {
+            self.inner.query(ctx, query)
+        }
+    }
+
+    let authority = Arc::new(FlippingAuthority {
+        frontier: std::sync::Mutex::new(vec![1]),
+    });
+    let inner = NoteWorld::new();
+    let id = inner.id();
+    let reg = WorldRegistration {
+        id: id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: inner.schemas().to_vec(),
+        limits: WorldLimits::default(),
+    };
+    let world: Arc<dyn World> = Arc::new(FlipDuringSubmit {
+        inner,
+        authority: authority.clone(),
+    });
+    let registry = RuntimeBuilder::new().register(reg, world).build().unwrap();
+    let rt = Runtime::open(temp_root(), registry, authority);
+    let station = rt
+        .form_space(SpaceFormationOptions::default())
+        .unwrap()
+        .activate(ActivationOptions::default())
+        .unwrap();
+    let session = station.dock(&id, &writer()).unwrap();
+    let before = station.frontier();
+    let r = session.submit(WorldIntent {
+        schema: SchemaId::parse("note").unwrap(),
+        schema_version: 1,
+        payload: b"x".to_vec(),
+    });
+    assert_eq!(r, Err(WorldError::AuthorityChanged));
+    assert_eq!(station.frontier(), before, "nothing committed");
+}
+
+#[test]
+fn runtime_stamps_the_projection_frontier() {
+    let station = station();
+    let world_id = WorldId::parse("com.example.notes").unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
+    let committed = session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: b"x".to_vec(),
+        })
+        .unwrap();
+    // The NoteWorld returns ReplicaFrontier::EMPTY from query; Runtime must
+    // overwrite it with the real committed frontier of the held snapshot.
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("note").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(proj.frontier, committed.frontier);
+    assert_ne!(proj.frontier, ReplicaFrontier::EMPTY);
+}
+
 #[test]
 fn observation_cursor_starts_at_a_reset_boundary() {
     let station = station();
     let world_id = WorldId::parse("com.example.notes").unwrap();
-    let session = station
-        .dock(&world_id, principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id, &writer()).unwrap();
     let cursor = ObservationCursor::start(session.epoch());
     assert_eq!(cursor.sequence, 0);
     assert_eq!(session.observe(cursor), cursor);

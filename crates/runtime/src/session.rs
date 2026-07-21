@@ -7,30 +7,34 @@
 //! The dispatch seam: `submit`/`query` **validate the request against the
 //! World's registration, contain a World panic, and build a bounded**
 //! [`WorldContext`](crate::world::WorldContext) over the principal before routing
-//! to the World implementation. Specifically, before the World is called the
-//! Session enforces: the Station is live; the payload is within
-//! [`WorldLimits`](crate::world::WorldLimits); and the intent/query names a
-//! schema+version the World declared (a query may also read a declared readable
-//! predecessor). A panic in the callback is caught as
-//! [`WorldError::WorldImplementationFailed`] and never ends the Station.
+//! to the World implementation. Before the World is called the Session
+//! enforces: the Station is live; the payload is within
+//! [`WorldLimits`](crate::world::WorldLimits); the intent/query names a declared
+//! schema+version (a query may also read a declared readable predecessor); and
+//! the principal's standing is **re-resolved through the mechanics
+//! [`AuthorityView`](crate::world::AuthorityView)** for this request. A panic in
+//! the callback is caught as [`WorldError::WorldImplementationFailed`] and never
+//! ends the Station.
 //!
-//! Durable persistence of the returned [`WorldEffect`] through Replica/Fabric and
-//! Observation publication are wired by the store cutover (S5): until then
-//! `submit` returns the staged effect and does **not** claim durability.
+//! After the World stages its effect, the Session **contains** it — every staged
+//! operation and scope must address the Session's own World namespace with an
+//! operation kind that World's registered mutation models allow — then performs
+//! the authority-frontier compare-and-swap under the writer lock, and durably
+//! commits. Success means recoverable, not merely applied in memory.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use lait_kernel::ids::StationEpoch;
-use replica::body::BodySchema;
+use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::ReplicaFrontier;
 use replica::ids::{BodyKey, SchemaId, WorldId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorldError;
 use crate::world::{
-    PrincipalFacts, World, WorldContext, WorldEffect, WorldIntent, WorldLimits, WorldProjection,
-    WorldQuery,
+    AuthorityView, PrincipalFacts, World, WorldContext, WorldEffect, WorldIntent, WorldLimits,
+    WorldProjection, WorldQuery,
 };
 
 /// A resumable Observation position. First observation, restart, cursor overrun,
@@ -154,6 +158,9 @@ pub struct Session {
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The Station's exclusive committing state.
     core: Arc<StationCore>,
+    /// The mechanics authority view: standing is re-resolved per request and the
+    /// authority frontier is compare-and-swapped at commit.
+    authority: Arc<dyn AuthorityView>,
 }
 
 impl Session {
@@ -167,6 +174,7 @@ impl Session {
         schemas: Vec<BodySchema>,
         alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
         core: Arc<StationCore>,
+        authority: Arc<dyn AuthorityView>,
     ) -> Self {
         Self {
             world_id,
@@ -177,7 +185,63 @@ impl Session {
             schemas,
             alive,
             core,
+            authority,
         }
+    }
+
+    /// Fresh principal facts for THIS request: standing and the authority
+    /// frontier are re-resolved through the mechanics view, so dock-time facts
+    /// never outlive the authority state. Denied when the device no longer
+    /// resolves.
+    fn fresh_principal(&self) -> Result<PrincipalFacts, WorldError> {
+        let resolution = self
+            .authority
+            .resolve(&self.principal.device)
+            .ok_or(WorldError::Denied)?;
+        Ok(PrincipalFacts {
+            actor: resolution.actor,
+            device: self.principal.device.clone(),
+            station: self.principal.station.clone(),
+            standing: resolution.standing,
+            authority_frontier: resolution.authority_frontier,
+        })
+    }
+
+    /// Contain a World's staged effect inside its own namespace and registered
+    /// mutation models. A buggy or hostile World must not be able to write
+    /// another World's Bodies or exceed the transaction bound.
+    fn contain_effect(&self, effect: &WorldEffect) -> Result<(), WorldError> {
+        if effect.operations.len() > replica::algebra::MAX_OPS_PER_TRANSACTION {
+            return Err(WorldError::ContractViolation);
+        }
+        let allows_atomic = self
+            .schemas
+            .iter()
+            .any(|s| matches!(s.mutation, MutationModel::Atomic));
+        let allows_collab = self
+            .schemas
+            .iter()
+            .any(|s| matches!(s.mutation, MutationModel::Collaborative(_)));
+        for (key, op) in &effect.operations {
+            if key.world != self.world_id {
+                return Err(WorldError::ContractViolation);
+            }
+            let permitted = match op {
+                BodyOp::ReplaceAtomic { .. } => allows_atomic,
+                // Create/tombstone are legal under either registered model.
+                BodyOp::Create | BodyOp::Tombstone => allows_atomic || allows_collab,
+                _ => allows_collab,
+            };
+            if !permitted {
+                return Err(WorldError::ContractViolation);
+            }
+        }
+        for scope in &effect.scopes {
+            if scope.world != self.world_id {
+                return Err(WorldError::ContractViolation);
+            }
+        }
+        Ok(())
     }
 
     fn ensure_live(&self) -> Result<(), WorldError> {
@@ -248,8 +312,9 @@ impl Session {
         self.ensure_live()?;
         self.ensure_within_limit(intent.payload.len())?;
         self.ensure_writable_schema(&intent.schema, intent.schema_version)?;
+        // Per-request authorization: derive fresh facts from the mechanics view.
+        let principal = self.fresh_principal()?;
         let world = &self.world;
-        let principal = &self.principal;
         let label = intent.schema.as_str().to_string();
         // Hold the exclusive writer across the whole transaction: the World reads
         // the stable committed snapshot, stages operations against it, and the
@@ -263,12 +328,25 @@ impl Session {
         }
         let effect: WorldEffect = {
             let reader = ReplicaReader(&inner.replica);
+            let principal = &principal;
             std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut ctx = WorldContext::with_reads(principal, &reader);
                 world.submit(&mut ctx, intent)
             }))
             .unwrap_or(Err(WorldError::WorldImplementationFailed))?
         };
+        // Contain the staged effect inside this World's namespace and models.
+        self.contain_effect(&effect)?;
+        // Authority-frontier compare-and-swap: the frontier the request was
+        // authorized at must still be current at commit. A change refuses the
+        // commit with AuthorityChanged and commits nothing.
+        let current = self
+            .authority
+            .resolve(&principal.device)
+            .ok_or(WorldError::Denied)?;
+        if current.authority_frontier != principal.authority_frontier {
+            return Err(WorldError::AuthorityChanged);
+        }
         let frontier = inner
             .replica
             .commit(&label, &effect.operations)
@@ -303,18 +381,26 @@ impl Session {
         self.ensure_live()?;
         self.ensure_within_limit(query.payload.len())?;
         self.ensure_readable_schema(&query.schema, query.schema_version)?;
+        // Per-request authorization for reads as well.
+        let principal = self.fresh_principal()?;
         let world = &self.world;
-        let principal = &self.principal;
         let inner = self.core.lock();
         if inner.closed {
             return Err(WorldError::StationDormant);
         }
         let reader = ReplicaReader(&inner.replica);
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let ctx = WorldContext::with_reads(principal, &reader);
-            world.query(&ctx, query)
-        }))
-        .unwrap_or(Err(WorldError::WorldImplementationFailed))
+        let mut projection = {
+            let principal = &principal;
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let ctx = WorldContext::with_reads(principal, &reader);
+                world.query(&ctx, query)
+            }))
+            .unwrap_or(Err(WorldError::WorldImplementationFailed))?
+        };
+        // Runtime — not the World — stamps the projection's source frontier: the
+        // snapshot it was derived from is the one held for this call.
+        projection.frontier = inner.replica.frontier();
+        Ok(projection)
     }
 
     /// Begin observing from a cursor. The streaming surface lands in S5; S0

@@ -44,6 +44,8 @@ pub enum LifecycleError {
     StoreIo(String),
     /// The Station is going dormant (or has exited); new docks/tasks are refused.
     StationDormant,
+    /// The mechanics authority view resolved no standing for the docking device.
+    PrincipalDenied,
     /// The operation is not yet wired at this stage of the carve. Present only so
     /// the sealed lifecycle surface compiles; production never routes through
     /// these paths until the owning stage lands.
@@ -125,6 +127,11 @@ pub enum WorldError {
     /// The World callback panicked. Runtime contains the unwind as this typed
     /// error without ending the Station or discarding the Replica.
     WorldImplementationFailed,
+    /// The World's staged effect violated its containment contract: an operation
+    /// or scope outside its own namespace, an operation kind its registered
+    /// mutation models do not allow, or the transaction op-count bound.
+    /// Nothing is committed.
+    ContractViolation,
 }
 
 debug_error!(

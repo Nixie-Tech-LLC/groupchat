@@ -40,7 +40,10 @@ impl Standing {
 
 /// The facts Runtime derives for a docked principal. A World cannot assert or
 /// replace them; authorization and commit compare-and-swap the same
-/// `authority_frontier`.
+/// `authority_frontier`. Constructed only inside Runtime
+/// ([`Station::dock`](crate::lifecycle::Station::dock) resolves them through the
+/// mechanics [`AuthorityView`]) — callers hand in a [`LocalIdentity`]
+/// (proof-of-possession of a device seed), never facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalFacts {
     pub actor: ActorId,
@@ -48,6 +51,49 @@ pub struct PrincipalFacts {
     pub station: StationId,
     pub standing: Standing,
     pub authority_frontier: AuthorityFrontier,
+}
+
+/// What the mechanics authority plane resolves for a local device: who it
+/// speaks for, its standing, and the authority frontier that standing was
+/// replayed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalResolution {
+    pub actor: ActorId,
+    pub standing: Standing,
+    pub authority_frontier: AuthorityFrontier,
+}
+
+/// The mechanics-owned view of Space authority that Runtime consults to derive
+/// [`PrincipalFacts`] — at dock **and again at every submit** (per-request
+/// authorization, and the commit-side authority-frontier compare-and-swap).
+/// Supplied by the deployment composition root (which owns the replayed signed
+/// history); Sessions and Worlds can neither replace nor bypass it.
+pub trait AuthorityView: Send + Sync {
+    /// Resolve a local device's principal, or `None` when the device has no
+    /// standing in the Space.
+    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution>;
+}
+
+/// An authenticated local caller: proof-of-possession of a device seed. Minted
+/// only by [`Runtime::identity_from_seed`](crate::lifecycle::Runtime::identity_from_seed),
+/// which derives the device key from the seed — a caller cannot assert an
+/// arbitrary device id, let alone standing.
+#[derive(Debug, Clone)]
+pub struct LocalIdentity {
+    device: DeviceId,
+}
+
+impl LocalIdentity {
+    pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
+        Self {
+            device: lait_kernel::crypto::device_from_seed(seed),
+        }
+    }
+
+    /// The device this identity proved possession of.
+    pub fn device(&self) -> &DeviceId {
+        &self.device
+    }
 }
 
 /// A World's declared implementation version.

@@ -204,14 +204,17 @@ impl Fabric for MemFabric {
     }
 }
 
-/// The Loro-backed Fabric engine — Fabric's real implementation, and the reason
-/// this crate is the only one that names Loro. Bodies are stored as canonical
-/// binary values in a single Loro map keyed by the hex of their [`FabricKey`];
-/// each commit lands as a Loro change and the receipt carries the Loro oplog
-/// frontier as its opaque causal token. [`LoroFabric::snapshot`] /
-/// [`LoroFabric::from_snapshot`] give the durable-representation round-trip the
-/// store cutover persists. The collaborative operation set (register/map/list/
-/// text/set/counter over Loro containers) extends [`FabricOp`] here in S5.
+/// The Loro-backed engine — an honest but **incremental slice** of the
+/// canonical Fabric: today it is a Loro-backed *atomic* key/value store, not
+/// the full collaborative Fabric. Bodies are canonical binary values in a
+/// single Loro map keyed by the hex of their [`FabricKey`]; each commit lands
+/// as a Loro change and the receipt carries the Loro oplog frontier as its
+/// opaque causal token. [`LoroFabric::snapshot`] / [`LoroFabric::from_snapshot`]
+/// give the durable-representation round-trip. What it does **not** yet do —
+/// and what the S5 collaborative work owes — is the frozen collaborative
+/// algebra (register/map/list/text/set/counter over Loro containers with stable
+/// element identity) and the journaled store layout; until then every
+/// collaborative `BodyOp` is refused upstream as unsupported.
 pub struct LoroFabric {
     doc: loro::LoroDoc,
 }

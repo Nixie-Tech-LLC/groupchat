@@ -26,9 +26,23 @@ use crate::error::{ContactError, DormancyError, LifecycleError, StationExit, Sta
 use crate::registry::{RuntimeBuilder, WorldRegistry};
 use crate::session::Session;
 use crate::store::{OrbitStore, StoreLock};
-use crate::world::PrincipalFacts;
+use crate::world::{AuthorityView, LocalIdentity, PrincipalFacts};
 use replica::ids::WorldId;
 use replica::ConvergenceOutcome;
+
+/// The authority view a Runtime without one falls back to: nobody resolves, so
+/// nothing can dock. Standing exists only when the deployment supplies a real
+/// mechanics view.
+struct DenyAllAuthority;
+
+impl AuthorityView for DenyAllAuthority {
+    fn resolve(
+        &self,
+        _device: &lait_kernel::ids::DeviceId,
+    ) -> Option<crate::world::PrincipalResolution> {
+        None
+    }
+}
 
 /// The default deadline for draining tracked tasks during dormancy.
 pub const DEFAULT_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
@@ -110,6 +124,9 @@ impl DeorbitConfirmation {
 pub struct Runtime {
     registry: WorldRegistry,
     root: Option<PathBuf>,
+    /// The mechanics authority view principals are derived from. Sessions and
+    /// Worlds cannot replace it; only the composition root supplies it.
+    authority: Arc<dyn AuthorityView>,
 }
 
 impl Runtime {
@@ -118,22 +135,38 @@ impl Runtime {
         RuntimeBuilder::new()
     }
 
-    /// Wrap a frozen registry into a Runtime with **no** store root. Such a
-    /// Runtime can host Worlds but cannot form or acquire a durable Orbit.
+    /// Wrap a frozen registry into a Runtime with **no** store root and a
+    /// deny-all authority. Such a Runtime can host Worlds but cannot form or
+    /// acquire a durable Orbit, and nothing can dock.
     pub fn from_registry(registry: WorldRegistry) -> Self {
         Self {
             registry,
             root: None,
+            authority: Arc::new(DenyAllAuthority),
         }
     }
 
-    /// Open a Runtime rooted at a store directory. Orbits live under
+    /// Open a Runtime rooted at a store directory, with the mechanics authority
+    /// view that principals are derived from. Orbits live under
     /// `<root>/<space-id>/`.
-    pub fn open(root: impl Into<PathBuf>, registry: WorldRegistry) -> Self {
+    pub fn open(
+        root: impl Into<PathBuf>,
+        registry: WorldRegistry,
+        authority: Arc<dyn AuthorityView>,
+    ) -> Self {
         Self {
             registry,
             root: Some(root.into()),
+            authority,
         }
+    }
+
+    /// Authenticate a local caller by possession of its device seed. The device
+    /// key is **derived** from the seed — an identity cannot be asserted from a
+    /// bare device id, and standing is resolved by the [`AuthorityView`] at dock
+    /// and again at every submit, never carried by the identity.
+    pub fn identity_from_seed(seed: &[u8; 32]) -> LocalIdentity {
+        LocalIdentity::from_seed(seed)
     }
 
     /// The immutable World registry this Runtime hosts.
@@ -157,7 +190,13 @@ impl Runtime {
         let store = OrbitStore::create(root, &space)?;
         let lock = store.acquire_lock()?;
         let epoch = StationEpoch::from_u64(store.read_epoch()?);
-        Ok(Orbit::new(store, self.registry.clone(), epoch, lock))
+        Ok(Orbit::new(
+            store,
+            self.registry.clone(),
+            self.authority.clone(),
+            epoch,
+            lock,
+        ))
     }
 
     /// Materialize this device's Orbit from Coordinates. The Coordinates are
@@ -184,7 +223,13 @@ impl Runtime {
         };
         let lock = store.acquire_lock()?;
         let epoch = StationEpoch::from_u64(store.read_epoch()?);
-        Ok(Orbit::new(store, self.registry.clone(), epoch, lock))
+        Ok(Orbit::new(
+            store,
+            self.registry.clone(),
+            self.authority.clone(),
+            epoch,
+            lock,
+        ))
     }
 
     /// Acquire an existing local Orbit for operational ownership. Revalidates the
@@ -196,7 +241,13 @@ impl Runtime {
         let store = OrbitStore::open(root, space)?;
         let lock = store.acquire_lock()?;
         let epoch = StationEpoch::from_u64(store.read_epoch()?);
-        Ok(Orbit::new(store, self.registry.clone(), epoch, lock))
+        Ok(Orbit::new(
+            store,
+            self.registry.clone(),
+            self.authority.clone(),
+            epoch,
+            lock,
+        ))
     }
 
     /// Advisory, read-only observation of a local Orbit. Never takes the lock and
@@ -228,6 +279,7 @@ impl Runtime {
 pub struct Orbit {
     store: OrbitStore,
     registry: WorldRegistry,
+    authority: Arc<dyn AuthorityView>,
     epoch: StationEpoch,
     lock: StoreLock,
 }
@@ -245,12 +297,14 @@ impl Orbit {
     pub(crate) fn new(
         store: OrbitStore,
         registry: WorldRegistry,
+        authority: Arc<dyn AuthorityView>,
         epoch: StationEpoch,
         lock: StoreLock,
     ) -> Self {
         Self {
             store,
             registry,
+            authority,
             epoch,
             lock,
         }
@@ -291,6 +345,7 @@ impl Orbit {
         Ok(Station {
             store: self.store,
             registry: self.registry,
+            authority: self.authority,
             epoch,
             lock: Some(self.lock),
             alive: Arc::new(AtomicBool::new(true)),
@@ -330,6 +385,7 @@ pub struct OrbitObservation {
 pub struct Station {
     store: OrbitStore,
     registry: WorldRegistry,
+    authority: Arc<dyn AuthorityView>,
     epoch: StationEpoch,
     /// The exclusive store lock. `Some` while live; taken out (and either moved
     /// into the returned Orbit or dropped) exactly once at dormancy/exit, so it
@@ -391,16 +447,38 @@ impl Station {
     }
 
     /// Attach a local caller to a hosted World and return a [`Session`] bound to
-    /// this activation epoch. Many Sessions may dock; none can stop the Station.
+    /// this activation epoch. The caller supplies only a [`LocalIdentity`]
+    /// (possession of a device seed) — Runtime **derives** the principal facts by
+    /// resolving the device through the mechanics [`AuthorityView`]; a caller
+    /// cannot assert actor, standing, or authority frontier. Standing is
+    /// re-resolved at every submit, so dock-time facts never outlive the
+    /// authority state. Many Sessions may dock; none can stop the Station.
     /// Refused once the Station is going dormant.
+    ///
+    /// The `station` fact is currently the docking device viewed as a Station id
+    /// (local in-process sessions); plumbing the Station's own device identity
+    /// through activation arrives with the daemon integration.
     pub fn dock(
         &self,
         world_id: &WorldId,
-        principal: PrincipalFacts,
+        identity: &LocalIdentity,
     ) -> Result<Session, LifecycleError> {
         if !self.alive.load(Ordering::SeqCst) {
             return Err(LifecycleError::StationDormant);
         }
+        let resolution = self
+            .authority
+            .resolve(identity.device())
+            .ok_or(LifecycleError::PrincipalDenied)?;
+        let station =
+            StationId::from_device(identity.device()).ok_or(LifecycleError::PrincipalDenied)?;
+        let principal = PrincipalFacts {
+            actor: resolution.actor,
+            device: identity.device().clone(),
+            station,
+            standing: resolution.standing,
+            authority_frontier: resolution.authority_frontier,
+        };
         let world = self
             .registry
             .world(world_id)
@@ -418,6 +496,7 @@ impl Station {
             registration.schemas.clone(),
             self.alive.clone(),
             self.core.clone(),
+            self.authority.clone(),
         ))
     }
 
@@ -497,7 +576,13 @@ impl Station {
             drop(lock);
             return Err(DormancyError::DrainTimeout);
         }
-        Ok(Orbit::new(self.store, self.registry, self.epoch, lock))
+        Ok(Orbit::new(
+            self.store,
+            self.registry,
+            self.authority,
+            self.epoch,
+            lock,
+        ))
     }
 
     /// Park until every tracked task exits, consuming the Station and returning a
@@ -520,7 +605,7 @@ impl Station {
         self.core.close();
         let lock = self.lock.take().expect("station holds its lock");
         StationExit {
-            orbit: Orbit::new(self.store, self.registry, self.epoch, lock),
+            orbit: Orbit::new(self.store, self.registry, self.authority, self.epoch, lock),
             reason,
         }
     }
@@ -566,7 +651,12 @@ mod tests {
     }
 
     fn runtime(root: &PathBuf) -> Runtime {
-        Runtime::open(root.clone(), RuntimeBuilder::new().build().unwrap())
+        // These lifecycle tests never dock, so the deny-all authority suffices.
+        Runtime::open(
+            root.clone(),
+            RuntimeBuilder::new().build().unwrap(),
+            Arc::new(DenyAllAuthority),
+        )
     }
 
     #[test]

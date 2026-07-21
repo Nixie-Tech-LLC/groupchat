@@ -12,15 +12,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId, StationId};
+use lait_kernel::ids::{ActorId, DeviceId};
 use replica::body::{BodyOp, BodySchema, MutationModel};
 use replica::frontier::{AuthorityFrontier, ReplicaFrontier};
 use replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 use runtime::{
-    ActivationOptions, DeorbitConfirmation, LifecycleError, PrincipalFacts, Runtime,
-    RuntimeBuilder, SpaceFormationOptions, Standing, World, WorldContext, WorldEffect, WorldError,
-    WorldIntent, WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
+    ActivationOptions, AuthorityView, DeorbitConfirmation, LifecycleError, LocalIdentity,
+    PrincipalResolution, Runtime, RuntimeBuilder, SpaceFormationOptions, Standing, World,
+    WorldContext, WorldEffect, WorldError, WorldIntent, WorldLimits, WorldProjection, WorldQuery,
+    WorldRegistration, WorldVersion,
 };
+
+/// The consumer's writing device; a second device resolves with no grants.
+const WRITER_SEED: [u8; 32] = [51u8; 32];
+const READER_SEED: [u8; 32] = [52u8; 32];
+
+/// The consumer-supplied mechanics view: grants Write to the writer device only.
+struct ConsumerAuthority;
+
+impl AuthorityView for ConsumerAuthority {
+    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
+        let writer = lait_kernel::crypto::device_from_seed(&WRITER_SEED);
+        let grants = if device == &writer {
+            vec![Grant::Write]
+        } else {
+            vec![]
+        };
+        Some(PrincipalResolution {
+            actor: ActorId::from_incept_hash(&"b".repeat(64)),
+            standing: Standing::new(grants),
+            authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![2]),
+        })
+    }
+}
+
+fn writer() -> LocalIdentity {
+    Runtime::identity_from_seed(&WRITER_SEED)
+}
+
+fn reader() -> LocalIdentity {
+    Runtime::identity_from_seed(&READER_SEED)
+}
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -119,17 +151,7 @@ fn kv_runtime(root: &PathBuf) -> Runtime {
         .register(reg, Arc::new(world))
         .build()
         .unwrap();
-    Runtime::open(root.clone(), registry)
-}
-
-fn principal(grants: Vec<Grant>) -> PrincipalFacts {
-    PrincipalFacts {
-        actor: ActorId::from_incept_hash(&"a".repeat(64)),
-        device: DeviceId::from_key_bytes(&[2u8; 32]),
-        station: StationId::from_key_bytes([2u8; 32]),
-        standing: Standing::new(grants),
-        authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![1]),
-    }
+    Runtime::open(root.clone(), registry, Arc::new(ConsumerAuthority))
 }
 
 fn world_id() -> WorldId {
@@ -152,9 +174,7 @@ fn a_consumer_drives_the_whole_lifecycle_through_the_public_api() {
     assert_eq!(rt.observe_orbits().len(), 1);
 
     // Dock and durably submit two entries.
-    let session = station
-        .dock(&world_id(), principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id(), &writer()).unwrap();
     let c1 = session
         .submit(WorldIntent {
             schema: SchemaId::parse("entry").unwrap(),
@@ -196,9 +216,7 @@ fn a_consumer_drives_the_whole_lifecycle_through_the_public_api() {
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap();
-    let session = station
-        .dock(&world_id(), principal(vec![Grant::Write]))
-        .unwrap();
+    let session = station.dock(&world_id(), &writer()).unwrap();
     assert_eq!(read(&session, "greeting"), b"hello");
     assert_eq!(read(&session, "farewell"), b"bye");
 
@@ -209,7 +227,7 @@ fn a_consumer_drives_the_whole_lifecycle_through_the_public_api() {
     ));
 
     // Per-request authorization: a read-only principal cannot write.
-    let readonly = station.dock(&world_id(), principal(vec![])).unwrap();
+    let readonly = station.dock(&world_id(), &reader()).unwrap();
     assert_eq!(
         readonly.submit(WorldIntent {
             schema: SchemaId::parse("entry").unwrap(),
@@ -240,7 +258,5 @@ fn an_unregistered_world_cannot_be_docked() {
         .activate(ActivationOptions::default())
         .unwrap();
     let unknown = WorldId::parse("dev.example.other").unwrap();
-    assert!(station
-        .dock(&unknown, principal(vec![Grant::Write]))
-        .is_err());
+    assert!(station.dock(&unknown, &writer()).is_err());
 }

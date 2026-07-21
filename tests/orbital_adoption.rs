@@ -1,17 +1,27 @@
-//! The product adopts the orbital lifecycle: form a Space, host the Issues
-//! World, dock a Session, and drive create/edit/comment/query durably — through
-//! the public `runtime` API, from the root application. This is the evidence
-//! that the root `lait` crate depends on and exercises the new crates.
+//! The product composes the orbital lifecycle through its mechanics-only
+//! adoption seam (`lait::orbital`): store-root convention + caller-supplied
+//! registry + caller-supplied mechanics authority view. The World used here is
+//! an **independent example World** (a tiny counter journal) — deliberately not
+//! product semantics: per O13/O23 the product ships no first-party World, and
+//! the Issues adapter arrives with the daemon integration as an adapter over
+//! the existing product behavior.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use lait::orbital::{open_orbital_runtime, IssueCommand, IssueQuery, IssueState, ISSUE_SCHEMA};
+use lait::orbital::{open_orbital_runtime, orbital_store_root};
 use lait_kernel::acl::Grant;
-use lait_kernel::ids::{ActorId, DeviceId, StationId};
+use lait_kernel::ids::{ActorId, DeviceId};
 use runtime::{
-    ActivationOptions, PrincipalFacts, SpaceFormationOptions, Standing, WorldIntent, WorldQuery,
+    ActivationOptions, AuthorityView, PrincipalResolution, Runtime, RuntimeBuilder,
+    SpaceFormationOptions, Standing, World, WorldContext, WorldEffect, WorldError, WorldIntent,
+    WorldLimits, WorldProjection, WorldQuery, WorldRegistration, WorldVersion,
 };
+
+use ::replica::body::{BodyOp, BodySchema, MutationModel};
+use ::replica::frontier::{AuthorityFrontier, ReplicaFrontier};
+use ::replica::ids::{BodyId, BodyKey, EncodingId, SchemaId, WorldId};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -23,83 +33,143 @@ fn temp_home() -> PathBuf {
     dir
 }
 
-fn principal() -> PrincipalFacts {
-    PrincipalFacts {
-        actor: ActorId::from_incept_hash(&"a".repeat(64)),
-        device: DeviceId::from_key_bytes(&[3u8; 32]),
-        station: StationId::from_key_bytes([3u8; 32]),
-        standing: Standing::new(vec![Grant::Write]),
-        authority_frontier: ::replica::frontier::AuthorityFrontier::from_canonical_bytes(vec![1]),
+const WRITER_SEED: [u8; 32] = [61u8; 32];
+
+/// The example deployment's mechanics view: the writer device gets Write.
+struct ExampleAuthority;
+
+impl AuthorityView for ExampleAuthority {
+    fn resolve(&self, device: &DeviceId) -> Option<PrincipalResolution> {
+        let writer = lait_kernel::crypto::device_from_seed(&WRITER_SEED);
+        (device == &writer).then(|| PrincipalResolution {
+            actor: ActorId::from_incept_hash(&"c".repeat(64)),
+            standing: Standing::new(vec![Grant::Write]),
+            authority_frontier: AuthorityFrontier::from_canonical_bytes(vec![3]),
+        })
     }
 }
 
-fn schema() -> ::replica::ids::SchemaId {
-    ::replica::ids::SchemaId::parse(ISSUE_SCHEMA).unwrap()
+/// An independent example World: a single tally Body; an intent increments it
+/// by the payload's byte length, a query returns the tally as decimal ASCII.
+struct TallyWorld {
+    id: WorldId,
+    schemas: Vec<BodySchema>,
 }
 
-fn intent(cmd: &IssueCommand) -> WorldIntent {
-    WorldIntent {
-        schema: schema(),
-        schema_version: 1,
-        payload: serde_json::to_vec(cmd).unwrap(),
+impl TallyWorld {
+    fn new() -> Self {
+        Self {
+            id: WorldId::parse("dev.example.tally").unwrap(),
+            schemas: vec![BodySchema {
+                id: SchemaId::parse("tally").unwrap(),
+                version: 1,
+                encoding: EncodingId::parse("ascii.decimal").unwrap(),
+                mutation: MutationModel::Atomic,
+                readable_predecessors: vec![],
+            }],
+        }
+    }
+    fn body(&self) -> BodyKey {
+        BodyKey::new(self.id.clone(), BodyId::from_bytes([9u8; 16]))
+    }
+    fn current(&self, ctx: &WorldContext<'_>) -> u64 {
+        ctx.read_body(&self.body())
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+}
+
+impl World for TallyWorld {
+    fn id(&self) -> WorldId {
+        self.id.clone()
+    }
+    fn schemas(&self) -> &[BodySchema] {
+        &self.schemas
+    }
+    fn submit(
+        &self,
+        ctx: &mut WorldContext<'_>,
+        intent: WorldIntent,
+    ) -> Result<WorldEffect, WorldError> {
+        if !ctx.principal().standing.has(&Grant::Write) {
+            return Err(WorldError::Denied);
+        }
+        let next = self.current(ctx) + intent.payload.len() as u64;
+        let key = self.body();
+        Ok(WorldEffect {
+            operations: vec![(
+                key.clone(),
+                BodyOp::ReplaceAtomic {
+                    value: next.to_string().into_bytes(),
+                },
+            )],
+            scopes: vec![key],
+            effect: next.to_string().into_bytes(),
+        })
+    }
+    fn query(
+        &self,
+        ctx: &WorldContext<'_>,
+        _query: WorldQuery,
+    ) -> Result<WorldProjection, WorldError> {
+        Ok(WorldProjection {
+            schema: SchemaId::parse("tally").unwrap(),
+            schema_version: 1,
+            bytes: self.current(ctx).to_string().into_bytes(),
+            frontier: ReplicaFrontier::EMPTY, // overwritten by Runtime
+        })
     }
 }
 
 #[test]
-fn the_product_hosts_issues_over_the_orbital_lifecycle() {
+fn the_product_composes_the_orbital_runtime_for_an_independent_world() {
     let home = temp_home();
-    let rt = open_orbital_runtime(home);
-    let world = ::replica::ids::WorldId::parse(lait::orbital::ISSUES_WORLD_ID).unwrap();
+    let world = TallyWorld::new();
+    let world_id = world.id();
+    let reg = WorldRegistration {
+        id: world_id.clone(),
+        implementation_version: WorldVersion(1),
+        schemas: world.schemas().to_vec(),
+        limits: WorldLimits::default(),
+    };
+    let registry = RuntimeBuilder::new()
+        .register(reg, Arc::new(world))
+        .build()
+        .unwrap();
 
+    // The product's composition seam: store-root convention + supplied parts.
+    let rt = open_orbital_runtime(&home, registry, Arc::new(ExampleAuthority));
+    assert!(orbital_store_root(&home).ends_with("orbital"));
+
+    let writer = Runtime::identity_from_seed(&WRITER_SEED);
     let orbit = rt.form_space(SpaceFormationOptions::default()).unwrap();
     let space = orbit.space_id().clone();
     let station = orbit.activate(ActivationOptions::default()).unwrap();
-    let session = station.dock(&world, principal()).unwrap();
+    let session = station.dock(&world_id, &writer).unwrap();
 
-    // Create an issue.
+    // Two increments: 5 then 3 bytes.
     session
-        .submit(intent(&IssueCommand::Create {
-            id: "iss-1".into(),
-            title: "first bug".into(),
-            body: "it broke".into(),
-        }))
+        .submit(WorldIntent {
+            schema: SchemaId::parse("tally").unwrap(),
+            schema_version: 1,
+            payload: b"hello".to_vec(),
+        })
         .unwrap();
-
-    // Edit its title (read-modify-write against the committed snapshot).
-    session
-        .submit(intent(&IssueCommand::Edit {
-            id: "iss-1".into(),
-            title: Some("first bug (triaged)".into()),
-            body: None,
-        }))
+    let second = session
+        .submit(WorldIntent {
+            schema: SchemaId::parse("tally").unwrap(),
+            schema_version: 1,
+            payload: b"add".to_vec(),
+        })
         .unwrap();
+    assert_eq!(second.effect, b"8");
+    assert_eq!(second.observation.sequence, 2);
 
-    // Comment on it.
-    let committed = session
-        .submit(intent(&IssueCommand::Comment {
-            id: "iss-1".into(),
-            text: "looking into it".into(),
-        }))
-        .unwrap();
-    assert_eq!(committed.observation.sequence, 3);
+    // The store lives under the product's orbital root.
+    assert!(orbital_store_root(&home).join(space.as_str()).is_dir());
 
-    // Query the current state.
-    let get = |id: &str| -> IssueState {
-        let proj = session
-            .query(WorldQuery {
-                schema: schema(),
-                schema_version: 1,
-                payload: serde_json::to_vec(&IssueQuery::Get { id: id.into() }).unwrap(),
-            })
-            .unwrap();
-        serde_json::from_slice(&proj.bytes).unwrap()
-    };
-    let issue = get("iss-1");
-    assert_eq!(issue.title, "first bug (triaged)");
-    assert_eq!(issue.body, "it broke");
-    assert_eq!(issue.comments, vec!["looking into it".to_string()]);
-
-    // Durability: go dormant, reactivate, the issue is still there.
+    // Restart durability through the product seam.
     let orbit = station.go_dormant().unwrap();
     drop(orbit);
     let station = rt
@@ -107,17 +177,15 @@ fn the_product_hosts_issues_over_the_orbital_lifecycle() {
         .unwrap()
         .activate(ActivationOptions::default())
         .unwrap();
-    let session = station.dock(&world, principal()).unwrap();
-    let issue = {
-        let proj = session
-            .query(WorldQuery {
-                schema: schema(),
-                schema_version: 1,
-                payload: serde_json::to_vec(&IssueQuery::Get { id: "iss-1".into() }).unwrap(),
-            })
-            .unwrap();
-        serde_json::from_slice::<IssueState>(&proj.bytes).unwrap()
-    };
-    assert_eq!(issue.title, "first bug (triaged)");
-    assert_eq!(issue.comments.len(), 1);
+    let session = station.dock(&world_id, &writer).unwrap();
+    let proj = session
+        .query(WorldQuery {
+            schema: SchemaId::parse("tally").unwrap(),
+            schema_version: 1,
+            payload: vec![],
+        })
+        .unwrap();
+    assert_eq!(proj.bytes, b"8");
+    // Runtime stamped the real committed frontier onto the projection.
+    assert_eq!(proj.frontier, second.frontier);
 }
