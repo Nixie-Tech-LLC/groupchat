@@ -337,7 +337,7 @@ impl<'a> IssueRouter<'a> {
                 body,
             } => {
                 let project = self.choose_project(&snapshot, project.as_deref(), facts)?;
-                let resolved_assignees: Vec<String> = assignees.iter().cloned().collect();
+                let resolved_assignees: Vec<String> = assignees.to_vec();
                 let mut label_ids = Vec::new();
                 let mut new_labels = Vec::new();
                 for label in &labels {
