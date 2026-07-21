@@ -21,11 +21,6 @@ use crate::world::PrincipalFacts;
 use replica::ids::WorldId;
 use replica::ConvergenceOutcome;
 
-/// Verifiable material sufficient to identify and approach a Space. This is the
-/// S0 placeholder shape; S2 replaces it with canonical `SignedCoordinatesV1`.
-#[derive(Debug, Clone)]
-pub struct Coordinates(pub Vec<u8>);
-
 /// Options for forming a new Space. Reserved shape; fields land in S2.
 #[derive(Debug, Clone, Default)]
 pub struct SpaceFormationOptions {
@@ -92,13 +87,25 @@ impl Runtime {
         Err(LifecycleError::NotYetWired("form_space (S2)"))
     }
 
-    /// Materialize this device's Orbit from Coordinates. Wired in S2.
+    /// Materialize this device's Orbit from Coordinates. The Coordinates are
+    /// fully verified here (version, founding self-proof, approach-Station
+    /// signature, admission structure); the durable Replica materialization is
+    /// wired in the S2 store cutover. A pre-carve `SpaceTicket` fails with
+    /// [`LifecycleError::UnsupportedCoordinatesVersion`].
     pub fn enter_orbit(
         &self,
-        _coordinates: Coordinates,
+        coordinates: &crate::coordinates::SignedCoordinatesV1,
         _options: EnterOptions,
     ) -> Result<Orbit, LifecycleError> {
-        Err(LifecycleError::NotYetWired("enter_orbit (S2)"))
+        let _verified = coordinates.verify().map_err(|e| match e {
+            crate::coordinates::CoordinatesError::UnsupportedVersion(_) => {
+                LifecycleError::UnsupportedCoordinatesVersion
+            }
+            other => LifecycleError::IntegrityFailure(other.to_string()),
+        })?;
+        Err(LifecycleError::NotYetWired(
+            "enter_orbit Replica materialization (S2 store cutover)",
+        ))
     }
 
     /// Acquire an existing local Orbit for operational ownership (revalidates

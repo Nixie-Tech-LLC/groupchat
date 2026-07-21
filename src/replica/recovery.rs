@@ -1383,48 +1383,63 @@ impl Replica {
                 }
             }
         }
+        // Write to a temp sibling, verify it opens, and only then rename it over
+        // the target. Overwriting `out` up front and verifying afterwards would
+        // destroy a good prior share whenever the fresh export fails to reopen —
+        // an all-holders arrangement then loses a custodian to a bad passphrase
+        // typo. The verified temp is the only thing that ever replaces the target.
+        let nonce_hex = data_encoding::HEXLOWER.encode(&rand16());
+        let base = out.file_name().and_then(|n| n.to_str()).unwrap_or("share");
+        let tmp = out.with_file_name(format!("{base}.tmp-{nonce_hex}"));
         // Portable: a share package is meant to be carried off this machine, so
-        // it must not be wrapped to this account.
+        // it must not be wrapped to this account. `New` so a stray temp is loud.
         if let Err(e) = crate::secretfs::write_private(
-            &out,
+            &tmp,
             &bytes,
-            crate::secretfs::Create::Replace,
+            crate::secretfs::Create::New,
             crate::secretfs::Wrap::Portable,
         ) {
             return Err(ReplicaError::from(e));
         }
-        // Read back from disk and open through the portable slot. Verifying the
-        // in-memory value would test nothing that could actually fail.
-        let reread = match crate::secretfs::read_private(&out) {
-            Ok(Some(b)) => b,
-            Ok(None) => return Err(ReplicaError::ceremony("the package vanished after writing")),
-            Err(e) => {
-                return Err(ReplicaError::ceremony(format!(
-                    "re-reading the package failed: {e}"
-                )))
-            }
-        };
-        let restored: crate::custody::AuthoritySharePackage = match postcard::from_bytes(&reread) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(ReplicaError::ceremony(format!(
-                    "the written package does not decode: {e}"
-                )))
-            }
-        };
-        let expect = crate::custody::PackageExpectation {
-            space: &self.space_id,
-            authority: &authority,
-            ceremony: &dkg.to_hex(),
-            leaf: &leaf,
-            group_key: &group_key,
-            index: index as u16 + 1,
-        };
-        if let Err(e) =
-            restored.verify_and_open(&crate::custody::UnlockKey::Passphrase(passphrase), &expect)
-        {
+        // Read the temp back from disk and open through the portable slot.
+        // Verifying the in-memory value would test nothing that could fail.
+        let verify = (|| -> Result<(), String> {
+            let reread = match crate::secretfs::read_private(&tmp) {
+                Ok(Some(b)) => b,
+                Ok(None) => return Err("the package vanished after writing".into()),
+                Err(e) => return Err(format!("re-reading the package failed: {e}")),
+            };
+            let restored: crate::custody::AuthoritySharePackage = postcard::from_bytes(&reread)
+                .map_err(|e| format!("the written package does not decode: {e}"))?;
+            let expect = crate::custody::PackageExpectation {
+                space: &self.space_id,
+                authority: &authority,
+                ceremony: &dkg.to_hex(),
+                leaf: &leaf,
+                group_key: &group_key,
+                index: index as u16 + 1,
+            };
+            restored
+                .verify_and_open(
+                    &crate::custody::UnlockKey::Passphrase(passphrase.clone()),
+                    &expect,
+                )
+                .map_err(|e| format!("the exported package could not be reopened: {e:#}"))?;
+            Ok(())
+        })();
+        if let Err(msg) = verify {
+            // Leave any existing target untouched; discard the unverified temp.
+            let _ = std::fs::remove_file(&tmp);
             return Err(ReplicaError::ceremony(format!(
-                "the exported package could not be reopened, so it was NOT attested: {e:#}"
+                "{msg}, so it was NOT attested"
+            )));
+        }
+        // The temp opened cleanly: promote it atomically. Only now is the old
+        // target (if any) replaced.
+        if let Err(e) = crate::secretfs::persist_replace(&tmp, &out) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ReplicaError::ceremony(format!(
+                "the verified package could not be moved into place: {e}"
             )));
         }
         if let Err(e) = self.post_ceremony(crate::dkg::CeremonyOp::CustodyAck { dkg }) {

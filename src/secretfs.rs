@@ -88,6 +88,17 @@ pub fn write_private(path: &Path, bytes: &[u8], create: Create, wrap: Wrap) -> R
     imp::write_private(path, &payload, create)
 }
 
+/// Atomically move `tmp` onto `final_path`, replacing any existing file. Both
+/// paths must be on the same filesystem. `std::fs::rename` is an atomic replace
+/// on every platform lait targets (it passes `MOVEFILE_REPLACE_EXISTING` on
+/// Windows), so a caller can write and *verify* a secret at `tmp` and only then
+/// make it visible at `final_path` — a failed or corrupt write never destroys
+/// the file already there. The temp inherits the parent's owner-only ACL from
+/// [`write_private`], and the rename preserves it.
+pub fn persist_replace(tmp: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, final_path)
+}
+
 /// Why a secret that exists could not be produced.
 ///
 /// `Undecryptable` is the operationally important variant: the bytes are on disk
@@ -459,6 +470,46 @@ mod tests {
         // Portable means portable: the bytes on disk are the bytes we wrote, so
         // a key carried to another machine still opens.
         assert_eq!(std::fs::read(&path).unwrap(), b"deadbeef");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_replace_overwrites_an_existing_target_atomically() {
+        let dir = tmp("replace");
+        create_private_dir(&dir).unwrap();
+        let target = dir.join("share.pkg");
+        // A prior good share is already at the target.
+        write_private(&target, b"old-good-share", Create::New, Wrap::Portable).unwrap();
+        // A verified fresh export lands at a temp sibling, then is promoted.
+        let temp = dir.join("share.pkg.tmp-abcd");
+        write_private(&temp, b"new-good-share", Create::New, Wrap::Portable).unwrap();
+        persist_replace(&temp, &target).unwrap();
+        assert_eq!(
+            read_private(&target).unwrap().as_deref(),
+            Some(&b"new-good-share"[..])
+        );
+        // The temp is gone (renamed away), leaving no litter behind.
+        assert!(read_private(&temp).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_verify_leaves_the_prior_target_intact() {
+        // Models the custody-export contract: if a fresh export is written to a
+        // temp and never promoted (because verification failed), the target the
+        // caller already had must be untouched.
+        let dir = tmp("intact");
+        create_private_dir(&dir).unwrap();
+        let target = dir.join("share.pkg");
+        write_private(&target, b"old-good-share", Create::New, Wrap::Portable).unwrap();
+        let temp = dir.join("share.pkg.tmp-ef01");
+        write_private(&temp, b"corrupt-export", Create::New, Wrap::Portable).unwrap();
+        // Verification "fails": discard the temp, do NOT promote it.
+        std::fs::remove_file(&temp).unwrap();
+        assert_eq!(
+            read_private(&target).unwrap().as_deref(),
+            Some(&b"old-good-share"[..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

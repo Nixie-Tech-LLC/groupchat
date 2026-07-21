@@ -26,6 +26,7 @@
 //! consumption semantics.
 
 pub mod action;
+pub mod coordinates;
 #[cfg(test)]
 mod dispatch_tests;
 pub mod error;
@@ -35,6 +36,10 @@ pub mod session;
 pub mod world;
 
 pub use action::{ActionError, IdempotencyKey, RequestId, SignedWorldActionV1, WorldActionHeader};
+pub use coordinates::{
+    AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
+    CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
+};
 pub use error::{ContactError, DormancyError, LifecycleError, StationExit, WorldError};
 pub use lifecycle::{ContactOutcome, Neighbor, Orbit, OrbitObservation, Runtime, Station};
 pub use registry::{RuntimeBuilder, WorldRegistry};

@@ -21,8 +21,13 @@ serde-byte-array = "0.1"
 # Canonical wire encoding for the signed World-action envelope (and later public
 # envelopes). postcard is the workspace-pinned canonical codec.
 postcard = { version = "1", features = ["use-std"] }
+# base32 for the Coordinates v1 link form.
+data-encoding = "2.6"
 # Payload commitment in the World-action header.
 blake3 = "1"
+# NFC validation of the human-facing display-name/nick hints in Coordinates v1
+# (the canonical form rejects non-NFC UTF-8).
+unicode-normalization = "0.1"
 anyhow = "1"
 
 [dev-dependencies]
