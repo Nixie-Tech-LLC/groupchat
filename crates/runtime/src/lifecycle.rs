@@ -96,16 +96,22 @@ pub struct SpaceFormationOptions {
 pub struct EnterOptions;
 
 /// Options for activating an Orbit into a Station.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct ActivationOptions {
     /// The deadline for draining tracked tasks at dormancy.
     pub drain_deadline: Duration,
+    /// The Station's Contact plane: transport, station identity, mechanics
+    /// seams, and gossip. `None` activates an offline Station (valid; grants
+    /// no new authority; `neighbors` still serves the persisted registry).
+    pub comms: Option<crate::contact_driver::CommsOptions>,
 }
 
-impl Default for ActivationOptions {
-    fn default() -> Self {
+impl ActivationOptions {
+    /// The default activation: offline, with the default drain deadline.
+    pub fn offline() -> Self {
         Self {
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
+            comms: None,
         }
     }
 }
@@ -358,6 +364,11 @@ impl Orbit {
     /// overflow), then transfers the store lock into the live Station. Valid
     /// offline; grants no new Space authority.
     pub fn activate(self, options: ActivationOptions) -> Result<Station, LifecycleError> {
+        let drain_deadline = if options.drain_deadline.is_zero() {
+            DEFAULT_DRAIN_DEADLINE
+        } else {
+            options.drain_deadline
+        };
         let epoch = StationEpoch::from_u64(self.store.bump_epoch()?);
         // Open the durable Replica at the Orbit store's journaled Fabric store:
         // crash recovery runs here (exposing the complete old or complete new
@@ -392,7 +403,12 @@ impl Orbit {
             }
         }
         replica.set_supported(supported);
-        Ok(Station {
+        let neighbor_registry = Arc::new(Mutex::new(
+            crate::neighbors::NeighborRegistry::load(self.store.dir(), self.store.space())
+                .map_err(|e| LifecycleError::IntegrityFailure(e.to_string()))?,
+        ));
+        let core = Arc::new(crate::session::StationCore::new(replica));
+        let station = Station {
             store: self.store,
             registry: self.registry,
             authority: self.authority,
@@ -402,9 +418,41 @@ impl Orbit {
             alive: Arc::new(AtomicBool::new(true)),
             cancel: CancelToken::new(),
             handles: Mutex::new(Vec::new()),
-            drain_deadline: options.drain_deadline,
-            core: Arc::new(crate::session::StationCore::new(replica)),
-        })
+            drain_deadline,
+            core,
+            neighbor_registry,
+            driver: Mutex::new(None),
+            contact_deadline: options
+                .comms
+                .as_ref()
+                .map(|c| c.whole_deadline)
+                .unwrap_or(Duration::from_secs(60)),
+        };
+        if let Some(comms) = options.comms {
+            let space = station.store.space().clone();
+            let space_bytes = <[u8; 29]>::try_from(space.as_str().as_bytes())
+                .map_err(|_| LifecycleError::IntegrityFailure("space id shape".into()))?;
+            let station_key = mechanics::crypto::device_from_seed(&comms.station_seed)
+                .key_bytes()
+                .ok_or_else(|| LifecycleError::IntegrityFailure("station seed key".into()))?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = crate::contact_driver::DriverContext {
+                space,
+                space_bytes,
+                station_key,
+                epoch: epoch.as_u64(),
+                core: station.core.clone(),
+                registry: station.neighbor_registry.clone(),
+                options: comms,
+                commands: rx,
+                cancel: station.cancel.clone(),
+            };
+            station
+                .spawn_tracked(move |_cancel| crate::contact_driver::run_driver(ctx))
+                .expect("station is live at activation");
+            *station.driver.lock().expect("driver slot") = Some(tx);
+        }
+        Ok(station)
     }
 
     /// Destructively remove this local Orbit, consuming it (and its lock). The
@@ -454,6 +502,12 @@ pub struct Station {
     /// shared with docked Sessions so their commits serialize through the one
     /// Replica. Sessions hold a clone but can never stop the Station.
     core: Arc<crate::session::StationCore>,
+    /// The persistent Neighbor registry (loaded at activation).
+    neighbor_registry: Arc<Mutex<crate::neighbors::NeighborRegistry>>,
+    /// The Contact-plane command channel, when a transport was activated.
+    driver: Mutex<Option<std::sync::mpsc::Sender<crate::contact_driver::DriverCmd>>>,
+    /// The whole-contact deadline (bounds the administrative contact wait).
+    contact_deadline: Duration,
 }
 
 impl std::fmt::Debug for Station {
@@ -559,25 +613,76 @@ impl Station {
         self.core.frontier()
     }
 
-    /// Known/discoverable Neighbors. Reachability is advisory. **Incomplete
-    /// surface**: the persistent Neighbor registry is completion package C2 of
-    /// `docs/plans/02-runtime-world-carve.md`; until it lands this returns an
-    /// empty snapshot and the public lifecycle is not claimed complete.
+    /// Known/discoverable Neighbors: a consistent snapshot of the persistent
+    /// registry (verified Beacon high-water, advisory reachability, retry
+    /// state). Reachability is advisory and never standing.
     pub fn neighbors(&self) -> Vec<Neighbor> {
-        Vec::new()
+        self.neighbor_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
     }
 
-    /// An explicitly privileged administrative/test Contact. Not exposed on
-    /// ordinary Session handles. **Incomplete surface**: Contact transport and
-    /// scheduling are completion package C2 of
-    /// `docs/plans/02-runtime-world-carve.md`; until it lands every Neighbor is
-    /// reported `Unreachable` and the public lifecycle is not claimed complete.
+    /// Ingest raw Beacon bytes (e.g. received over an application gossip
+    /// surface). Verified, forward-only, coalescing; a fresh advertised
+    /// frontier queues a Contact through the Station scheduler.
+    pub fn observe_beacon(&self, bytes: &[u8]) {
+        if !self.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let driver = self.driver.lock().expect("driver slot");
+        if let Some(tx) = driver.as_ref() {
+            let _ = tx.send(crate::contact_driver::DriverCmd::Beacon(bytes.to_vec()));
+            return;
+        }
+        drop(driver);
+        // No transport: ingest directly into the registry.
+        let Ok(signed) = crate::beacon::SignedBeaconV1::decode_canonical(bytes) else {
+            return;
+        };
+        let Ok(verified) = signed.verify() else {
+            return;
+        };
+        let frontier = self.core.frontier();
+        let mut registry = self
+            .neighbor_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _ = registry.observe_beacon(
+            &verified,
+            (&frontier.root, frontier.transaction_count),
+            crate::contact_driver::now_ms(),
+            60_000,
+        );
+    }
+
+    /// An explicitly privileged administrative/test Contact: dial the Neighbor
+    /// now (bypassing backoff, not the in-flight bounds), run the full
+    /// initiator exchange, validate, and durably incorporate. Not exposed on
+    /// ordinary Session handles; refused once the Station is going dormant or
+    /// when no transport was activated.
     pub fn contact(
         &self,
-        _neighbor: &StationId,
+        neighbor: &StationId,
         _options: ContactOptions,
     ) -> Result<ContactOutcome, ContactError> {
-        Err(ContactError::Unreachable)
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(ContactError::Transfer("station dormant".into()));
+        }
+        let driver = self.driver.lock().expect("driver slot");
+        let Some(tx) = driver.as_ref() else {
+            return Err(ContactError::Unreachable);
+        };
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(crate::contact_driver::DriverCmd::Contact {
+            station: neighbor.clone(),
+            reply: reply_tx,
+        })
+        .map_err(|_| ContactError::Unreachable)?;
+        drop(driver);
+        reply_rx
+            .recv_timeout(self.contact_deadline + Duration::from_secs(5))
+            .map_err(|_| ContactError::Unreachable)?
     }
 
     /// Drain the tracked task set within `deadline`. Returns the join results of
@@ -821,6 +926,7 @@ mod tests {
         let space = orbit.space_id().clone();
         let opts = ActivationOptions {
             drain_deadline: Duration::from_millis(20),
+            comms: None,
         };
         let station = orbit.activate(opts).unwrap();
         let stop2 = stop.clone();

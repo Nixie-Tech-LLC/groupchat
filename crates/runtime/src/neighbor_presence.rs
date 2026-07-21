@@ -16,6 +16,9 @@ use crate::wire::length_framed;
 
 /// The only presence protocol version this build speaks (never negotiated).
 pub const PRESENCE_PROTOCOL: u16 = 1;
+
+/// The Neighbor-presence v1 ALPN.
+pub const PRESENCE_ALPN_V1: &[u8] = b"lait/neighbor-presence/1";
 /// Probe signing domain.
 pub const PROBE_DOMAIN: &[u8] = b"lait/neighbor-presence/1/probe";
 /// Ack signing domain.

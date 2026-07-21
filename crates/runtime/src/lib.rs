@@ -28,6 +28,7 @@
 pub mod action;
 pub mod beacon;
 pub mod contact;
+pub mod contact_driver;
 pub mod coordinates;
 #[cfg(test)]
 mod dispatch_tests;
@@ -35,6 +36,7 @@ pub mod dto;
 pub mod error;
 pub mod lifecycle;
 pub mod neighbor_presence;
+pub mod neighbors;
 pub mod registry;
 pub mod session;
 pub mod store;
@@ -49,6 +51,7 @@ pub use contact::{
     AccepterEvent, AccepterValidator, ContactFrame, ContactHelloAckV1, ContactHelloV1, ContactId,
     ContactWireError, InitiatorReceiver, InitiatorState, Progress, ReceivedMaterial,
 };
+pub use contact_driver::{CommsOptions, ContactMechanics, GossipOptions, MAX_CONTACTS_IN_FLIGHT};
 pub use coordinates::{
     AdmissionCapabilityV1, ApproachAddr, CoordinatesAdmission, CoordinatesError,
     CoordinatesPayloadV1, SignedCoordinatesV1, VerifiedCoordinates,
@@ -59,7 +62,8 @@ pub use lifecycle::{
     EnterOptions, Neighbor, Orbit, OrbitObservation, Reachability, Runtime, SpaceFormationOptions,
     Station,
 };
-pub use neighbor_presence::{AckV1, PresenceError, ProbeV1};
+pub use neighbor_presence::{AckV1, PresenceError, ProbeV1, PRESENCE_ALPN_V1};
+pub use neighbors::{NeighborRecordV1, NeighborRegistry, RegistryError, StoredRoute};
 pub use registry::{RuntimeBuilder, WorldRegistry};
 pub use session::{CommittedEffect, Observation, ObservationCursor, Session};
 pub use world::{

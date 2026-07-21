@@ -957,6 +957,110 @@ impl InitiatorReceiver {
 }
 
 // ---------------------------------------------------------------------------
+// Outbound transfer framing
+// ---------------------------------------------------------------------------
+
+/// The material one accepter serves in one transfer, snapshotted before the
+/// first frame is sent.
+#[derive(Debug, Clone)]
+pub struct OutboundTransfer {
+    pub authority_frontier: Vec<u8>,
+    /// Canonical authority-section records (mechanics material and signed
+    /// `BodyTransactionV1` records), byte-exact.
+    pub authority_records: Vec<Vec<u8>>,
+    pub manifest_root_bytes: Vec<u8>,
+    /// Ordered canonical page bytes.
+    pub manifest_pages: Vec<Vec<u8>>,
+    /// `(transaction id, key, protected payload bytes)`.
+    pub bodies: Vec<([u8; 16], BodyKey, Vec<u8>)>,
+}
+
+/// Build the complete, canonical, ordered frame sequence for a transfer:
+/// authority section, manifest root + pages, chunked protected Body payloads
+/// (each chunk at most [`MAX_CHUNK`]), and the terminal `TransferEnd` carrying
+/// the transcript hash over every prior frame.
+pub fn build_transfer_frames(contact: &ContactId, t: &OutboundTransfer) -> Vec<Vec<u8>> {
+    let record_hashes: Vec<[u8; 32]> = t
+        .authority_records
+        .iter()
+        .map(|r| authority_record_hash(r))
+        .collect();
+    let set_hash = authority_set_hash(&record_hashes);
+    let root = manifest_root_ref(&t.manifest_root_bytes);
+    let total_bytes: u64 = t.authority_records.iter().map(|r| r.len() as u64).sum();
+
+    let mut frames: Vec<ContactFrame> = Vec::new();
+    frames.push(ContactFrame::AuthorityOffer {
+        authority_frontier: t.authority_frontier.clone(),
+        record_count: t.authority_records.len() as u32,
+        total_bytes,
+        set_hash,
+    });
+    for (i, record) in t.authority_records.iter().enumerate() {
+        frames.push(ContactFrame::AuthorityChunk {
+            index: i as u32,
+            record_hash: record_hashes[i],
+            bytes: record.clone(),
+        });
+    }
+    frames.push(ContactFrame::AuthorityEnd {
+        record_count: t.authority_records.len() as u32,
+        set_hash,
+    });
+    frames.push(ContactFrame::ManifestOffer {
+        root_bytes: t.manifest_root_bytes.clone(),
+    });
+    for (i, page) in t.manifest_pages.iter().enumerate() {
+        frames.push(ContactFrame::ManifestPage {
+            root,
+            page_index: i as u32,
+            page_hash: manifest_page_hash(page),
+            page_bytes: page.clone(),
+        });
+    }
+    let mut body_count = 0u32;
+    for (tx, key, payload) in &t.bodies {
+        let total = payload.len() as u64;
+        let mut offset = 0u64;
+        for chunk in payload.chunks(MAX_CHUNK) {
+            frames.push(ContactFrame::BodyChunk {
+                transaction: *tx,
+                body: key.clone(),
+                offset,
+                total,
+                chunk_hash: body_chunk_hash(chunk),
+                bytes: chunk.to_vec(),
+            });
+            offset += chunk.len() as u64;
+        }
+        frames.push(ContactFrame::BodyEnd {
+            transaction: *tx,
+            body: key.clone(),
+            total,
+            content_commitment: ContentCommitment::over_protected_payload(payload).as_bytes(),
+        });
+        body_count += 1;
+    }
+
+    let mut raw: Vec<Vec<u8>> = frames.drain(..).map(|f| f.encode(contact)).collect();
+    let mut transcript = blake3::Hasher::new();
+    transcript.update(TRANSCRIPT_DOMAIN);
+    for r in &raw {
+        transcript.update(r);
+    }
+    raw.push(
+        ContactFrame::TransferEnd {
+            authority_set_hash: set_hash,
+            manifest_root: root,
+            body_count,
+            transcript_hash: *transcript.finalize().as_bytes(),
+        }
+        .encode(contact),
+    );
+    raw
+}
+
+// ---------------------------------------------------------------------------
 // Accepter request validation
 // ---------------------------------------------------------------------------
 

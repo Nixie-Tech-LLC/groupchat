@@ -34,8 +34,14 @@ unicode-normalization = "0.1"
 # Cross-platform advisory file lock: the Orbit's exclusive store lock (the typed
 # double-lock). Same lock the product's single-instance daemon guard uses.
 fs2 = "0.4"
+# The Station's Contact plane: one tracked driver thread runs a current-thread
+# tokio runtime to drive the comms transport (accept loop, scheduler, gossip).
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 # Minting a fresh SpaceId digest at formation.
 getrandom = "0.3"
 anyhow = "1"
 
 [dev-dependencies]
+# The real-iroh Contact gate test builds two loopback endpoints on a
+# multi-thread runtime that outlives the Stations driving them.
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }

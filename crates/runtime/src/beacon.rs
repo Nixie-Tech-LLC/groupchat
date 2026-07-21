@@ -189,6 +189,9 @@ impl SignedBeaconV1 {
             station_bytes: self.body.station,
             epoch: self.body.epoch,
             sequence: self.body.sequence,
+            frontier_root: self.body.frontier_root,
+            frontier_count: self.body.frontier_count,
+            routes: self.body.routes.clone(),
         })
     }
 }
@@ -204,6 +207,9 @@ pub struct VerifiedBeacon {
     station_bytes: [u8; 32],
     epoch: u64,
     sequence: u64,
+    frontier_root: [u8; 32],
+    frontier_count: u64,
+    routes: Vec<RouteHint>,
 }
 
 impl VerifiedBeacon {
@@ -216,6 +222,14 @@ impl VerifiedBeacon {
     /// The freshness coordinate `(epoch, sequence)`.
     pub fn coordinate(&self) -> (u64, u64) {
         (self.epoch, self.sequence)
+    }
+    /// The advertised Replica frontier summary.
+    pub fn frontier(&self) -> ([u8; 32], u64) {
+        (self.frontier_root, self.frontier_count)
+    }
+    /// The verified route hints (advisory).
+    pub fn routes(&self) -> &[RouteHint] {
+        &self.routes
     }
 }
 

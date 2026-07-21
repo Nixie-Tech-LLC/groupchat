@@ -119,6 +119,21 @@ impl StationCore {
         self.lock().replica.frontier()
     }
 
+    /// Run a closure against the exclusive Replica writer (the Contact plane's
+    /// snapshot/incorporation entry). Refused once the core is closed.
+    pub(crate) fn with_replica<T>(
+        &self,
+        f: impl FnOnce(&mut replica::Replica) -> Result<T, replica::ReplicaCommitError>,
+    ) -> Result<T, replica::ReplicaCommitError> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(replica::ReplicaCommitError::Illegitimate(
+                "station dormant".into(),
+            ));
+        }
+        f(&mut inner.replica)
+    }
+
     /// Close the core to further commits, as one transition under the writer
     /// mutex: an in-flight submit either completed its journaled durable commit
     /// before the close or observes it and is refused. Every acknowledged
