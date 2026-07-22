@@ -20,6 +20,7 @@ const ctx = (over: Partial<Ctx> = {}): Ctx => ({
   spaceId: "s1",
   readOnly: false,
   selection: null,
+  checkedCount: 0,
   overlay: false,
   app: {} as Ctx["app"],
   ...over,

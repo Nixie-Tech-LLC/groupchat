@@ -1,8 +1,9 @@
 import { useEffect, useRef } from "react";
-import { Plus } from "lucide-react";
+import { Plus, Trash2 } from "lucide-react";
 
-import type { BoardColumn, BoardView, MemberDto, Row } from "../types";
-import { AvatarStack, stackFor } from "./Avatar";
+import type { RowGroup } from "../core/display";
+import type { MemberDto, Row, WorkflowState } from "../types";
+import { Avatar, AvatarStack, memberName, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { IconButton, Kbd } from "./primitives";
@@ -10,37 +11,52 @@ import { IconButton, Kbd } from "./primitives";
 /**
  * The default view: one flat, grouped list.
  *
- * Grouped **by status**, which costs nothing — `BoardView.columns` are already
- * status buckets with their rows in board order, so the list and the board are two
- * renderings of one fetch rather than two round trips.
+ * The groups arrive from `core/display.ts` — by status they are the board's own
+ * columns (one fetch, two renderings), and the other axes are client-side
+ * rearrangements of the same rows. Group *shape* changes; row identity, motion,
+ * and selection never do.
  *
- * The density is the feature. Rows are a fixed 32px with a fixed column rhythm, so
- * the eye tracks straight down the ids and the titles without re-finding them on
- * each line — which is exactly what stops being true the moment a row grows to fit
- * its content.
+ * The density is the feature. Rows are a fixed 32px with a fixed column rhythm,
+ * so the eye tracks straight down the ids and the titles without re-finding them
+ * on each line — which is exactly what stops being true the moment a row grows to
+ * fit its content.
  */
 export function IssueList({
-  board,
+  groups,
+  deleted,
+  states,
   members,
   selection,
+  checked,
   optimistic,
   onSelect,
+  onToggleCheck,
   onOpen,
   onCreate,
   readOnly,
 }: {
-  board: BoardView;
+  groups: RowGroup[];
+  /** The trash — tombstoned rows from `list all:true`, rendered as their own
+   *  group. Separate from `groups` because a deleted issue is *not on the
+   *  board* (deletion removes it from `boards[P]`); empty = trash hidden. */
+  deleted: Row[];
+  /** Board-ordered workflow, for a row's status glyph under non-status grouping. */
+  states: WorkflowState[];
   /** The ACL, for resolving assignee keys to faces. */
   members: MemberDto[];
   selection: string | null;
+  /** Bulk-selection checks, by canonical ref. */
+  checked: ReadonlySet<string>;
   /** Docs carrying an unconfirmed local prediction. */
   optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
+  onToggleCheck: (reff: string) => void;
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
 }) {
-  const total = board.columns.reduce((n, c) => n + visible(c).length, 0);
+  const visible = (g: RowGroup) => g.rows.filter((r) => !r.tombstone);
+  const total = groups.reduce((n, g) => n + visible(g).length, 0);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -48,20 +64,51 @@ export function IssueList({
         {total} {total === 1 ? "issue" : "issues"}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {board.columns.map((col) => (
+        {groups.map((group) => (
           <Group
-            key={col.state.id}
-            col={col}
+            key={group.key}
+            group={group}
+            rows={visible(group)}
+            states={states}
             members={members}
             selection={selection}
+            checked={checked}
             optimistic={optimistic}
             onSelect={onSelect}
+            onToggleCheck={onToggleCheck}
             onOpen={onOpen}
             onCreate={onCreate}
             readOnly={readOnly}
           />
         ))}
-        {total === 0 && (
+        {deleted.length > 0 && (
+          <section>
+            <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
+              <Trash2 className="text-mute size-3.5" />
+              <h2 className="text-base font-semibold">Deleted</h2>
+              <span className="text-mute text-sm tabular-nums">{deleted.length}</span>
+            </header>
+            <ul>
+              {deleted.map((row) => (
+                <IssueRow
+                  key={row.reff}
+                  row={row}
+                  state={states.find((s) => s.id === row.status)}
+                  members={members}
+                  selected={row.reff === selection}
+                  checked={checked.has(row.reff)}
+                  anyChecked={checked.size > 0}
+                  pending={optimistic.has(row.doc_id)}
+                  onSelect={onSelect}
+                  onToggleCheck={onToggleCheck}
+                  onOpen={onOpen}
+                  readOnly={readOnly}
+                />
+              ))}
+            </ul>
+          </section>
+        )}
+        {total === 0 && deleted.length === 0 && (
           <p className="text-mute p-8 text-center">
             Nothing here yet. Press <Kbd>c</Kbd> to file the first issue.
           </p>
@@ -71,40 +118,74 @@ export function IssueList({
   );
 }
 
-const visible = (c: BoardColumn) => c.rows.filter((r) => !r.tombstone);
+/** The group header's leading glyph: whatever the group *is*. */
+function GroupIcon({ group, members }: { group: RowGroup; members: MemberDto[] }) {
+  if (group.state) {
+    return (
+      <StatusIcon category={group.state.category} color={catalogColor(group.state.color)} />
+    );
+  }
+  if (group.kind === "priority") {
+    return <PriorityIcon priority={group.label as Row["priority"]} />;
+  }
+  if (group.kind === "assignee" && group.key !== "unassigned") {
+    const m = members.find((x) => x.key === group.label);
+    return <Avatar deviceKey={group.label} alias={m?.alias ?? ""} me={m?.me ?? false} size="sm" />;
+  }
+  return null;
+}
 
 function Group({
-  col,
+  group,
+  rows,
+  states,
   members,
   selection,
+  checked,
   optimistic,
   onSelect,
+  onToggleCheck,
   onOpen,
   onCreate,
   readOnly,
 }: {
-  col: BoardColumn;
+  group: RowGroup;
+  rows: Row[];
+  states: WorkflowState[];
   members: MemberDto[];
   selection: string | null;
+  checked: ReadonlySet<string>;
   optimistic: ReadonlySet<string>;
   onSelect: (reff: string) => void;
+  onToggleCheck: (reff: string) => void;
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
 }) {
-  const rows = visible(col);
+  // An emptied group stays visible under status grouping (a status that exists
+  // is a column that exists — filter.ts's rule); a derived group with no rows
+  // is nothing at all, so it goes.
+  if (rows.length === 0 && group.kind !== "status") return null;
+
+  // An assignee group is labeled by a KEY; the human name is resolved here,
+  // where the member list is (same rule as every other naming site).
+  const title =
+    group.kind === "assignee" && group.key !== "unassigned"
+      ? memberName(group.label, members.find((m) => m.key === group.label))
+      : group.label;
+
   return (
     <section>
       {/* Sticky so you never lose which bucket you are reading — the one piece of
           context a long list silently takes away. */}
       <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
-        <StatusIcon category={col.state.category} color={catalogColor(col.state.color)} />
-        <h2 className="text-base font-semibold">{col.state.name}</h2>
+        <GroupIcon group={group} members={members} />
+        <h2 className="text-base font-semibold capitalize">{title}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
-        {!readOnly && (
+        {!readOnly && group.state && (
           <IconButton
-            label={`New issue in ${col.state.name}`}
-            onClick={() => onCreate(col.state.id)}
+            label={`New issue in ${group.state.name}`}
+            onClick={() => onCreate(group.state!.id)}
             // Revealed on hover/focus: present when wanted, silent otherwise.
             className="ml-auto opacity-0 transition group-hover/list:opacity-100 focus-visible:opacity-100"
           >
@@ -117,12 +198,16 @@ function Group({
           <IssueRow
             key={row.reff}
             row={row}
-            state={col}
+            state={states.find((s) => s.id === row.status)}
             members={members}
             selected={row.reff === selection}
+            checked={checked.has(row.reff)}
+            anyChecked={checked.size > 0}
             pending={optimistic.has(row.doc_id)}
             onSelect={onSelect}
+            onToggleCheck={onToggleCheck}
             onOpen={onOpen}
+            readOnly={readOnly}
           />
         ))}
       </ul>
@@ -135,17 +220,26 @@ function IssueRow({
   state,
   members,
   selected,
+  checked,
+  anyChecked,
   pending,
   onSelect,
+  onToggleCheck,
   onOpen,
+  readOnly,
 }: {
   row: Row;
-  state: BoardColumn;
+  state: WorkflowState | undefined;
   members: MemberDto[];
   selected: boolean;
+  checked: boolean;
+  /** While any check exists the whole column shows, so targets stay aligned. */
+  anyChecked: boolean;
   pending: boolean;
   onSelect: (reff: string) => void;
+  onToggleCheck: (reff: string) => void;
   onOpen: (reff: string) => void;
+  readOnly: boolean;
 }) {
   const el = useRef<HTMLLIElement>(null);
 
@@ -159,24 +253,47 @@ function IssueRow({
     <li
       ref={el}
       className={clsxish([
-        "border-line/60 group flex h-8 cursor-default items-center gap-3 border-b px-4",
+        "border-line/60 group/row flex h-8 cursor-default items-center gap-3 border-b px-4",
         selected ? "bg-active" : "hover:bg-hover",
         // A row whose body hasn't synced yet is real but not yet trustworthy;
         // say so quietly rather than rendering it as settled (UI.md §3.3).
         row.provisional && "opacity-60",
+        row.tombstone && "opacity-60",
       ])}
       onClick={() => onSelect(row.reff)}
       onDoubleClick={() => onOpen(row.reff)}
       aria-selected={selected}
       role="option"
     >
+      {!readOnly && (
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={() => onToggleCheck(row.reff)}
+          onClick={(e) => e.stopPropagation()}
+          aria-label={`Select ${row.key_alias ?? row.reff}`}
+          // Hidden until hover — or until a bulk selection is underway, when
+          // every row's box shows so the remaining targets are hittable.
+          className={clsxish([
+            "shrink-0",
+            !anyChecked && "opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100",
+          ])}
+        />
+      )}
       <PriorityIcon priority={row.priority} />
       {/* Fixed width + tabular numerals: the ids form a straight edge to scan. */}
       <span className="text-mute w-20 shrink-0 truncate font-mono text-xs tabular-nums">
         {row.key_alias ?? row.reff}
       </span>
-      <StatusIcon category={state.state.category} color={catalogColor(state.state.color)} />
-      <span className="min-w-0 flex-1 truncate">{row.title}</span>
+      {state && <StatusIcon category={state.category} color={catalogColor(state.color)} />}
+      <span
+        className={clsxish(["min-w-0 flex-1 truncate", row.tombstone && "text-mute line-through"])}
+      >
+        {row.title}
+      </span>
+      {row.tombstone && (
+        <Trash2 className="text-mute size-3 shrink-0" aria-label="Deleted" />
+      )}
       {/* Unconfirmed: shown as truth because that is what makes a write feel
           instant, but never *claimed* as truth. */}
       {pending && (
@@ -198,5 +315,3 @@ function IssueRow({
 function clsxish(parts: Array<string | false | undefined>): string {
   return parts.filter(Boolean).join(" ");
 }
-
-

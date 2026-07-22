@@ -360,6 +360,15 @@ export type Request =
   | { cmd: "label"; reff: string; add?: string[]; remove?: string[] }
   | { cmd: "comment"; reff: string; body: string }
   | { cmd: "issue_delete"; reff: string }
+  /** Clears the tombstone. Restore wins over a concurrent delete. */
+  | { cmd: "issue_restore"; reff: string }
+  /** `kind` is `blocks` | `relates` | `duplicates`; `reff` is the edge's source
+   *  (`reff` blocks `target`), so "blocked by" is the same verb with the ends
+   *  swapped. `relates` is symmetric — the daemon canonicalizes the endpoints. */
+  | { cmd: "issue_link"; reff: string; kind: string; target: string }
+  | { cmd: "issue_unlink"; reff: string; kind: string; target: string }
+  /** `parent: null` clears. The daemon refuses cycles (tree-move CRDT). */
+  | { cmd: "issue_parent"; reff: string; parent?: string | null }
   | { cmd: "issue_start"; reff: string }
   | { cmd: "issue_done"; reff: string }
   | { cmd: "issue_stop"; reff: string }
@@ -384,6 +393,12 @@ export type Request =
   | { cmd: "diagnose"; expected_space?: string | null }
   | { cmd: "id" }
   | { cmd: "invite"; role?: string | null; reusable?: boolean; ttl_hours?: number | null }
+  /** Admin-only. Accepts the invite ticket or its 32-hex nonce. */
+  | { cmd: "invite_revoke"; invite: string }
+  /** Reply is `text` — the revision as pretty JSON (same shape the CLI prints). */
+  | { cmd: "workflow_show"; project: string }
+  /** Reply is `text` — every role definition as pretty JSON. */
+  | { cmd: "role_list" }
   | { cmd: "join"; ticket: string }
   | { cmd: "seed_list" }
   | { cmd: "log"; since: number }

@@ -13,6 +13,7 @@ import {
 import { ConfirmRequired, LaitError, rpc, spaces as fetchSpaces } from "./api";
 import { useDoorbell } from "./doorbell";
 import { coalesce } from "./core/coalesce";
+import { groupRows, loadDisplay, saveDisplay, type DisplayState } from "./core/display";
 import {
   contribute,
   registry,
@@ -25,11 +26,14 @@ import { useKeys } from "./core/useKeys";
 import { neighbourState, workTarget } from "./core/workflow";
 import { Activity } from "./ui/Activity";
 import { Board } from "./ui/Board";
+import { BulkBar } from "./ui/BulkBar";
+import { DisplayOptions } from "./ui/DisplayOptions";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
 import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
+import { RolesDialog, WorkflowDialog } from "./ui/Governance";
 import { NewIssue } from "./ui/NewIssue";
 import { NewProject } from "./ui/NewProject";
 import { Palette } from "./ui/Palette";
@@ -61,7 +65,7 @@ import {
 } from "./types";
 import "./commands";
 
-type Modal = "palette" | "shortcuts" | null;
+type Modal = "palette" | "shortcuts" | "workflow" | "roles" | null;
 
 /**
  * The shell.
@@ -89,6 +93,12 @@ export function App() {
   const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
+  /** Group / order / show-deleted. Loaded once; every change is persisted. */
+  const [display, setDisplay] = useState<DisplayState>(loadDisplay);
+  const [displayOpen, setDisplayOpen] = useState(false);
+  /** Bulk-selection checks, by canonical ref. Distinct from `selection`: the
+   *  focus is one row, the checks are a set, and `x` is the bridge. */
+  const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
   const [labels, setLabels] = useState<LabelDto[]>([]);
   const [members, setMembers] = useState<MemberDto[]>([]);
   const [projects, setProjects] = useState<ProjectDto[]>([]);
@@ -100,6 +110,10 @@ export function App() {
   /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
    *  not the same as "nothing qualifies" — see core/filter.ts. */
   const [allowed, setAllowed] = useState<ReadonlySet<string> | null>(null);
+  /** Tombstoned rows, fetched only while the display option shows them.
+   *  Deleting an issue REMOVES it from `boards[P]` (the board genuinely does
+   *  not know it), so the trash comes from `list all:true`, not the board. */
+  const [deletedRows, setDeletedRows] = useState<Row[]>([]);
   /** Local predictions. A ref, not state: the doorbell handler mutates it and we
    *  re-render explicitly — putting it in state would make every `set` a new Map
    *  and every render a new overlay. */
@@ -130,12 +144,26 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board, filter, allowed, predicted]);
 
-  // Motion follows what is *visible*: j/k over rows a filter hid would look like
-  // the selection teleporting.
-  const rows: Row[] = useMemo(
-    () => (shown ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone)) : []),
-    [shown],
-  );
+  /** The list's arrangement (the board renders columns straight off `shown`). */
+  const groups = useMemo(() => (shown ? groupRows(shown, display) : []), [shown, display]);
+
+  // Motion follows what is *visible*, in the order it is visible: on the list,
+  // j/k walks the display *groups*; on the board — which always lays out by
+  // status regardless of the grouping option — it walks the columns. The trash
+  // rows join the motion exactly when the display option shows them — a row you
+  // can see but not land on is a trap.
+  const rows: Row[] = useMemo(() => {
+    const live =
+      view === "board" && shown
+        ? shown.columns.flatMap((c) => c.rows.filter((r) => !r.tombstone))
+        : groups.flatMap((g) => g.rows.filter((r) => !r.tombstone));
+    return display.deleted ? [...live, ...deletedRows] : live;
+  }, [view, shown, groups, display.deleted, deletedRows]);
+
+  // Persisted like the sidebar width: an arrangement chosen once should hold.
+  useEffect(() => {
+    saveDisplay(display);
+  }, [display]);
 
   const loadSpacesRaw = useCallback(async () => {
     try {
@@ -308,6 +336,28 @@ export function App() {
     };
   }, [current, revision]);
 
+  // The trash. Scoped to the board's project so the group matches the view,
+  // re-read on every doorbell (a remote delete is exactly the news it carries).
+  useEffect(() => {
+    if (!current || !display.deleted) return setDeletedRows([]);
+    let alive = true;
+    void (async () => {
+      try {
+        const r = await rpc(current, {
+          cmd: "list",
+          project: board?.project.key ?? null,
+          filter: { all: true },
+        });
+        if (alive && r.kind === "list") setDeletedRows(r.rows.filter((x) => x.tombstone));
+      } catch {
+        if (alive) setDeletedRows([]);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [current, display.deleted, board?.project.key, revision]);
+
   // `mine`/`label` are server truth: ask `list`, keep the doc-ids, intersect.
   useEffect(() => {
     if (!current || !needsServer(filter)) return setAllowed(null);
@@ -332,6 +382,15 @@ export function App() {
   // A selection that no longer exists (deleted, filtered away) must not linger.
   useEffect(() => {
     setSelection((s) => (s && rows.some((r) => r.reff === s) ? s : (rows[0]?.reff ?? null)));
+  }, [rows]);
+
+  // Checks on rows that left the view are stale writes waiting to happen: a
+  // bulk action must only ever touch what the user can currently see checked.
+  useEffect(() => {
+    setChecked((c) => {
+      const live = new Set([...c].filter((reff) => rows.some((r) => r.reff === reff)));
+      return live.size === c.size ? c : live;
+    });
   }, [rows]);
 
   useEffect(() => {
@@ -404,6 +463,10 @@ export function App() {
   selRef.current = selection;
   const statesRef = useRef(states);
   statesRef.current = states;
+  const checkedRef = useRef(checked);
+  checkedRef.current = checked;
+  const membersRef = useRef(members);
+  membersRef.current = members;
   // The *filtered* board: reordering has to land relative to a neighbour you can
   // actually see, or `J` jumps the card past rows a filter is hiding.
   const shownRef = useRef(shown);
@@ -447,6 +510,26 @@ export function App() {
     } catch (e) {
       if (e instanceof ConfirmRequired) return;
       setError(e instanceof LaitError ? e.message : String(e));
+    }
+  }, []);
+
+  /**
+   * One request per checked issue, in check order, sequentially.
+   *
+   * Sequential on purpose: each write is its own commit and its own doorbell,
+   * and a parallel burst of N mutations against one daemon buys nothing but
+   * interleaved activity rows. The first refusal stops the run and shows why —
+   * continuing past an error would leave "which of my 12 landed?" unanswerable.
+   */
+  const bulk = useCallback(async (fn: (reff: string) => Promise<unknown>) => {
+    const targets = rowsRef.current.filter((r) => checkedRef.current.has(r.reff));
+    for (const row of targets) {
+      try {
+        await fn(row.reff);
+      } catch (e) {
+        setError(e instanceof LaitError ? e.message : String(e));
+        return;
+      }
     }
   }, []);
 
@@ -594,6 +677,50 @@ export function App() {
             throw e;
           }
         }),
+
+      restoreIssue: (reff) => {
+        if (!current) return;
+        // `issue_restore` on a live issue still writes a "restored" event, so
+        // refusing here keeps the history honest rather than politely noisy.
+        const row = rowsRef.current.find((r) => r.reff === reff);
+        if (row && !row.tombstone) return setToast("Not deleted");
+        void guard(() => rpc(current, { cmd: "issue_restore", reff }));
+      },
+
+      /** Toggle, not set: `i` on an issue you hold puts it down (Linear's `I`
+       *  self-assigns; the toggle is what a second press should honestly mean). */
+      assignMe: () => {
+        const row = selectedRow();
+        const me = membersRef.current.find((m) => m.me);
+        if (!row || !current || !me) return;
+        const add = !row.assignees.includes(me.key);
+        void guard(() => rpc(current, { cmd: "assign", reff: row.reff, who: [me.key], add }));
+      },
+
+      /** Column top/bottom. Same done-column refusal as `reorder`, same reason. */
+      moveTo: (pos) => {
+        const row = selectedRow();
+        const shownBoard = shownRef.current;
+        if (!row || !current || !shownBoard) return;
+        const col = shownBoard.columns.find((c) => c.state.id === row.status);
+        if (!col || col.state.category === "done") return;
+        void guard(() => rpc(current, { cmd: "issue_move", reff: row.reff, pos: { at: pos } }));
+      },
+
+      toggleCheck: () => {
+        const row = selectedRow();
+        if (!row) return;
+        setChecked((c) => {
+          const next = new Set(c);
+          if (!next.delete(row.reff)) next.add(row.reff);
+          return next;
+        });
+      },
+      checkAll: () => setChecked(new Set(rowsRef.current.map((r) => r.reff))),
+      clearChecks: () => setChecked(new Set()),
+      openDisplay: () => setDisplayOpen(true),
+      openWorkflow: () => setModal("workflow"),
+      openRoles: () => setModal("roles"),
     }),
     [current, guard, loadBoard, loadSpaces, predict, selectedRow],
   );
@@ -604,12 +731,13 @@ export function App() {
       spaceId: current,
       readOnly,
       selection,
+      checkedCount: checked.size,
       // An open picker owns the keymap exactly as the palette does: `j` in the
       // assignee menu is cmdk's, not the board's.
       overlay: modal !== null || field !== null,
       app: api,
     }),
-    [view, current, readOnly, selection, modal, field, api],
+    [view, current, readOnly, selection, checked, modal, field, api],
   );
 
   /**
@@ -794,14 +922,23 @@ export function App() {
             </IconButton>
 
             {(view === "list" || view === "board") && (
-              <IconButton
-                label="Filter"
-                chord="/"
-                variant={isActive(filter) ? "active" : "ghost"}
-                onClick={() => run("filter.open")}
-              >
-                <ListFilter className="size-4" />
-              </IconButton>
+              <>
+                <IconButton
+                  label="Filter"
+                  chord="/"
+                  variant={isActive(filter) ? "active" : "ghost"}
+                  onClick={() => run("filter.open")}
+                >
+                  <ListFilter className="size-4" />
+                </IconButton>
+                <DisplayOptions
+                  display={display}
+                  view={view}
+                  open={displayOpen}
+                  onOpenChange={setDisplayOpen}
+                  onChange={setDisplay}
+                />
+              </>
             )}
 
             {/* A segmented group without a box around it: adjacency does the
@@ -898,11 +1035,21 @@ export function App() {
             />
           ) : shown && view === "list" ? (
             <IssueList
-              board={shown}
+              groups={groups}
+              deleted={display.deleted ? deletedRows : []}
+              states={states}
               members={members}
               selection={selection}
+              checked={checked}
               optimistic={optimistic}
               onSelect={api.select}
+              onToggleCheck={(reff) =>
+                setChecked((c) => {
+                  const next = new Set(c);
+                  if (!next.delete(reff)) next.add(reff);
+                  return next;
+                })
+              }
               onOpen={() => setDetail(true)}
               onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
@@ -930,6 +1077,9 @@ export function App() {
               labels={labels}
               projects={projects}
               readOnly={readOnly}
+              // A deleted issue is not on the board at all, so the trash rows
+              // are the only place its tombstone can be read from.
+              tombstone={deletedRows.some((r) => r.reff === selection)}
               openField={field}
               onOpenField={setField}
               revision={revision}
@@ -965,9 +1115,55 @@ export function App() {
           onError={setError}
         />
       )}
+      {checked.size > 0 && !readOnly && current && (
+        <BulkBar
+          count={checked.size}
+          states={states}
+          labels={labels}
+          members={members}
+          onStatus={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, status: id }))
+          }
+          onPriority={(id) =>
+            void bulk((reff) => rpc(current, { cmd: "issue_edit", reff, priority: id }))
+          }
+          onLabel={(name) => void bulk((reff) => rpc(current, { cmd: "label", reff, add: [name] }))}
+          onAssign={(key) =>
+            void bulk((reff) => rpc(current, { cmd: "assign", reff, who: [key], add: true }))
+          }
+          onDelete={() =>
+            void (async () => {
+              const n = checked.size;
+              // The engine's per-issue question doesn't scale to a set, so the
+              // dialog owns the aggregate phrasing and each request then rides
+              // with `confirm` — the same consent, asked once.
+              const ok = await ask.confirm({
+                title: `Delete ${n} ${n === 1 ? "issue" : "issues"}?`,
+                body: "Deletion tombstones — they can be restored later.",
+                confirmText: "Delete",
+                danger: true,
+              });
+              if (!ok) return;
+              await bulk((reff) => rpc(current, { cmd: "issue_delete", reff }, { confirm: true }));
+              setChecked(new Set());
+            })()
+          }
+          onClear={() => setChecked(new Set())}
+        />
+      )}
       <DialogHost />
       {modal === "palette" && <Palette ctx={ctx} onClose={() => setModal(null)} />}
       {modal === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setModal(null)} />}
+      {modal === "workflow" && current && board && (
+        <WorkflowDialog
+          spaceId={current}
+          projectKey={board.project.key}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal === "roles" && current && (
+        <RolesDialog spaceId={current} onClose={() => setModal(null)} />
+      )}
 
       {/* A half-typed sequence must be visible, or `g` reads as a dropped key. */}
       {pending.length > 0 && (

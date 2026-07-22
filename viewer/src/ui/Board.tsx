@@ -171,7 +171,7 @@ function Column({
             pending={optimistic.has(row.doc_id)}
             dragging={drag?.reff === row.reff}
             gap={gapFor(over, row.reff)}
-            draggable={!readOnly}
+            draggable={!readOnly && !row.tombstone}
             onSelect={onSelect}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
@@ -281,12 +281,15 @@ function Card({
           "bg-raised cursor-default rounded border p-2 transition-colors",
           selected ? "border-accent ring-accent ring-1" : "border-line hover:border-line-strong",
           row.provisional ? "opacity-60" : "",
+          row.tombstone ? "opacity-60" : "",
           // The card left the deck: dim the hole it came from rather than removing
           // it, so the column doesn't reflow under the cursor mid-drag.
           dragging ? "opacity-40" : "",
         ].join(" ")}
       >
-        <p className="mb-1.5 line-clamp-2">{row.title}</p>
+        <p className={`mb-1.5 line-clamp-2 ${row.tombstone ? "text-mute line-through" : ""}`}>
+          {row.title}
+        </p>
         <div className="flex items-center gap-2">
           <PriorityIcon priority={row.priority} />
           <span className="text-mute font-mono text-2xs tabular-nums">

@@ -243,6 +243,9 @@ export function NewIssue({
               onToggle={(name) =>
                 setPicked((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]))
               }
+              // A typed-but-unknown name is picked like any other: `issue_new`
+              // creates it on first use, so nothing needs minting here.
+              onCreate={(name) => setPicked((p) => (p.includes(name) ? p : [...p, name]))}
             />
           </div>
 

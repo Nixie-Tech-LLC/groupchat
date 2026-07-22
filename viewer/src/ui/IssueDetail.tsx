@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Ban, CircleDot, CornerDownRight, GitMerge, Info, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  ArchiveRestore,
+  Ban,
+  CircleDot,
+  CornerDownRight,
+  GitMerge,
+  Info,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
@@ -22,8 +33,9 @@ import {
 import { Avatar, AvatarStack, memberName as nameOf } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
-import { Combobox } from "./Picker";
-import { IconButton } from "./primitives";
+import { Markdown } from "./Markdown";
+import { Combobox, type Option } from "./Picker";
+import { Button, IconButton } from "./primitives";
 import { short, when } from "./time";
 
 /**
@@ -47,6 +59,7 @@ export function IssueDetail({
   labels,
   projects,
   readOnly,
+  tombstone,
   openField,
   onOpenField,
   onError,
@@ -63,6 +76,9 @@ export function IssueDetail({
   labels: LabelDto[];
   projects: ProjectDto[];
   readOnly: boolean;
+  /** Whether the board says this issue is deleted — `IssueView` doesn't carry
+   *  the tombstone, but the row does, and it decides Delete vs Restore. */
+  tombstone: boolean;
   /** Which picker a keybinding wants open, if any. */
   openField: IssueField | null;
   onOpenField: (f: IssueField | null) => void;
@@ -168,16 +184,34 @@ export function IssueDetail({
             provisional
           </span>
         )}
-        {!readOnly && (
-          <IconButton
-            label="Delete issue"
-            variant="danger"
-            className="ml-auto"
-            onClick={() => onDelete(issue.reff)}
-          >
-            <Trash2 className="size-3.5" />
-          </IconButton>
+        {tombstone && (
+          <span className="text-danger text-2xs" title="Deleted — restorable at any time">
+            deleted
+          </span>
         )}
+        {!readOnly &&
+          (tombstone ? (
+            // Restore wins over a concurrent delete (engine rule), so this is
+            // safe to offer without a confirmation of its own.
+            <IconButton
+              label="Restore issue"
+              className="ml-auto"
+              onClick={() =>
+                void send(() => rpc(spaceId, { cmd: "issue_restore", reff: issue.reff }))
+              }
+            >
+              <ArchiveRestore className="size-3.5" />
+            </IconButton>
+          ) : (
+            <IconButton
+              label="Delete issue"
+              variant="danger"
+              className="ml-auto"
+              onClick={() => onDelete(issue.reff)}
+            >
+              <Trash2 className="size-3.5" />
+            </IconButton>
+          ))}
       </header>
 
       <div className="flex flex-col gap-4 p-4">
@@ -363,6 +397,11 @@ export function IssueDetail({
                   }),
                 );
               }}
+              // `label add` creates unknown names on first use (gray, like the
+              // CLI) — the picker just stops pretending the vocabulary is closed.
+              onCreate={(name) =>
+                void send(() => rpc(spaceId, { cmd: "label", reff, add: [name] }))
+              }
             />
           </Prop>
 
@@ -402,7 +441,18 @@ export function IssueDetail({
           onSave={(description) => void edit({ description })}
         />
 
-        {graph && <Relations graph={graph} onNavigate={onNavigate} />}
+        {graph && (
+          <Relations
+            graph={graph}
+            spaceId={spaceId}
+            reff={issue.reff}
+            projectId={issue.project_id}
+            states={states}
+            readOnly={readOnly}
+            send={send}
+            onNavigate={onNavigate}
+          />
+        )}
 
         <Timeline events={events} comments={issue.comments} memberOf={memberOf} />
 
@@ -462,49 +512,186 @@ function LabelChip({ name, labels }: { name: string; labels: LabelDto[] }) {
 }
 
 /**
- * The issue graph — parent, sub-issues, blockers, links — read from `GraphView`.
- *
- * Read-only for now: every edge here is navigable (click to open that issue), which
- * is the thing that was impossible before — the structure existed in the engine and
- * the browser couldn't see it. *Creating* edges (`IssueLink`/`IssueParent`) wants an
- * issue-search picker that doesn't exist yet, so it's a deliberate follow-up rather
- * than a half-built control here.
- *
- * `blocked_by` is the daemon's transitive computation (issues that block this one and
- * are still open), not just direct `blocks` edges — so it's shown as its own line,
- * separate from the raw links, and only when non-empty because "not blocked" is the
- * normal case and deserves no row.
+ * The kinds of edge a human adds. The engine has three link kinds plus the
+ * parent tree; "blocked by" and "sub-issue" are the same verbs with the ends
+ * swapped, spelled out because that is how people think about them (and how
+ * Linear's relation menu names them).
  */
-function Relations({ graph, onNavigate }: { graph: GraphView; onNavigate: (reff: string) => void }) {
+const RELATION_KINDS = [
+  { id: "blocks", label: "Blocks" },
+  { id: "blocked-by", label: "Blocked by" },
+  { id: "relates", label: "Related to" },
+  { id: "duplicates", label: "Duplicate of" },
+  { id: "parent", label: "Parent" },
+  { id: "sub-issue", label: "Sub-issue (existing)" },
+] as const;
+type RelationKind = (typeof RELATION_KINDS)[number]["id"];
+
+/**
+ * The issue graph — parent, sub-issues, blockers, links — read from `GraphView`,
+ * and now written back through it: every edge can be added and removed here
+ * (`IssueLink`/`IssueUnlink`/`IssueParent`), and a sub-issue can be created
+ * in place (an `issue_new` and then an `issue_parent` — two commits, two
+ * activity rows, which is the honest record of what happened).
+ *
+ * `blocked_by` is the daemon's transitive computation (issues that block this one
+ * and are still open), not just direct `blocks` edges — so it's shown as its own
+ * warning line and offers no remove: cutting an edge two hops away from here
+ * would be action at a distance. The direct edge is removable in its own group.
+ */
+function Relations({
+  graph,
+  spaceId,
+  reff,
+  projectId,
+  states,
+  readOnly,
+  send,
+  onNavigate,
+}: {
+  graph: GraphView;
+  spaceId: string;
+  reff: string;
+  /** The issue's project — where a quick-created sub-issue is filed. */
+  projectId: string;
+  states: WorkflowState[];
+  readOnly: boolean;
+  send: (fn: () => Promise<unknown>) => Promise<void>;
+  onNavigate: (reff: string) => void;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [kind, setKind] = useState<RelationKind>("blocks");
+  /** Every live issue in the space, fetched when the picker first opens. */
+  const [candidates, setCandidates] = useState<Row[] | null>(null);
+  /** The inline sub-issue composer. `null` = closed. */
+  const [subDraft, setSubDraft] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!adding || candidates !== null) return;
+    let alive = true;
+    // `all: true` on purpose: a duplicate's canonical is often already Done.
+    // Tombstoned rows stay out — linking to a deleted issue is a dead edge.
+    void rpc(spaceId, { cmd: "list", project: null, filter: { all: true } })
+      .then((r) => {
+        if (alive && r.kind === "list") {
+          setCandidates(r.rows.filter((x) => !x.tombstone && x.reff !== reff));
+        }
+      })
+      .catch(() => {
+        if (alive) setCandidates([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [adding, candidates, spaceId, reff]);
+
+  const relate = (target: string) => {
+    setAdding(false);
+    void send(() => {
+      switch (kind) {
+        case "blocked-by":
+          // Same edge, other end: `target` blocks this issue.
+          return rpc(spaceId, { cmd: "issue_link", reff: target, kind: "blocks", target: reff });
+        case "parent":
+          return rpc(spaceId, { cmd: "issue_parent", reff, parent: target });
+        case "sub-issue":
+          return rpc(spaceId, { cmd: "issue_parent", reff: target, parent: reff });
+        default:
+          return rpc(spaceId, { cmd: "issue_link", reff, kind, target });
+      }
+    });
+  };
+
+  const unlink = (l: LinkDto) =>
+    void send(() =>
+      // `direction` says which end this issue is; the unlink must name the same
+      // ordered pair the link did or `blocks`/`duplicates` would miss the edge.
+      l.direction === "out"
+        ? rpc(spaceId, { cmd: "issue_unlink", reff, kind: l.kind, target: l.row.reff })
+        : rpc(spaceId, { cmd: "issue_unlink", reff: l.row.reff, kind: l.kind, target: reff }),
+    );
+
+  const createSub = (title: string) => {
+    setSubDraft("");
+    void send(async () => {
+      const r = await rpc(spaceId, { cmd: "issue_new", title, project: projectId });
+      if (r.kind === "ref") {
+        await rpc(spaceId, { cmd: "issue_parent", reff: r.reff, parent: reff });
+      }
+    });
+  };
+
   const blocks = graph.links.filter((l) => l.kind === "blocks");
   const related = graph.links.filter((l) => l.kind === "relates");
   const dupes = graph.links.filter((l) => l.kind === "duplicates");
+  const doneChildren = graph.children.filter(
+    (c) => states.find((s) => s.id === c.status)?.category === "done",
+  ).length;
 
   const empty =
     !graph.parent &&
     graph.children.length === 0 &&
     graph.blocked_by.length === 0 &&
     graph.links.length === 0;
-  if (empty) return null;
+  if (empty && readOnly) return null;
+
+  const removable = !readOnly;
 
   return (
     <section className="border-line flex flex-col gap-3 border-t pt-3">
       {graph.parent && (
         <RelGroup label="Parent">
-          <RelRow row={graph.parent} icon={<GitMerge className="size-3" />} onNavigate={onNavigate} />
+          <RelRow
+            row={graph.parent}
+            icon={<GitMerge className="size-3" />}
+            onNavigate={onNavigate}
+            {...(removable
+              ? {
+                  onRemove: () =>
+                    void send(() => rpc(spaceId, { cmd: "issue_parent", reff, parent: null })),
+                }
+              : {})}
+          />
         </RelGroup>
       )}
 
-      {graph.children.length > 0 && (
-        <RelGroup label={`Sub-issues · ${graph.children.length}`}>
+      {(graph.children.length > 0 || subDraft !== null) && (
+        // `done/total`, Linear's sub-issue progress at a glance.
+        <RelGroup label={`Sub-issues · ${doneChildren}/${graph.children.length}`}>
           {graph.children.map((r) => (
             <RelRow
               key={r.reff}
               row={r}
               icon={<CornerDownRight className="size-3" />}
               onNavigate={onNavigate}
+              {...(removable
+                ? {
+                    onRemove: () =>
+                      void send(() =>
+                        rpc(spaceId, { cmd: "issue_parent", reff: r.reff, parent: null }),
+                      ),
+                  }
+                : {})}
             />
           ))}
+          {subDraft !== null && (
+            <input
+              autoFocus
+              value={subDraft}
+              placeholder="Sub-issue title…  (Enter creates, Esc closes)"
+              onChange={(e) => setSubDraft(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter" && subDraft.trim()) createSub(subDraft.trim());
+                if (e.key === "Escape") setSubDraft(null);
+              }}
+              onBlur={() => {
+                if (!subDraft.trim()) setSubDraft(null);
+              }}
+              aria-label="New sub-issue title"
+              className="border-line focus:border-line-strong placeholder:text-mute rounded border bg-transparent px-2 py-1 text-sm outline-none"
+            />
+          )}
         </RelGroup>
       )}
 
@@ -521,13 +708,79 @@ function Relations({ graph, onNavigate }: { graph: GraphView; onNavigate: (reff:
         </RelGroup>
       )}
 
-      {blocks.length > 0 && <LinkGroup label="Blocks" links={blocks} onNavigate={onNavigate} />}
-      {related.length > 0 && (
-        <LinkGroup label="Related" links={related} onNavigate={onNavigate} />
+      {blocks.length > 0 && (
+        <LinkGroup
+          label="Blocks"
+          links={blocks}
+          onNavigate={onNavigate}
+          {...(removable ? { onRemove: unlink } : {})}
+        />
       )}
-      {dupes.length > 0 && <LinkGroup label="Duplicates" links={dupes} onNavigate={onNavigate} />}
+      {related.length > 0 && (
+        <LinkGroup
+          label="Related"
+          links={related}
+          onNavigate={onNavigate}
+          {...(removable ? { onRemove: unlink } : {})}
+        />
+      )}
+      {dupes.length > 0 && (
+        <LinkGroup
+          label="Duplicates"
+          links={dupes}
+          onNavigate={onNavigate}
+          {...(removable ? { onRemove: unlink } : {})}
+        />
+      )}
+
+      {!readOnly &&
+        (adding ? (
+          <div className="flex items-center gap-2">
+            <Combobox
+              label="Relation"
+              value={{
+                id: kind,
+                label: RELATION_KINDS.find((k) => k.id === kind)?.label ?? kind,
+              }}
+              options={RELATION_KINDS.map((k) => ({ id: k.id, label: k.label }))}
+              onPick={(id) => setKind(id as RelationKind)}
+            />
+            <Combobox
+              label="Issue"
+              value={null}
+              placeholder="Issue…"
+              emptyText={candidates === null ? "Loading…" : "No issues"}
+              options={(candidates ?? []).map(issueOption)}
+              onPick={relate}
+            />
+            <IconButton label="Cancel" onClick={() => setAdding(false)}>
+              <X className="size-3.5" />
+            </IconButton>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1">
+            <Button onClick={() => setAdding(true)} className="w-fit">
+              <Plus className="size-3" />
+              Add relation
+            </Button>
+            <Button onClick={() => setSubDraft("")} className="w-fit">
+              <Plus className="size-3" />
+              Add sub-issue
+            </Button>
+          </div>
+        ))}
     </section>
   );
+}
+
+/** How an issue reads inside a picker: its handle, then its title; searchable by both. */
+function issueOption(r: Row): Option {
+  return {
+    id: r.reff,
+    label: r.title,
+    hint: r.key_alias ?? r.reff,
+    keywords: [r.reff, ...(r.key_alias ? [r.key_alias] : [])],
+  };
 }
 
 function RelGroup({
@@ -556,10 +809,12 @@ function LinkGroup({
   label,
   links,
   onNavigate,
+  onRemove,
 }: {
   label: string;
   links: LinkDto[];
   onNavigate: (reff: string) => void;
+  onRemove?: (l: LinkDto) => void;
 }) {
   return (
     <RelGroup label={label}>
@@ -573,33 +828,53 @@ function LinkGroup({
             </span>
           }
           onNavigate={onNavigate}
+          {...(onRemove ? { onRemove: () => onRemove(l) } : {})}
         />
       ))}
     </RelGroup>
   );
 }
 
-/** One navigable edge: click opens that issue in this same pane. */
+/**
+ * One navigable edge: click opens that issue in this same pane. A `div` holding
+ * two buttons rather than one button, because "open" and "remove" are separate
+ * gestures and nested buttons are invalid HTML the keyboard can't reach.
+ */
 function RelRow({
   row,
   icon,
   onNavigate,
+  onRemove,
 }: {
   row: Row;
   icon: React.ReactNode;
   onNavigate: (reff: string) => void;
+  onRemove?: () => void;
 }) {
   return (
-    <button
-      onClick={() => onNavigate(row.reff)}
-      className="hover:bg-hover -mx-1 flex items-center gap-2 rounded px-1 py-0.5 text-left text-sm"
-    >
-      <span className="flex size-3 shrink-0 items-center justify-center">{icon}</span>
-      <span className="text-mute w-16 shrink-0 truncate font-mono text-2xs tabular-nums">
-        {row.key_alias ?? row.reff}
-      </span>
-      <span className="min-w-0 flex-1 truncate">{row.title}</span>
-    </button>
+    <div className="group/rel -mx-1 flex items-center gap-2 rounded px-1 py-0.5 text-sm">
+      <button
+        onClick={() => onNavigate(row.reff)}
+        className="hover:bg-hover flex min-w-0 flex-1 items-center gap-2 rounded text-left"
+      >
+        <span className="flex size-3 shrink-0 items-center justify-center">{icon}</span>
+        <span className="text-mute w-16 shrink-0 truncate font-mono text-2xs tabular-nums">
+          {row.key_alias ?? row.reff}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{row.title}</span>
+      </button>
+      {onRemove && (
+        <IconButton
+          label="Remove relation"
+          onClick={onRemove}
+          // Revealed on row hover/focus: the affordance is there when wanted and
+          // the list stays quiet the rest of the time.
+          className="opacity-0 group-hover/rel:opacity-100 focus-visible:opacity-100"
+        >
+          <X className="size-3" />
+        </IconButton>
+      )}
+    </div>
   );
 }
 
@@ -708,7 +983,7 @@ function Comment({ comment: c, member }: { comment: CommentDto; member: MemberDt
             {when(c.ts)}
           </time>
         </div>
-        <p className="whitespace-pre-wrap">{c.body}</p>
+        <Markdown text={c.body} />
       </div>
     </article>
   );
@@ -761,12 +1036,17 @@ function Description({
 
   if (readOnly || (!editing && value)) {
     return (
-      <p
-        className={`min-h-8 whitespace-pre-wrap ${readOnly ? "" : "hover:bg-hover -mx-2 cursor-text rounded px-2"}`}
-        onClick={() => !readOnly && setEditing(true)}
+      <div
+        className={`min-h-8 ${readOnly ? "" : "hover:bg-hover -mx-2 cursor-text rounded px-2"}`}
+        onClick={(e) => {
+          // A link inside the prose is a link first: following it must not
+          // also flip the paragraph into an editor underneath the new tab.
+          if ((e.target as HTMLElement).closest("a, input")) return;
+          if (!readOnly) setEditing(true);
+        }}
       >
-        {value || <span className="text-mute">No description</span>}
-      </p>
+        {value ? <Markdown text={value} /> : <span className="text-mute">No description</span>}
+      </div>
     );
   }
   if (!editing) {

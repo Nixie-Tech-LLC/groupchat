@@ -16,6 +16,7 @@ import { ConfirmRequired, rpc } from "../api";
 import type { MemberDto, MemberLogEntry } from "../types";
 import { memberName } from "./Avatar";
 import * as ask from "./dialogs";
+import { Combobox } from "./Picker";
 import { Button, IconButton } from "./primitives";
 
 /**
@@ -235,12 +236,29 @@ function MemberLog({ entries, members }: { entries: MemberLogEntry[]; members: M
   );
 }
 
+/** The roles an invite can admit as — `cli::invite`'s exact vocabulary. */
+const INVITE_ROLES = [
+  { id: "contributor", label: "Contributor", hint: "read + write issues" },
+  { id: "viewer", label: "Viewer", hint: "read-only" },
+  { id: "administrator", label: "Administrator", hint: "full control" },
+] as const;
+
+/** Expiry choices, in the engine's unit (hours). 168 is the daemon's default. */
+const INVITE_TTLS = [
+  { hours: 24, label: "1 day" },
+  { hours: 168, label: "7 days" },
+  { hours: 720, label: "30 days" },
+] as const;
+
 /**
  * The invite surface.
  *
  * `invite --json` returns the bare **link body**; the `lait://join/…` link is
  * derived from it. The capability always auto-admits — the joiner runs
- * `lait join <link>` and is in; accepting the invite is the approval.
+ * `lait join <link>` and is in; accepting the invite is the approval. The
+ * options are the capability's own knobs (`Request::Invite`): the admitted
+ * role rides in the signed evidence, `reusable` admits a whole team until
+ * expiry, and the TTL bounds how long the link can admit anyone.
  */
 function Invite({
   spaceId,
@@ -255,6 +273,9 @@ function Invite({
 }) {
   const [qr, setQr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [role, setRole] = useState<string>("contributor");
+  const [reusable, setReusable] = useState(false);
+  const [ttl, setTtl] = useState<number>(168);
 
   const link = ticket ? `lait://join/${ticket}` : null;
 
@@ -269,8 +290,20 @@ function Invite({
 
   const mint = async () => {
     try {
-      const r = await rpc(spaceId, { cmd: "invite" });
+      const r = await rpc(spaceId, { cmd: "invite", role, reusable, ttl_hours: ttl });
       if (r.kind === "text") setTicket(r.text.trim());
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /** Kill the outstanding link. The daemon refuses future redemptions of it —
+   *  this is the "that link left the building" control. */
+  const revoke = async () => {
+    if (!ticket) return;
+    try {
+      await rpc(spaceId, { cmd: "invite_revoke", invite: ticket });
+      setTicket(null);
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     }
@@ -281,10 +314,40 @@ function Invite({
       <h2 className="text-mute mb-2 text-2xs font-semibold tracking-wider uppercase">Invite</h2>
       <div className="border-line flex flex-col gap-3 rounded border p-3">
         {!link ? (
-          <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
-            <UserPlus className="size-3.5" />
-            Create invite link
-          </Button>
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <Combobox
+                label="Role"
+                value={{
+                  id: role,
+                  label: INVITE_ROLES.find((r) => r.id === role)?.label ?? role,
+                }}
+                options={INVITE_ROLES.map((r) => ({ id: r.id, label: r.label, hint: r.hint }))}
+                onPick={setRole}
+              />
+              <Combobox
+                label="Expires"
+                value={{
+                  id: String(ttl),
+                  label: INVITE_TTLS.find((t) => t.hours === ttl)?.label ?? `${ttl}h`,
+                }}
+                options={INVITE_TTLS.map((t) => ({ id: String(t.hours), label: t.label }))}
+                onPick={(id) => setTtl(Number(id))}
+              />
+              <label className="text-dim flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={reusable}
+                  onChange={(e) => setReusable(e.target.checked)}
+                />
+                Reusable — admits anyone with the link until it expires
+              </label>
+            </div>
+            <Button variant="outline" size="md" onClick={() => void mint()} className="w-fit">
+              <UserPlus className="size-3.5" />
+              Create invite link
+            </Button>
+          </>
         ) : (
           <>
             <div className="flex gap-4">
@@ -322,6 +385,14 @@ function Invite({
                     <Link2 className="size-3.5" />
                     Email it
                   </a>
+                  <Button
+                    variant="danger"
+                    onClick={() => void revoke()}
+                    title="The daemon refuses any future redemption of this link"
+                  >
+                    <ShieldAlert className="size-3.5" />
+                    Revoke
+                  </Button>
                   <Button onClick={() => setTicket(null)} className="ml-auto">
                     <KeyRound className="size-3.5" />
                     New link

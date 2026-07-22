@@ -54,6 +54,9 @@ export interface Ctx {
   readOnly: boolean;
   /** The focused issue's canonical ref, when a list/board has one. */
   selection: string | null;
+  /** How many issues carry a bulk-selection check. Gates the bulk commands
+   *  (and lets Esc mean "clear checks" only while there are checks to clear). */
+  checkedCount: number;
   /** True while an overlay owns input (palette, modal, editor). */
   overlay: boolean;
   /** Imperative surface the app exposes to commands. */
@@ -94,6 +97,25 @@ export interface AppApi {
   pickProject(key: string | null): void;
   /** Open the new-project composer. */
   createProject(): void;
+
+  /** Clear the tombstone on a deleted issue (no-ops with a toast otherwise). */
+  restoreIssue(reff: string): void;
+  /** Assign the selected issue to me (UI.md's `start` without the status move). */
+  assignMe(): void;
+  /** Send the selected issue to its column's top or bottom. */
+  moveTo(pos: "top" | "bottom"): void;
+  /** Toggle the bulk-selection check on the selected issue. */
+  toggleCheck(): void;
+  /** Check every visible issue. */
+  checkAll(): void;
+  /** Drop every bulk-selection check. */
+  clearChecks(): void;
+  /** Open the display-options popover (group / order / deleted). */
+  openDisplay(): void;
+  /** Show the current project's workflow — states, transitions, gates. */
+  openWorkflow(): void;
+  /** Show the space's role definitions. */
+  openRoles(): void;
 }
 
 export interface Command {
