@@ -305,7 +305,11 @@ fn issues_reference_performance_gate() {
         focus(&rt);
     }
 
-    let mut families: Vec<(&str, Box<dyn FnMut(&tokio::runtime::Runtime, usize)>)> = vec![
+    type Family<'a> = (
+        &'a str,
+        Box<dyn FnMut(&tokio::runtime::Runtime, usize) + 'a>,
+    );
+    let mut families: Vec<Family<'_>> = vec![
         ("focus", Box::new(|rt, _| focus(rt))),
         (
             "issue_open",

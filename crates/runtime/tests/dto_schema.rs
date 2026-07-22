@@ -71,7 +71,7 @@ fn identifier_patterns_agree_with_the_rust_parsers() {
     let ids = runtime::dto::identifier_schemas();
     let pattern = |name: &str| {
         let p = ids[name]["pattern"].as_str().expect("pattern string");
-        regex::Regex::new(&format!("{p}")).expect("valid regex")
+        regex::Regex::new(p).expect("valid regex")
     };
 
     let space = pattern("SpaceId");
