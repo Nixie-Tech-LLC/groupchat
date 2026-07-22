@@ -8,6 +8,14 @@ name: perf
 
 on:
   workflow_dispatch:
+  # Perf-affecting changes run the full gate on their own PR: the corpus spec,
+  # the harness, and this workflow. Other PRs pay only the smoke run inside
+  # the default suite.
+  pull_request:
+    paths:
+      - "benchmarks/**"
+      - "tests/issues_reference_perf.rs"
+      - ".github/workflows/perf.yml"
   schedule:
     # Weekly, off-peak: the full corpus build is hours of daemon traffic by
     # design (it measures the real product surface, not a fixture).
@@ -24,7 +32,7 @@ jobs:
   orbital-perf:
     name: orbital-perf (issues-reference, full corpus)
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Rust (stable)
