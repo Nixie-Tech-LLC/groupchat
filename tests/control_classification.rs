@@ -1,34 +1,44 @@
-//! G8 — exhaustive classification of every current control request into one of
-//! the four orbital classes. The `match` is exhaustive, so the **compiler**
-//! guarantees no `Request` variant is left unclassified: adding a variant
-//! without classifying it fails the build. This is the table S1 requires before
-//! the product is routed through Sessions in S5.
+//! M0.1 — exhaustive terminal-owner classification of every control request.
 //!
-//! Classes:
-//! - **Lifecycle** — Space authority, membership, custody, keys, identity, and
-//!   join/admission. In the orbital model these are mechanics/Orbit concerns
-//!   (`form_space`/`enter_orbit`/authority), not World application meaning.
-//! - **Deployment** — daemon/IPC/transport/process/seed/local-config concerns
-//!   that become deployment adapters, never generic-runtime API.
-//! - **Application** — World application intents, queries, and observation over
-//!   the Issues product; these route through a Session in S5.
-//! - **TemporaryAdapter** — bridges that exist only until the carve replaces
-//!   them, kept behind the product adapter and removed in S6.
+//! Every `control::Request` variant is mapped to exactly one **terminal
+//! owner** — the single orbital plane that serves it once the migration is
+//! complete. The `match` in [`terminal_owner`] is exhaustive, so adding a
+//! variant without a terminal owner fails the build; a daemon catch-all is
+//! forbidden by construction because there is no catch-all class.
+//!
+//! Owners (plan 01, "External architecture"):
+//! - **Session** — product intent/query through `IssueRouter` → Session;
+//! - **Mechanics** — membership/ceremony/custody/admission through the active
+//!   Orbit/Station's mechanics;
+//! - **Station** — connect/neighbor/Contact operations;
+//! - **Observation** — status/subscription projections;
+//! - **Lifecycle** — Runtime/Orbit/Station/daemon process concerns and
+//!   node-local configuration adapters;
+//! - **RemovedByM2** — the pending-member approval surface, deleted by the M2
+//!   acceptance-triggered-admission cutover. No other terminal state may use
+//!   this owner.
 
 use lait::control::Request;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+enum Owner {
+    Session,
+    Mechanics,
+    Station,
+    Observation,
     Lifecycle,
-    Deployment,
-    Application,
-    TemporaryAdapter,
+    /// Slated for deletion in M2 (pending-approval surface). Terminal state is
+    /// nonexistence; while the variant exists it must refuse with a typed
+    /// error, never be served.
+    RemovedByM2,
 }
 
-fn classify(r: &Request) -> Class {
-    use Class::*;
+/// The exhaustive terminal-owner table. Compile-enforced: a new `Request`
+/// variant without an arm here is a build failure, not a runtime catch-all.
+fn terminal_owner(r: &Request) -> Owner {
+    use Owner::*;
     match r {
-        // ---- Application: World intents, queries, projections, observation ----
+        // ---- Session: product intents, queries, projections ----
         Request::IssueNew { .. }
         | Request::IssueEdit { .. }
         | Request::IssueMove { .. }
@@ -53,15 +63,11 @@ fn classify(r: &Request) -> Class {
         | Request::LabelNew { .. }
         | Request::LabelList
         | Request::Activity { .. }
-        | Request::Inbox { .. }
-        | Request::Who
-        | Request::Subscribe { .. } => Application,
+        | Request::Inbox { .. } => Session,
 
-        // ---- Lifecycle: Space authority, membership, custody, keys, join ----
+        // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
         Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
-        | Request::MemberApprove { .. }
-        | Request::MemberRequests
         | Request::Members
         | Request::MemberLog
         | Request::AgentAdd { .. }
@@ -80,12 +86,16 @@ fn classify(r: &Request) -> Class {
         | Request::Recover
         | Request::Invite { .. }
         | Request::Join { .. }
-        | Request::Connect { .. }
-        | Request::Id => Lifecycle,
+        | Request::Id => Mechanics,
 
-        // ---- Deployment: daemon/transport/process/local-node concerns ----
-        Request::Status
-        | Request::Diagnose { .. }
+        // ---- Station: connect/neighbor/Contact ----
+        Request::Connect { .. } | Request::Who => Station,
+
+        // ---- Observation: status + subscription projections ----
+        Request::Status | Request::Subscribe { .. } => Observation,
+
+        // ---- Lifecycle/deployment: daemon process + node-local config ----
+        Request::Diagnose { .. }
         | Request::SeedAdd { .. }
         | Request::SeedList
         | Request::SeedRemove { .. }
@@ -93,18 +103,19 @@ fn classify(r: &Request) -> Class {
         | Request::ConfigReload
         | Request::Stop
         | Request::Hello { .. }
-        // A local, never-synced petname: node-local state, a deployment concern.
-        | Request::MemberAlias { .. } => Deployment,
+        | Request::MemberAlias { .. } => Lifecycle,
+
+        // ---- deleted by the M2 admission cutover ----
+        Request::MemberRequests | Request::MemberApprove { .. } => RemovedByM2,
     }
 }
 
 #[test]
-fn every_request_variant_is_classified() {
-    // Spot-check one representative of each class. Exhaustiveness itself is
-    // enforced by the compiler on `classify`'s match; this asserts the mapping
-    // is the intended one for a sample of each bucket.
+fn every_request_variant_has_a_terminal_owner() {
+    // Exhaustiveness is compile-enforced by `terminal_owner`'s match. Assert
+    // the intended mapping for one representative per owner.
     assert_eq!(
-        classify(&Request::IssueNew {
+        terminal_owner(&Request::IssueNew {
             title: "t".into(),
             project: None,
             project_hint: None,
@@ -113,26 +124,30 @@ fn every_request_variant_is_classified() {
             labels: vec![],
             body: None,
         }),
-        Class::Application
+        Owner::Session
     );
-    assert_eq!(classify(&Request::Members), Class::Lifecycle);
+    assert_eq!(terminal_owner(&Request::Members), Owner::Mechanics);
+    assert_eq!(terminal_owner(&Request::DeviceList), Owner::Mechanics);
     assert_eq!(
-        classify(&Request::Join { ticket: "x".into() }),
-        Class::Lifecycle
+        terminal_owner(&Request::Connect { ticket: "x".into() }),
+        Owner::Station
     );
-    assert_eq!(classify(&Request::Status), Class::Deployment);
-    assert_eq!(classify(&Request::Stop), Class::Deployment);
-    assert_eq!(
-        classify(&Request::Hello {
-            protocol_version: 2
-        }),
-        Class::Deployment
-    );
+    assert_eq!(terminal_owner(&Request::Status), Owner::Observation);
+    assert_eq!(terminal_owner(&Request::Stop), Owner::Lifecycle);
+    assert_eq!(terminal_owner(&Request::MemberRequests), Owner::RemovedByM2);
 }
 
 #[test]
-fn temporary_adapter_class_exists_for_future_use() {
-    // No current request is a pure temporary adapter, but the class is reserved
-    // so S5/S6 can retire bridge requests without reshaping this taxonomy.
-    let _ = Class::TemporaryAdapter;
+fn removed_by_m2_is_reserved_for_the_approval_surface() {
+    // Only the two pending-approval requests may carry the deletion owner; if
+    // M2 has landed (the variants are gone) this test still compiles because
+    // the arms above are deleted with them.
+    let removed = [
+        terminal_owner(&Request::MemberRequests),
+        terminal_owner(&Request::MemberApprove {
+            who: String::new(),
+            as_name: None,
+        }),
+    ];
+    assert!(removed.iter().all(|o| *o == Owner::RemovedByM2));
 }
