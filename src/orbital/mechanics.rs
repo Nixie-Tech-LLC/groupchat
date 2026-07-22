@@ -253,35 +253,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Commit one **terminal** Space-authority event (`Recover` / `Rotate` /
-    /// `Reshare` installation) to the authority history as a
-    /// [`LedgerEffect::SpaceAuthority`]. This is the ONLY ceremony outcome
-    /// that enters an authority frontier; idempotent by node hash.
-    pub(super) fn commit_space_authority(
-        &mut self,
-        ev: crate::space::SignedSpaceEvent,
-    ) -> Result<()> {
-        self.ledger
-            .commit_batch(&[LedgerEffect::SpaceAuthority(ev).encode()], &[])
-            .map_err(|e| anyhow!("space-authority commit: {e}"))?;
-        Ok(())
-    }
-
-    /// Append one signed ceremony-board node to the ledger's **ceremony
-    /// material** log — proposals, authorizations, rounds, custody
-    /// attestations and progress. Distinct material class with its own
-    /// bounded cursor; never an authority-frontier head. Idempotent by node
-    /// hash, and the node replicates to peers as a `Ceremony` record.
-    pub(super) fn commit_ceremony_material(
-        &mut self,
-        ev: crate::space::SignedSpaceEvent,
-    ) -> Result<()> {
-        self.ledger
-            .commit_ceremony_batch(&[mechanics::ledger::CeremonyMaterial::new(ev).encode()])
-            .map_err(|e| anyhow!("ceremony-material commit: {e}"))?;
-        Ok(())
-    }
-
     /// Resolve an actor by its actor id or by one of its device keys — the
     /// orbital form of the legacy `resolve_actor`, used to interpret the
     /// `--to` roots a recovery approver names.
@@ -321,13 +292,6 @@ impl Inner {
     /// at formation (`recovery.key`). Resets the actor's device set on recover.
     pub(super) fn read_recovery_key(&self) -> Option<[u8; 32]> {
         read_hex_key(&self.dir.join(RECOVERY_KEY_FILE))
-    }
-
-    /// This device's offline **space** break-glass recovery secret, if it holds
-    /// the solo authority (`space-recovery.key`). `None` once the space has been
-    /// elevated to a threshold group key.
-    pub(super) fn read_space_recovery_key(&self) -> Option<[u8; 32]> {
-        read_hex_key(&self.dir.join(SPACE_RECOVERY_KEY_FILE))
     }
 
     /// The admin-side admission redemption: validate the capability, the
@@ -1005,6 +969,17 @@ impl OrbitalMechanics {
     /// The Space this handle serves.
     pub fn space(&self) -> SpaceId {
         self.lock().space.clone()
+    }
+
+    /// The space plane's standing root state plus the count of terminal
+    /// Space-authority effects — the ceremony gates' terminal-state oracle
+    /// (exact root, exact generation, exactly-one-terminal-effect proofs).
+    pub fn space_root_state(&self) -> (crate::space::RootState, usize) {
+        let inner = self.lock();
+        let events = inner.ledger.space_authority_events();
+        let genesis = inner.ledger.genesis().clone();
+        let state = crate::space::replay(&genesis, &inner.space, &events);
+        (state, events.len())
     }
 
     /// Whether this device's actor currently holds membership.

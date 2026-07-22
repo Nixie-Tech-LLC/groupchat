@@ -178,6 +178,28 @@ pub enum CeremonyOp {
         signing: TranscriptId,
         share: Vec<u8>,
     },
+    /// An OLD holder's broadcast reshare commitments for a same-key
+    /// redistribution transcript: the Feldman coefficient commitments of its
+    /// fresh sharing (constant term = its own standing share).
+    ReshareCommit {
+        dkg: TranscriptId,
+        commitments: Vec<u8>,
+    },
+    /// An OLD holder's dealt sub-share for one NEW participant, sealed to
+    /// recipient device `to`.
+    ReshareDeal {
+        dkg: TranscriptId,
+        to: DeviceId,
+        sealed: Vec<u8>,
+    },
+    /// The reshare coordinator's frozen qualified old set (old participant
+    /// indices). Only the proposal author's plan counts; every combiner uses
+    /// the same set, or their derived shares would belong to different
+    /// polynomials.
+    ResharePlan {
+        dkg: TranscriptId,
+        qualified: Vec<u16>,
+    },
 }
 
 impl CeremonyOp {
@@ -185,7 +207,11 @@ impl CeremonyOp {
     /// `None` for openers — their id is the hash of the enclosing node.
     pub fn dkg(&self) -> Option<TranscriptId> {
         match self {
-            CeremonyOp::DkgRound1 { dkg, .. } | CeremonyOp::DkgRound2 { dkg, .. } => Some(*dkg),
+            CeremonyOp::DkgRound1 { dkg, .. }
+            | CeremonyOp::DkgRound2 { dkg, .. }
+            | CeremonyOp::ReshareCommit { dkg, .. }
+            | CeremonyOp::ReshareDeal { dkg, .. }
+            | CeremonyOp::ResharePlan { dkg, .. } => Some(*dkg),
             _ => None,
         }
     }
@@ -233,23 +259,50 @@ pub struct KeyCeremonyProposal {
 pub enum ProposedTransition {
     /// Create a new key under a new arrangement, replacing `current`.
     RotateKey { current: AuthorityId },
-    /// Redistribute the same key under a new arrangement. Reserved until the
-    /// proactive resharing protocol is production-ready:
-    /// same-key resharing needs a reviewed protocol that never reconstructs the
-    /// secret, so accepting one here would promise something unimplemented.
-    Reshare { authority: AuthorityId },
+    /// Redistribute the **same** key under a new arrangement (Desmedt–Jajodia
+    /// share redistribution over the standing Shamir shares; the secret is
+    /// never reconstructed). The proposal carries the standing arrangement and
+    /// its public-key package so every node — including a brand-new
+    /// participant — can validate old-holder membership and each dealer's
+    /// `C_0` against the authenticated old verifying shares. Resharing is not
+    /// a revocation: an old qualified coalition that kept its shares can still
+    /// sign under the unchanged key (a removal that must revoke uses
+    /// `RotateKey`).
+    Reshare {
+        /// The standing authority (key + arrangement id) being redistributed.
+        authority: AuthorityId,
+        /// The standing arrangement, whole; must hash to
+        /// `authority.configuration`.
+        current_configuration: AuthorityConfiguration,
+        /// The standing group's serialized public-key package; its derived
+        /// group key must equal `authority.public_key`.
+        old_public_package: Vec<u8>,
+    },
+}
+
+/// The validated context of a same-key reshare proposal.
+#[derive(Debug, Clone)]
+pub struct ReshareContext {
+    /// The NEW arrangement being created.
+    pub new_config: FrostThresholdConfig,
+    /// The NEW participant devices, in canonical index order.
+    pub new_devices: Vec<DeviceId>,
+    /// The standing (old) arrangement.
+    pub old_config: FrostThresholdConfig,
+    /// The OLD participant devices, in canonical index order.
+    pub old_devices: Vec<DeviceId>,
+    /// The standing authority being redistributed.
+    pub authority: AuthorityId,
+    /// The standing group's serialized public-key package (validated to
+    /// derive `authority.public_key`).
+    pub old_public_package: Vec<u8>,
 }
 
 impl KeyCeremonyProposal {
-    /// The flat-FROST configuration this proposal creates, if it is one and it
-    /// is well formed for a transition this phase implements.
-    ///
-    /// Returns `None` for a `Reshare` — the variant exists so the format does
-    /// not need changing when resharing is enabled, not so it can be honored now.
+    /// The flat-FROST configuration this proposal creates, if it is well
+    /// formed. For a `Reshare` this is the NEW arrangement; the reshare's
+    /// additional bindings are validated by [`Self::reshare_context`].
     pub fn frost_config(&self) -> Option<FrostThresholdConfig> {
-        if !matches!(self.transition, ProposedTransition::RotateKey { .. }) {
-            return None;
-        }
         if self.configuration.scheme != AuthorityScheme::FrostThreshold
             || !self.configuration.is_well_formed()
         {
@@ -262,8 +315,54 @@ impl KeyCeremonyProposal {
     pub fn current_authority(&self) -> &AuthorityId {
         match &self.transition {
             ProposedTransition::RotateKey { current } => current,
-            ProposedTransition::Reshare { authority } => authority,
+            ProposedTransition::Reshare { authority, .. } => authority,
         }
+    }
+
+    /// The validated same-key reshare context, if this is a well-formed
+    /// reshare proposal: the new configuration is a well-formed flat
+    /// threshold, the carried standing configuration hashes to the
+    /// authority's configuration id, is itself a well-formed flat threshold,
+    /// and the carried public-key package derives the authority's key.
+    pub fn reshare_context(&self) -> Option<ReshareContext> {
+        let ProposedTransition::Reshare {
+            authority,
+            current_configuration,
+            old_public_package,
+        } = &self.transition
+        else {
+            return None;
+        };
+        let new_config = self.frost_config()?;
+        let new_devices = self.frost_devices()?;
+        if current_configuration.id() != authority.configuration
+            || current_configuration.scheme != AuthorityScheme::FrostThreshold
+            || !current_configuration.is_well_formed()
+        {
+            return None;
+        }
+        let old_config = current_configuration.as_frost_threshold()?;
+        let old_devices: Vec<DeviceId> = old_config
+            .participants
+            .iter()
+            .map(|p| p.as_device())
+            .collect::<Option<Vec<_>>>()?;
+        if group_key_of_package(old_public_package).ok()? != authority.public_key {
+            return None;
+        }
+        Some(ReshareContext {
+            new_config,
+            new_devices,
+            old_config,
+            old_devices,
+            authority: authority.clone(),
+            old_public_package: old_public_package.clone(),
+        })
+    }
+
+    /// Whether this proposal is a same-key reshare.
+    pub fn is_reshare(&self) -> bool {
+        matches!(self.transition, ProposedTransition::Reshare { .. })
     }
 
     /// Participant devices, in canonical index order, for a flat-FROST proposal.
@@ -521,6 +620,9 @@ pub fn parse_board(events: &[SignedNode], ws: &SpaceId) -> CeremonyBoard {
             // Rounds are keyed by the transcript they name.
             CeremonyOp::DkgRound1 { dkg, .. }
             | CeremonyOp::DkgRound2 { dkg, .. }
+            | CeremonyOp::ReshareCommit { dkg, .. }
+            | CeremonyOp::ReshareDeal { dkg, .. }
+            | CeremonyOp::ResharePlan { dkg, .. }
             | CeremonyOp::CustodyAck { dkg } => {
                 let dkg = *dkg;
                 board.dkg.entry(dkg).or_default().rounds.push(entry);
@@ -560,6 +662,9 @@ fn round_key(op: &CeremonyOp) -> Option<(u8, &str)> {
         // decision to whoever looks second.
         CeremonyOp::SignPlan { .. } => Some((5, "")),
         CeremonyOp::CustodyAck { .. } => Some((6, "")),
+        CeremonyOp::ReshareCommit { .. } => Some((7, "")),
+        CeremonyOp::ReshareDeal { to, .. } => Some((8, to.as_str())),
+        CeremonyOp::ResharePlan { .. } => Some((9, "")),
         _ => None,
     }
 }
@@ -594,8 +699,21 @@ fn retain(board: &mut CeremonyBoard) {
     board.dkg.retain(|_, t| t.proposal.is_some());
     board.signing.retain(|_, t| t.request.is_some());
     for t in board.dkg.values_mut() {
+        // Permitted round authors: the proposal's participants — plus, for a
+        // same-key reshare, the standing arrangement's OLD holders, who deal
+        // the redistribution but need not be new participants.
         let participants: Vec<DeviceId> = match t.proposal.as_ref().map(|p| &p.op) {
-            Some(CeremonyOp::DkgPropose(p)) => p.frost_devices().unwrap_or_default(),
+            Some(CeremonyOp::DkgPropose(p)) => {
+                let mut devices = p.frost_devices().unwrap_or_default();
+                if let Some(ctx) = p.reshare_context() {
+                    for d in ctx.old_devices {
+                        if !devices.contains(&d) {
+                            devices.push(d);
+                        }
+                    }
+                }
+                devices
+            }
             _ => Vec::new(),
         };
         let mut seen: BTreeMap<(DeviceId, u8, String), ()> = BTreeMap::new();
@@ -1057,6 +1175,289 @@ pub fn aggregate(
     ser(sig.serialize(), "serialize signature")
 }
 
+// ---- Same-key share redistribution (reshare) --------------------------------
+//
+// Move the standing group secret from one flat-threshold arrangement to
+// another **without changing the public key and without reconstructing the
+// secret** (Desmedt–Jajodia redistribution over the frost Shamir shares).
+// Every old holder in a fixed qualified set Q re-shares its own share `s_i`
+// as the constant term of a fresh degree-`k'-1` polynomial, commits to the
+// coefficients (Feldman; `C_0 = s_i·G` must equal the dealer's published old
+// verifying share), and deals an evaluation to every new participant. New
+// participant `j` combines the dealt sub-shares with the old Lagrange
+// coefficients: `t_j = Σ_{i∈Q} λ_i·g_i(j)` is a Shamir share of the SAME
+// secret over the new threshold. The new public key package is computed from
+// the commitments alone and carries the unchanged verifying key.
+//
+// This is the share-transfer algebra only. Resharing is NOT a revocation: an
+// old qualified coalition that kept its shares can still sign under the
+// unchanged key (see `crate::reshare`'s module docs for the proactive model).
+
+use curve25519_dalek::constants::ED25519_BASEPOINT_POINT as BASE;
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use curve25519_dalek::scalar::Scalar;
+
+fn scalar_of(bytes: &[u8]) -> Result<Scalar> {
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("scalar bytes must be 32 bytes"))?;
+    Option::<Scalar>::from(Scalar::from_canonical_bytes(raw))
+        .ok_or_else(|| anyhow!("non-canonical scalar"))
+}
+
+fn point_of(bytes: &[u8; 32]) -> Result<EdwardsPoint> {
+    CompressedEdwardsY(*bytes)
+        .decompress()
+        .ok_or_else(|| anyhow!("invalid curve point"))
+}
+
+/// Evaluate the committed polynomial at participant index `at`:
+/// `Σ_l at^l · C_l`.
+fn eval_commitments(commitments: &[EdwardsPoint], at: u16) -> EdwardsPoint {
+    let x = Scalar::from(u64::from(at));
+    let mut acc = EdwardsPoint::identity();
+    let mut pow = Scalar::ONE;
+    for c in commitments {
+        acc += c * pow;
+        pow *= x;
+    }
+    acc
+}
+
+use curve25519_dalek::traits::Identity;
+
+/// The Lagrange coefficient at zero for old index `i` over the qualified set
+/// `q` (1-based indices, sorted, unique).
+fn lagrange_at_zero(i: u16, q: &[u16]) -> Result<Scalar> {
+    let xi = Scalar::from(u64::from(i));
+    let mut num = Scalar::ONE;
+    let mut den = Scalar::ONE;
+    for &m in q {
+        if m == i {
+            continue;
+        }
+        let xm = Scalar::from(u64::from(m));
+        num *= xm;
+        den *= xm - xi;
+    }
+    if den == Scalar::ZERO {
+        return Err(anyhow!("degenerate qualified set"));
+    }
+    Ok(num * den.invert())
+}
+
+/// One dealer's reshare commitments: the canonical blob posted to the board.
+fn encode_commitments(points: &[EdwardsPoint]) -> Vec<u8> {
+    let raw: Vec<[u8; 32]> = points.iter().map(|p| p.compress().to_bytes()).collect();
+    postcard::to_stdvec(&raw).expect("encode reshare commitments")
+}
+
+fn decode_commitments(blob: &[u8], expect_len: u16) -> Result<Vec<EdwardsPoint>> {
+    let raw: Vec<[u8; 32]> =
+        postcard::from_bytes(blob).map_err(|e| anyhow!("reshare commitments: {e}"))?;
+    if raw.len() != expect_len as usize {
+        return Err(anyhow!(
+            "reshare commitments carry {} coefficients (expected {expect_len})",
+            raw.len()
+        ));
+    }
+    raw.iter().map(point_of).collect()
+}
+
+/// Dealer side of a same-key reshare: from this old holder's key share, deal a
+/// fresh degree-`new_k - 1` sharing of its OWN share to the `new_n` new
+/// participants. Returns `(commitments_blob, sub_shares_by_new_index)` — post
+/// the commitments broadcast, seal each sub-share to its recipient. The result
+/// is randomized: persist it and re-post the SAME material on retry.
+pub fn reshare_deal(old_key_share: &[u8], new_k: u16, new_n: u16) -> Result<(Vec<u8>, Packages)> {
+    if new_k == 0 || new_n == 0 || new_k > new_n {
+        return Err(anyhow!("reshare needs 1 <= k <= n"));
+    }
+    let kp = ser(
+        frost::keys::KeyPackage::deserialize(old_key_share),
+        "deserialize key package",
+    )?;
+    let s_i = scalar_of(&kp.signing_share().serialize())?;
+    let mut sigma = vec![s_i];
+    for _ in 1..new_k {
+        let mut wide = [0u8; 64];
+        getrandom::fill(&mut wide).expect("getrandom");
+        sigma.push(Scalar::from_bytes_mod_order_wide(&wide));
+    }
+    let commitments: Vec<EdwardsPoint> = sigma.iter().map(|s| BASE * s).collect();
+    let mut sub_shares = BTreeMap::new();
+    for j in 1..=new_n {
+        let x = Scalar::from(u64::from(j));
+        let mut acc = Scalar::ZERO;
+        let mut pow = Scalar::ONE;
+        for s in &sigma {
+            acc += s * pow;
+            pow *= x;
+        }
+        sub_shares.insert(j, acc.to_bytes().to_vec());
+    }
+    Ok((encode_commitments(&commitments), sub_shares))
+}
+
+/// The serialized verifying share the old public-key package publishes for
+/// `old_index` — what an honest dealer's `C_0` must equal.
+pub fn old_verifying_share(old_pkp: &[u8], old_index: u16) -> Result<[u8; 32]> {
+    let pkp = ser(
+        frost::keys::PublicKeyPackage::deserialize(old_pkp),
+        "deserialize public key package",
+    )?;
+    let vs = pkp
+        .verifying_shares()
+        .get(&ident(old_index)?)
+        .ok_or_else(|| anyhow!("the old group publishes no share for index {old_index}"))?;
+    let bytes = ser(vs.serialize(), "serialize verifying share")?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("verifying share is not 32 bytes"))
+}
+
+/// Verify one dealer's reshare material as new participant `my_index`: the
+/// commitment vector has exactly `new_k` coefficients, `C_0` equals the
+/// dealer's published old verifying share, and (when a sub-share is supplied)
+/// the dealt evaluation is consistent with the commitments.
+pub fn reshare_verify(
+    commitments_blob: &[u8],
+    new_k: u16,
+    dealer_old_verifying_share: &[u8; 32],
+    my_index: u16,
+    my_sub_share: Option<&[u8]>,
+) -> Result<()> {
+    let commitments = decode_commitments(commitments_blob, new_k)?;
+    let expected = point_of(dealer_old_verifying_share)?;
+    if commitments[0] != expected {
+        return Err(anyhow!(
+            "the dealer reshared a sub-secret other than its real old share"
+        ));
+    }
+    if let Some(sub) = my_sub_share {
+        let u = scalar_of(sub)?;
+        if BASE * u != eval_commitments(&commitments, my_index) {
+            return Err(anyhow!("the dealt sub-share fails its Feldman check"));
+        }
+    }
+    Ok(())
+}
+
+/// Combine a qualified old set's reshare deals into this new participant's key
+/// share and the new group's public-key package — same verifying key, new
+/// `new_k`-of-`new_n` arrangement.
+///
+/// `qualified` are the OLD indices of the contributing dealers (sorted,
+/// unique, exactly the old threshold); `commitments`/`my_sub_shares` are keyed
+/// by old index and must cover exactly that set. Every contribution is
+/// re-verified against the old public-key package before use, and the
+/// recombined key must equal the old verifying key — a substituted dealer set
+/// cannot silently mint a different key.
+pub fn reshare_finalize(
+    my_index: u16,
+    new_k: u16,
+    new_n: u16,
+    qualified: &[u16],
+    commitments: &BTreeMap<u16, Vec<u8>>,
+    my_sub_shares: &BTreeMap<u16, Vec<u8>>,
+    old_pkp: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, DeviceId)> {
+    if my_index == 0 || my_index > new_n {
+        return Err(anyhow!("new participant index out of range"));
+    }
+    if qualified.is_empty()
+        || qualified.windows(2).any(|w| w[0] >= w[1])
+        || qualified.iter().any(|&i| i == 0)
+    {
+        return Err(anyhow!("qualified set must be sorted, unique and 1-based"));
+    }
+    let cset: std::collections::BTreeSet<u16> = commitments.keys().copied().collect();
+    let sset: std::collections::BTreeSet<u16> = my_sub_shares.keys().copied().collect();
+    let qset: std::collections::BTreeSet<u16> = qualified.iter().copied().collect();
+    if cset != qset || sset != qset {
+        return Err(anyhow!(
+            "contributions must correspond exactly to the qualified set"
+        ));
+    }
+    let pkp = ser(
+        frost::keys::PublicKeyPackage::deserialize(old_pkp),
+        "deserialize public key package",
+    )?;
+    let old_key_bytes: [u8; 32] = ser(pkp.verifying_key().serialize(), "serialize group key")?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("group key is not 32 bytes"))?;
+    let old_y = point_of(&old_key_bytes)?;
+
+    // Verify every contribution and decode.
+    let mut decoded: BTreeMap<u16, (Vec<EdwardsPoint>, Scalar)> = BTreeMap::new();
+    let mut recombined = EdwardsPoint::identity();
+    for &i in qualified {
+        let blob = &commitments[&i];
+        let expected = old_verifying_share(old_pkp, i)?;
+        reshare_verify(blob, new_k, &expected, my_index, Some(&my_sub_shares[&i]))?;
+        let points = decode_commitments(blob, new_k)?;
+        let sub = scalar_of(&my_sub_shares[&i])?;
+        recombined += points[0] * lagrange_at_zero(i, qualified)?;
+        decoded.insert(i, (points, sub));
+    }
+    if recombined != old_y {
+        return Err(anyhow!(
+            "the qualified set's shares do not recombine to the standing key"
+        ));
+    }
+
+    // My new share and every new participant's verifying share.
+    let mut t = Scalar::ZERO;
+    for &i in qualified {
+        t += lagrange_at_zero(i, qualified)? * decoded[&i].1;
+    }
+    let mut verifying_shares: BTreeMap<frost::Identifier, frost::keys::VerifyingShare> =
+        BTreeMap::new();
+    for m in 1..=new_n {
+        let mut point = EdwardsPoint::identity();
+        for &i in qualified {
+            point += eval_commitments(&decoded[&i].0, m) * lagrange_at_zero(i, qualified)?;
+        }
+        let vs = ser(
+            frost::keys::VerifyingShare::deserialize(&point.compress().to_bytes()),
+            "verifying share",
+        )?;
+        verifying_shares.insert(ident(m)?, vs);
+    }
+    // My private share must re-derive my published verifying share.
+    let my_vs_point = {
+        let mut point = EdwardsPoint::identity();
+        for &i in qualified {
+            point += eval_commitments(&decoded[&i].0, my_index) * lagrange_at_zero(i, qualified)?;
+        }
+        point
+    };
+    if BASE * t != my_vs_point {
+        return Err(anyhow!(
+            "the combined share does not match its public commitment"
+        ));
+    }
+
+    let verifying_key = *pkp.verifying_key();
+    let new_pkp =
+        frost::keys::PublicKeyPackage::new(verifying_shares.clone(), verifying_key, Some(new_k));
+    let signing_share = ser(
+        frost::keys::SigningShare::deserialize(&t.to_bytes()),
+        "signing share",
+    )?;
+    let my_vs = verifying_shares[&ident(my_index)?];
+    let kp =
+        frost::keys::KeyPackage::new(ident(my_index)?, signing_share, my_vs, verifying_key, new_k);
+    let group = group_key_of(&new_pkp)?;
+    Ok((
+        ser(kp.serialize(), "serialize key package")?,
+        ser(new_pkp.serialize(), "serialize public key package")?,
+        group,
+    ))
+}
+
 /// DKG fixtures shared by other modules' tests.
 ///
 /// Exposed so custody tests can seal a REAL share rather than random bytes: a
@@ -1135,7 +1536,7 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
 
-    use super::tests_support::run_dkg;
+    use super::tests_support::{run_dkg, Holders};
 
     #[test]
     fn dkg_then_threshold_sign_yields_an_ed25519_group_signature() {
@@ -1641,5 +2042,132 @@ mod tests {
             assert_eq!(group_key_of_package(pkp).unwrap(), group_key);
         }
         assert!(group_key_of_package(b"not a package").is_err());
+    }
+
+    /// Drive a full same-key redistribution: a 2-of-3 group reshares onto a
+    /// new 2-of-3 arrangement; every new holder derives a usable share, the
+    /// verifying key is unchanged, and the NEW committee signs under it.
+    fn redistribute(
+        holders: &Holders,
+        qualified: &[u16],
+        new_k: u16,
+        new_n: u16,
+    ) -> (Holders, DeviceId) {
+        let old_pkp = holders.values().next().unwrap().1.clone();
+        let mut commitments: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+        let mut dealt: BTreeMap<u16, Packages> = BTreeMap::new();
+        for &i in qualified {
+            let (blob, subs) = reshare_deal(&holders[&i].0, new_k, new_n).unwrap();
+            commitments.insert(i, blob);
+            dealt.insert(i, subs);
+        }
+        let mut new_holders: Holders = BTreeMap::new();
+        let mut group = None;
+        for j in 1..=new_n {
+            let my_subs: BTreeMap<u16, Vec<u8>> = qualified
+                .iter()
+                .map(|&i| (i, dealt[&i][&j].clone()))
+                .collect();
+            let (kp, pkp, g) =
+                reshare_finalize(j, new_k, new_n, qualified, &commitments, &my_subs, &old_pkp)
+                    .unwrap();
+            validate_share(&kp, &pkp, j).unwrap();
+            if let Some(prev) = &group {
+                assert_eq!(prev, &g);
+            }
+            group = Some(g);
+            new_holders.insert(j, (kp, pkp));
+        }
+        (new_holders, group.unwrap())
+    }
+
+    #[test]
+    fn resharing_preserves_the_key_and_the_new_committee_signs() {
+        let (old_holders, old_group) = run_dkg(3, 2);
+        let (new_holders, new_group) = redistribute(&old_holders, &[1, 3], 2, 3);
+        assert_eq!(old_group, new_group, "the public key is unchanged");
+
+        // The NEW committee (indices 1 and 2 of the new arrangement) produces a
+        // signature that verifies against the unchanged group key.
+        let message = b"post-reshare signing".to_vec();
+        let mut nonces = BTreeMap::new();
+        let mut commitments: Packages = BTreeMap::new();
+        for &j in &[1u16, 2u16] {
+            let (n, c) = sign_round1(&new_holders[&j].0).unwrap();
+            nonces.insert(j, n);
+            commitments.insert(j, c);
+        }
+        let mut shares: Packages = BTreeMap::new();
+        for &j in &[1u16, 2u16] {
+            shares.insert(
+                j,
+                sign_round2(&commitments, &message, &nonces[&j], &new_holders[&j].0).unwrap(),
+            );
+        }
+        let sig = aggregate(&commitments, &message, &shares, &new_holders[&1].1).unwrap();
+        let key_bytes: [u8; 32] = data_encoding::HEXLOWER
+            .decode(new_group.as_str().as_bytes())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(crate::crypto::verify_detached(
+            &key_bytes,
+            &message,
+            &sig.as_slice().try_into().unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_reshared_group_can_reshare_again() {
+        // Redistribution composes: 2-of-3 → 2-of-3 → 3-of-4, key unchanged.
+        let (h0, g0) = run_dkg(3, 2);
+        let (h1, g1) = redistribute(&h0, &[1, 2], 2, 3);
+        let (_h2, g2) = redistribute(&h1, &[2, 3], 3, 4);
+        assert_eq!(g0, g1);
+        assert_eq!(g1, g2);
+    }
+
+    #[test]
+    fn a_substituted_subsecret_or_tampered_subshare_is_refused() {
+        let (old_holders, _) = run_dkg(3, 2);
+        let old_pkp = old_holders[&1].1.clone();
+        let (blob_1, subs_1) = reshare_deal(&old_holders[&1].0, 2, 3).unwrap();
+        // Dealer 2 deals from the WRONG share (holder 3's material).
+        let (blob_bad, subs_bad) = reshare_deal(&old_holders[&3].0, 2, 3).unwrap();
+        let commitments: BTreeMap<u16, Vec<u8>> =
+            [(1, blob_1.clone()), (2, blob_bad)].into_iter().collect();
+        let my_subs: BTreeMap<u16, Vec<u8>> = [(1, subs_1[&1].clone()), (2, subs_bad[&1].clone())]
+            .into_iter()
+            .collect();
+        let err = reshare_finalize(1, 2, 3, &[1, 2], &commitments, &my_subs, &old_pkp).unwrap_err();
+        assert!(
+            err.to_string().contains("other than its real old share"),
+            "substituted sub-secret is caught: {err}"
+        );
+
+        // A tampered sub-share fails its Feldman check.
+        let (blob_2, subs_2) = reshare_deal(&old_holders[&2].0, 2, 3).unwrap();
+        let commitments: BTreeMap<u16, Vec<u8>> = [(1, blob_1), (2, blob_2)].into_iter().collect();
+        let mut bad_sub = subs_2[&1].clone();
+        bad_sub[0] ^= 1;
+        let my_subs: BTreeMap<u16, Vec<u8>> = [(1, subs_1[&1].clone()), (2, bad_sub)]
+            .into_iter()
+            .collect();
+        let err = reshare_finalize(1, 2, 3, &[1, 2], &commitments, &my_subs, &old_pkp).unwrap_err();
+        assert!(
+            err.to_string().contains("Feldman") || err.to_string().contains("non-canonical"),
+            "tampered sub-share is caught: {err}"
+        );
+    }
+
+    #[test]
+    fn reshare_contributions_must_match_the_qualified_set() {
+        let (old_holders, _) = run_dkg(3, 2);
+        let old_pkp = old_holders[&1].1.clone();
+        let (blob_1, subs_1) = reshare_deal(&old_holders[&1].0, 2, 3).unwrap();
+        let commitments: BTreeMap<u16, Vec<u8>> = [(1, blob_1)].into_iter().collect();
+        let my_subs: BTreeMap<u16, Vec<u8>> = [(1, subs_1[&1].clone())].into_iter().collect();
+        // Qualified set names dealers 1 and 2 but only 1 contributed.
+        assert!(reshare_finalize(1, 2, 3, &[1, 2], &commitments, &my_subs, &old_pkp).is_err());
     }
 }

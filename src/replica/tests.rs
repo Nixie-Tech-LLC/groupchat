@@ -2050,13 +2050,27 @@ fn a_reshare_proposal_is_refused_until_the_protocol_exists() {
                 participants: principals,
             },
         ),
-        transition: crate::dkg::ProposedTransition::Reshare { authority: current },
+        transition: crate::dkg::ProposedTransition::Reshare {
+            authority: current.clone(),
+            // Deliberately inconsistent bindings: the configuration does not
+            // hash to the authority's configuration id and the package is not
+            // the standing group's, so the reshare context must refuse.
+            current_configuration: crate::authority::AuthorityConfiguration::frost_threshold(
+                &crate::authority::FrostThresholdConfig {
+                    k: 2,
+                    participants: vec![crate::authority::PrincipalId::of_device(
+                        &device_from_seed([45u8; 32]),
+                    )],
+                },
+            ),
+            old_public_package: vec![1, 2, 3],
+        },
     };
     // Everything else is impeccable: well-formed configuration, real grant.
     assert!(proposal.configuration.is_well_formed());
     assert!(
-        proposal.frost_config().is_none(),
-        "an unimplemented transition yields no usable configuration"
+        proposal.reshare_context().is_none(),
+        "a reshare with unverifiable standing bindings yields no usable context"
     );
 
     let ev = crate::dkg::sign_ceremony(

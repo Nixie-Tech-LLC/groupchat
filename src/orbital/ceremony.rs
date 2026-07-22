@@ -72,6 +72,13 @@ impl OrbitalMechanics {
             .with_ceremony_engine(|e| e.space_elevate_approve(session, proposal))
     }
 
+    /// Reshare the standing group key onto a new arrangement without changing
+    /// the key (same-key redistribution / participant replacement).
+    pub fn space_reshare(&self, participants: Vec<String>, k: u16) -> Result<Elevation> {
+        self.lock()
+            .with_ceremony_engine(|e| e.space_reshare(participants, k))
+    }
+
     /// Export this device's share as a verified portable package and attest it.
     pub fn space_custody_export(&self, path: String, passphrase: String) -> Result<CustodyExport> {
         self.lock()

@@ -21,6 +21,7 @@ const FOUNDER_SEED: [u8; 32] = [11u8; 32];
 const C1_SEED: [u8; 32] = [12u8; 32];
 const C2_SEED: [u8; 32] = [13u8; 32];
 const DEVICE2_SEED: [u8; 32] = [14u8; 32];
+const C3_SEED: [u8; 32] = [15u8; 32];
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -235,7 +236,7 @@ fn break_glass_solo_recovery_re_roots_and_re_keys() {
 }
 
 #[test]
-fn threshold_recovery_under_the_group_key_needs_a_co_signature() {
+fn threshold_recovery_installs_the_exact_root_and_fences_the_old_epoch() {
     let (_rf, f) = founder("thr-rec");
     let c1 = admit(&f, &C1_SEED, "thr-c1");
     let c2 = admit(&f, &C2_SEED, "thr-c2");
@@ -247,36 +248,80 @@ fn threshold_recovery_under_the_group_key_needs_a_co_signature() {
         f.recovery_status().scheme,
         mechanics::authority::AuthorityScheme::FrostThreshold
     );
-
-    // Under a 2-of-3 group the solo key no longer stands: one holder opens a
-    // break-glass recovery (Pending — one share alone cannot re-root), a second
-    // holder co-signs, and the threshold group signature installs on convergence.
-    let opened = f.space_recover().unwrap();
-    assert!(
-        matches!(opened, lait::replica::SpaceRecovery::Pending { .. }),
-        "one holder alone cannot complete a threshold recovery"
-    );
-    converge(&[&f, &c1.1, &c2.1]);
-    // The co-founder co-signs the recovery it has verified re-roots to `f`.
-    // `MemberDto.key` is the member's actor id; the founder is the `me` member.
-    let founder_actor = f
-        .members()
-        .into_iter()
-        .find(|m| m.me)
-        .map(|m| m.key)
-        .unwrap();
-    if let lait::replica::SpaceRecovery::Pending { session, .. } = &opened {
-        c1.1.space_recover_approve(session.to_hex(), vec![founder_actor.clone()])
-            .ok();
-    }
-    converge(&[&f, &c1.1, &c2.1]);
-    // The recovery either installed (generation advanced) or is legitimately
-    // still gathering — but it never silently no-ops the arrangement.
+    let (state, terminal_before) = f.space_root_state();
+    assert_eq!(state.gen, 1, "the elevation's Rotate advanced to gen 1");
     assert_eq!(
-        f.recovery_status().scheme,
-        mechanics::authority::AuthorityScheme::FrostThreshold,
-        "the group arrangement survives a recovery under it"
+        terminal_before, 1,
+        "the elevation emitted exactly one terminal effect"
     );
+
+    // Under a 2-of-3 group the solo key no longer stands: c1 opens a
+    // break-glass recovery re-rooting the space to ITSELF (Pending — one
+    // share alone cannot re-root), the founder co-signs, and the threshold
+    // group signature installs on convergence.
+    let opened = c1.1.space_recover().unwrap();
+    let session = match &opened {
+        lait::replica::SpaceRecovery::Pending { session, .. } => *session,
+        other => panic!("one holder alone cannot complete a threshold recovery: {other:?}"),
+    };
+    converge(&[&f, &c1.1, &c2.1]);
+    // The founder co-signs the recovery it has verified re-roots to c1.
+    let c1_actor = c1.1.my_actor().unwrap();
+    let approved = f
+        .space_recover_approve(session.to_hex(), vec![c1_actor.as_str().to_string()])
+        .expect("the co-signature must succeed");
+    assert_eq!(
+        approved.roots,
+        vec![c1_actor.clone()],
+        "consent bound to the exact root"
+    );
+    converge(&[&f, &c1.1, &c2.1]);
+
+    // Terminal state, exactly: the recovery installed the EXACT root at the
+    // EXACT next generation with exactly one more terminal effect, on every
+    // node.
+    for node in [&f, &c1.1, &c2.1] {
+        let (state, terminal) = node.space_root_state();
+        assert!(state.recovered, "the transcript completed and installed");
+        assert_eq!(state.gen, 2, "exact generation advance");
+        assert_eq!(
+            state.root,
+            vec![c1_actor.clone()],
+            "the space re-rooted to exactly the approved actor"
+        );
+        assert_eq!(
+            terminal, 2,
+            "a successful transcript emits exactly ONE terminal SpaceAuthority effect"
+        );
+    }
+    // The group arrangement survives a recovery under it.
+    assert_eq!(
+        c1.1.recovery_status().scheme,
+        mechanics::authority::AuthorityScheme::FrostThreshold
+    );
+    // Re-key: the new root is the sole admin and holds a usable active epoch
+    // (rotating from it succeeds); the OLD root is fenced — no longer a
+    // member, cannot author authority.
+    assert!(c1.1.am_i_admin(), "the recovered root holds admin standing");
+    c1.1.key_rotate()
+        .expect("the new root re-keyed (active epoch usable)");
+    assert!(
+        !f.am_i_member(),
+        "the old root is fenced by the re-root: its ops no longer authorize"
+    );
+    // Old-epoch rejection post-install: the fenced founder cannot author.
+    assert!(
+        f.key_rotate().is_err(),
+        "the fenced root cannot rotate the key"
+    );
+
+    // Durable restart result: reopen c1's store cold; the exact terminal
+    // state — root, generation, effect count — survives.
+    let space = c1.1.space();
+    let reopened = OrbitalMechanics::open(&c1.0, &space, &C1_SEED).unwrap();
+    let (state, terminal) = reopened.space_root_state();
+    assert_eq!((state.gen, terminal), (2, 2));
+    assert_eq!(state.root, vec![c1_actor]);
 }
 
 #[test]
@@ -322,19 +367,155 @@ fn indispensable_arrangement_waits_for_every_custody_attestation() {
 }
 
 #[test]
-fn reshare_is_refused_in_this_phase() {
+fn resharing_replaces_a_participant_without_changing_the_key() {
     let (_rf, f) = founder("reshare");
     let c1 = admit(&f, &C1_SEED, "reshare-c1");
     let c2 = admit(&f, &C2_SEED, "reshare-c2");
+    let c3 = admit(&f, &C3_SEED, "reshare-c3");
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+    f.space_elevate(vec![device_of(&C1_SEED), device_of(&C2_SEED)], 2)
+        .unwrap();
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+    let before = f.recovery_status();
+    assert_eq!(
+        (before.scheme, before.k, before.n),
+        (mechanics::authority::AuthorityScheme::FrostThreshold, 2, 3)
+    );
+    let standing_key = before.authority.clone().expect("standing authority known");
+    let (state_before, terminal_before) = f.space_root_state();
+
+    // Same-key reshare: replace c2 with c3 in the holder set. The proposer's
+    // grant needs the standing group's threshold, so c1 co-signs it.
+    let reshare = f
+        .space_reshare(
+            vec![
+                device_of(&FOUNDER_SEED),
+                device_of(&C1_SEED),
+                device_of(&C3_SEED),
+            ],
+            2,
+        )
+        .unwrap();
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+    let grant_session = reshare
+        .grant_request
+        .expect("a group authority needs a grant");
+    c1.1.space_elevate_approve(grant_session.to_hex(), reshare.proposal.to_hex())
+        .expect("a holder co-signs the reshare authorization");
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+
+    // Installed: the arrangement moved, the KEY did not.
+    let after = f.recovery_status();
+    assert_eq!(
+        (after.scheme, after.k, after.n),
+        (mechanics::authority::AuthorityScheme::FrostThreshold, 2, 3),
+        "the reshared 2-of-3 arrangement installed"
+    );
+    assert_eq!(
+        after.authority.as_deref(),
+        Some(standing_key.as_str()),
+        "a reshare NEVER changes the recovery key"
+    );
+    let (state_after, terminal_after) = f.space_root_state();
+    assert_eq!(
+        state_after.recovery_commit, state_before.recovery_commit,
+        "the on-plane key commitment is unchanged"
+    );
+    assert_ne!(
+        state_after.configuration, state_before.configuration,
+        "the on-plane arrangement changed"
+    );
+    assert_eq!(
+        state_after.gen,
+        state_before.gen + 1,
+        "exact generation advance"
+    );
+    assert_eq!(
+        terminal_after,
+        terminal_before + 1,
+        "a successful reshare emits exactly ONE terminal SpaceAuthority effect"
+    );
+
+    // The REPLACEMENT holder is a working custodian under the same key: c3
+    // co-signs a threshold recovery that installs.
+    let opened = c1.1.space_recover().unwrap();
+    let session = match &opened {
+        lait::replica::SpaceRecovery::Pending { session, .. } => *session,
+        other => panic!("threshold recovery still needs a co-signature: {other:?}"),
+    };
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+    let c1_actor = c1.1.my_actor().unwrap();
+    c3.1.space_recover_approve(session.to_hex(), vec![c1_actor.as_str().to_string()])
+        .expect("the replacement holder's share works under the reshared arrangement");
+    converge(&[&f, &c1.1, &c2.1, &c3.1]);
+    let (state, _) = c1.1.space_root_state();
+    assert!(state.recovered, "the reshared group completed a recovery");
+    assert_eq!(state.root, vec![c1_actor]);
+}
+
+#[test]
+fn an_offline_participant_resumes_and_completes_an_elevation() {
+    let (_rf, f) = founder("offline");
+    let c1 = admit(&f, &C1_SEED, "offline-c1");
+    let c2 = admit(&f, &C2_SEED, "offline-c2");
     converge(&[&f, &c1.1, &c2.1]);
     f.space_elevate(vec![device_of(&C1_SEED), device_of(&C2_SEED)], 2)
         .unwrap();
-    converge(&[&f, &c1.1, &c2.1]);
-    // A second elevation over an existing group is a reshare/reconfiguration;
-    // this phase does not implement it and must refuse rather than pretend.
-    let reshare = f.space_elevate(vec![device_of(&C1_SEED)], 1);
-    assert!(
-        reshare.is_err() || f.recovery_status().n == 3,
-        "reshare/reconfiguration does not silently change the arrangement"
+    // c2 is OFFLINE for the whole first phase: the DKG cannot complete
+    // (round 1 needs all N), so nothing installs.
+    converge(&[&f, &c1.1]);
+    assert_eq!(
+        f.recovery_status().scheme,
+        mechanics::authority::AuthorityScheme::Single,
+        "an elevation cannot install while a participant is offline"
     );
+    // c2 comes back: the ceremony resumes from the durable board and installs.
+    converge(&[&f, &c1.1, &c2.1]);
+    assert_eq!(
+        f.recovery_status().scheme,
+        mechanics::authority::AuthorityScheme::FrostThreshold,
+        "the offline participant resumed and the elevation completed"
+    );
+}
+
+#[test]
+fn a_cold_restart_mid_ceremony_resumes_without_regenerating_material() {
+    let (rf, f) = founder("restart");
+    let c1 = admit(&f, &C1_SEED, "restart-c1");
+    let c2 = admit(&f, &C2_SEED, "restart-c2");
+    converge(&[&f, &c1.1, &c2.1]);
+    f.space_elevate(vec![device_of(&C1_SEED), device_of(&C2_SEED)], 2)
+        .unwrap();
+    // One partial exchange, then EVERY node cold-restarts (drop + reopen from
+    // disk). The persisted phase state must resume — a regenerated round-1
+    // package would break the DKG (other participants bound to the first).
+    for a in [&f, &c1.1, &c2.1] {
+        for b in [&f, &c1.1, &c2.1] {
+            push(a, b);
+        }
+    }
+    for n in [&f, &c1.1, &c2.1] {
+        let _ = n.ceremony_advance();
+    }
+    let space = f.space();
+    drop(f);
+    let f = OrbitalMechanics::open(&rf, &space, &FOUNDER_SEED).unwrap();
+    let c1m = {
+        let (root, m) = c1;
+        drop(m);
+        OrbitalMechanics::open(&root, &space, &C1_SEED).unwrap()
+    };
+    let c2m = {
+        let (root, m) = c2;
+        drop(m);
+        OrbitalMechanics::open(&root, &space, &C2_SEED).unwrap()
+    };
+    converge(&[&f, &c1m, &c2m]);
+    let after = f.recovery_status();
+    assert_eq!(
+        after.scheme,
+        mechanics::authority::AuthorityScheme::FrostThreshold,
+        "the ceremony resumed across a cold restart of every node"
+    );
+    assert_eq!((after.k, after.n), (2, 3));
 }

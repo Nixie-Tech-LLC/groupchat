@@ -83,11 +83,14 @@ pub struct OrbitalDaemon {
     /// Signalled by a `Stop` request so `serve` returns (the injectable
     /// contract: return, don't `exit`).
     shutdown: Arc<tokio::sync::Notify>,
-    /// Latched when teardown begins (Stop or idle-shutdown). A live
-    /// `Subscribe` stream polls this between its bounded waits so it lets go
-    /// promptly instead of pinning a worker thread inside a long blocking
-    /// `next_timeout`, which would otherwise keep the daemon alive after Stop.
+    /// Latched when teardown begins (Stop or idle-shutdown). Subscription
+    /// worker threads check it between bounded waits; the async side watches
+    /// [`Self::stop_tx`] for the prompt wakeup.
     stopping: std::sync::atomic::AtomicBool,
+    /// The teardown broadcast: `true` once Stop/idle-shutdown latched. Every
+    /// live `Subscribe` connection selects on this, so teardown is prompt and
+    /// bounded instead of waiting out a poll interval per subscriber.
+    stop_tx: tokio::sync::watch::Sender<bool>,
     /// Control connections currently being served (idle-shutdown suppressor).
     active_conns: std::sync::atomic::AtomicU64,
     /// When the last control connection was accepted or completed — the idle
@@ -184,6 +187,7 @@ impl OrbitalDaemon {
             home: home.to_path_buf(),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            stop_tx: tokio::sync::watch::channel(false).0,
             active_conns: std::sync::atomic::AtomicU64::new(0),
             last_activity: Mutex::new(std::time::Instant::now()),
         })
@@ -389,6 +393,7 @@ impl OrbitalDaemon {
             Request::SpaceElevateApprove { session, proposal } => {
                 self.space_elevate_approve(session, proposal)
             }
+            Request::SpaceReshare { participants, k } => self.space_reshare(participants, k),
             Request::SpaceCustodyExport { path, passphrase } => {
                 self.space_custody_export(path, passphrase)
             }
@@ -741,6 +746,42 @@ impl OrbitalDaemon {
         }
     }
 
+    fn space_reshare(&self, participants: Vec<String>, k: u16) -> Response {
+        match self.mechanics.space_reshare(participants, k) {
+            Ok(e) => {
+                let message = match (e.grant_request, e.incomplete) {
+                    (_, Some(why)) => format!(
+                        "proposed resharing the recovery key onto a {}-of-{} arrangement \
+                         (proposal {}) — but this device could not carry it further ({why:#}); \
+                         the proposal stands and can still be authorized",
+                        e.k,
+                        e.n,
+                        e.proposal.to_hex()
+                    ),
+                    (Some(signing), None) => format!(
+                        "proposed resharing the recovery key onto a {}-of-{} arrangement \
+                         (proposal {}) — the current group must authorize it: each holder runs \
+                         `space elevate-approve {} --proposal {}`. The key itself does not change.",
+                        e.k,
+                        e.n,
+                        e.proposal.to_hex(),
+                        signing.to_hex(),
+                        e.proposal.to_hex(),
+                    ),
+                    (None, None) => format!(
+                        "started resharing the recovery key onto a {}-of-{} arrangement — the \
+                         redistribution completes automatically as the holders' nodes sync",
+                        e.k, e.n
+                    ),
+                };
+                Response::Ok {
+                    message: Some(message),
+                }
+            }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
     fn space_custody_export(&self, path: String, passphrase: String) -> Response {
         match self.mechanics.space_custody_export(path, passphrase) {
             Ok(e) => {
@@ -851,7 +892,7 @@ impl OrbitalDaemon {
                 _ = idle_tick.tick() => {
                     if self.should_idle_shutdown(idle_window) {
                         tracing::info!("orbital daemon idle-shutdown after {idle_window:?}");
-                        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.begin_stop();
                         break;
                     }
                 }
@@ -932,9 +973,7 @@ impl OrbitalDaemon {
         let resp = self.dispatch(req);
         let _ = write_line(write_half, &resp).await;
         if stop {
-            self.stopping
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            self.shutdown.notify_one();
+            self.begin_stop();
         }
     }
 
@@ -966,17 +1005,42 @@ impl OrbitalDaemon {
         }
         // Drain the initial reset record so subsequent records are live.
         let _ = stream.try_next();
-        loop {
-            // Poll on a short window rather than one long blocking wait: the
-            // wait is synchronous, so a 30s window would pin this worker thread
-            // and keep the daemon alive ~30s past a Stop. A quarter-second
-            // window bounds teardown while still delivering a doorbell within
-            // one tick of its publication.
-            if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
+
+        // Bridge the blocking observation iterator through a TRACKED blocking
+        // task and an async channel. The worker owns the stream and blocks in
+        // bounded windows, re-checking the cancellation flag between them; the
+        // async side selects on the channel and the teardown watch, so a Stop
+        // wakes it immediately and the worker exits within one window. The
+        // JoinHandle is awaited — the thread is tracked, never leaked.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<runtime::Observation>(64);
+        let worker = tokio::task::spawn_blocking(move || {
+            loop {
+                if worker_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                match stream.next_timeout(Duration::from_millis(250)) {
+                    Ok(Some(record)) => {
+                        if tx.blocking_send(record).is_err() {
+                            return; // subscriber went away
+                        }
+                    }
+                    Ok(None) => continue, // idle window: re-check cancellation
+                    Err(_) => return,     // station dormant: stream closed
+                }
             }
-            match stream.next_timeout(Duration::from_millis(250)) {
-                Ok(Some(record)) => {
+        });
+        let mut stop_rx = self.stop_tx.subscribe();
+        loop {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                record = rx.recv() => {
+                    let Some(record) = record else { break }; // worker ended
                     let frame = Doorbell {
                         epoch: record.epoch.as_u64(),
                         seq: record.sequence,
@@ -985,18 +1049,25 @@ impl OrbitalDaemon {
                         ..Default::default()
                     };
                     if write_line_half(&mut write_half, &frame).await.is_err() {
-                        return;
+                        break;
                     }
                 }
-                Ok(None) => {
-                    // Keepalive: nothing changed within the window.
-                    if write_half.flush().await.is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return, // station dormant
             }
         }
+        // Bounded shutdown: signal the worker and await it (it exits within
+        // one 250 ms window, or immediately on the closed channel).
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(rx);
+        let _ = worker.await;
+    }
+
+    /// Latch teardown: the atomic (for worker threads), the watch (for live
+    /// subscriptions), and the serve loop's notify.
+    fn begin_stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.stop_tx.send(true);
+        self.shutdown.notify_one();
     }
 }
 

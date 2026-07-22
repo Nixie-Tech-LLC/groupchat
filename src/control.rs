@@ -338,6 +338,15 @@ pub enum Request {
         session: String,
         proposal: String,
     },
+    /// Reshare the standing group recovery key onto a new K-of-N arrangement
+    /// **without changing the key** (same-key share redistribution) — the
+    /// participant-replacement path. The current holders authorize it exactly
+    /// like an elevation (`SpaceElevateApprove`), the redistribution advances
+    /// on sync, and the current group threshold-signs the installation.
+    SpaceReshare {
+        participants: Vec<String>,
+        k: u16,
+    },
     /// Export this device's recovery share as a portable, passphrase-protected
     /// package, verify it by reopening, and attest that on the board. An
     /// all-holders arrangement will not install until every custodian has done

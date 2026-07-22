@@ -81,6 +81,7 @@ fn terminal_owner(r: &Request) -> Owner {
         | Request::SpaceElevate { .. }
         | Request::SpaceRecoverApprove { .. }
         | Request::SpaceElevateApprove { .. }
+        | Request::SpaceReshare { .. }
         | Request::SpaceCustodyExport { .. }
         | Request::SpaceCustodyImport { .. }
         | Request::Recover

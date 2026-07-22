@@ -1544,6 +1544,7 @@ impl Node {
             | Request::SpaceElevate { .. }
             | Request::SpaceRecoverApprove { .. }
             | Request::SpaceElevateApprove { .. }
+            | Request::SpaceReshare { .. }
             | Request::SpaceCustodyExport { .. }
             | Request::SpaceCustodyImport { .. }
             | Request::SpaceRecover => {

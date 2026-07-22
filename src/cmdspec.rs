@@ -1267,6 +1267,32 @@ pub fn specs() -> Vec<Spec> {
             },
         ),
         Spec::req(
+            "reshare-recovery",
+            "Reshare the group recovery key onto a new K-of-N arrangement \
+             WITHOUT changing the key — replace or add holders. The current \
+             holders authorize it (`elevate-approve`) and then threshold-sign \
+             the installation. Note resharing is not a revocation: a removed \
+             holder's old share still exists; to revoke, rotate the key with \
+             `elevate-recovery` instead.",
+            vec![
+                A::pos_multi(
+                    "participants",
+                    "The COMPLETE new holder set (device keys), replacing the current one.",
+                ),
+                A::val(
+                    "threshold",
+                    "Signatures required to recover (K). Defaults to all holders (N-of-N).",
+                )
+                .default("0"),
+            ],
+            |m| {
+                Ok(Request::SpaceReshare {
+                    participants: multi(m, "participants"),
+                    k: u64_arg(m, "threshold")? as u16,
+                })
+            },
+        ),
+        Spec::req(
             "activity",
             "Space-wide recent transitions.",
             vec![A::val("since", "Only events after this seq.").default("0")],

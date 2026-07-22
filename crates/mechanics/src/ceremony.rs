@@ -952,6 +952,115 @@ impl CeremonyEngine<'_> {
         })
     }
 
+    /// Begin a **same-key reshare**: redistribute the standing group key onto a
+    /// new `k`-of-N arrangement over `participants` (device keys), without
+    /// changing the key and without reconstructing the secret. Participant
+    /// replacement is the ordinary use: name the retained holders plus the
+    /// replacements.
+    ///
+    /// Requires the standing authority to be a group this device holds a
+    /// usable share of (a solo authority has no shares to redistribute — use
+    /// `space elevate`). Posts the reshare proposal plus the standing group's
+    /// authorization request; the other holders consent with
+    /// `space elevate-approve`, dealing/combination advances on sync, and the
+    /// standing group threshold-signs the terminal `Reshare` installation.
+    /// Resharing is not a revocation — an old coalition that kept its shares
+    /// can still sign; a removal that must revoke uses a key rotation.
+    pub fn space_reshare(&mut self, participants: Vec<String>, k: u16) -> Result<Elevation> {
+        let Some(standing) = self.active_dkg_session() else {
+            return Err(anyhow!(
+                "the standing recovery authority is not a group this device holds a share of — a solo authority has no shares to redistribute; use `space elevate`",
+            ));
+        };
+        let manifest = self
+            .dkg_manifest(&standing)
+            .ok_or_else(|| anyhow!("no acceptance record for the standing ceremony"))?;
+        let group_key = self
+            .group_key_of_transcript(&standing)
+            .ok_or_else(|| anyhow!("cannot derive the standing group key"))?;
+        let old_pkp = self
+            .dkg_read(&standing, "pkp")
+            .ok_or_else(|| anyhow!("the standing public-key package is missing"))?;
+        // Assemble the sorted new participant set. Sorted and deduped here AND
+        // re-checked by every acceptor.
+        let mut set: std::collections::BTreeSet<DeviceId> = std::collections::BTreeSet::new();
+        for p in participants {
+            match DeviceId::parse(&p) {
+                Some(d) => {
+                    set.insert(d);
+                }
+                None => return Err(anyhow!("not a valid participant device key: {p}")),
+            }
+        }
+        let new_devices: Vec<DeviceId> = set.into_iter().collect();
+        let n = new_devices.len() as u16;
+        let k = if k == 0 { n } else { k };
+        if !(1..=n).contains(&k) || n < 1 {
+            return Err(anyhow!(
+                "resharing needs ≥1 participant and threshold in 1..=N"
+            ));
+        }
+        let principals: Vec<crate::authority::PrincipalId> = new_devices
+            .iter()
+            .map(crate::authority::PrincipalId::of_device)
+            .collect();
+        let proposal = crate::dkg::KeyCeremonyProposal {
+            nonce: rand16(),
+            configuration: crate::authority::AuthorityConfiguration::frost_threshold(
+                &crate::authority::FrostThresholdConfig {
+                    k,
+                    participants: principals,
+                },
+            ),
+            transition: crate::dkg::ProposedTransition::Reshare {
+                authority: crate::authority::AuthorityId::new(
+                    group_key.clone(),
+                    &manifest.configuration,
+                ),
+                current_configuration: manifest.configuration.clone(),
+                old_public_package: old_pkp,
+            },
+        };
+        if proposal.reshare_context().is_none() {
+            return Err(anyhow!(
+                "the standing arrangement cannot be redistributed (not a flat threshold group)",
+            ));
+        }
+        let propose = crate::dkg::CeremonyOp::DkgPropose(proposal);
+        let ev = crate::dkg::sign_ceremony(&self.seed, &propose, &self.space);
+        let Some(transcript) = crate::dkg::TranscriptId::of(&ev) else {
+            return Err(anyhow!("could not derive the proposal id"));
+        };
+        // Local consent for the ceremony, then the durable proposal.
+        self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes())?;
+        self.commit_ceremony_material(ev)?;
+
+        // ---- the proposal is durable from here (failures ride out) ----
+        let mut grant_request = None;
+        let mut incomplete = None;
+        match self.open_grant_request(&transcript) {
+            Ok((signing, _)) => grant_request = Some(signing),
+            Err(e) => incomplete = Some(e),
+        }
+        match self.dkg_advance() {
+            Ok(progress) => {
+                if let Some(e) = progress.install_incomplete {
+                    incomplete.get_or_insert(e);
+                }
+            }
+            Err(e) => {
+                incomplete.get_or_insert(e);
+            }
+        }
+        Ok(Elevation {
+            k,
+            n,
+            proposal: transcript,
+            grant_request,
+            incomplete,
+        })
+    }
+
     /// Open (or join) a threshold-signing transcript asking the standing group to
     /// authorize `proposal`, and record our own consent to it.
     ///
@@ -1096,13 +1205,16 @@ impl CeremonyEngine<'_> {
         }
         // A holder must not authorize a ceremony that cannot be installed. The
         // proposer checks this too, but a hostile or stale proposer does not, and
-        // the cost of being wrong is a permanently stalled rotation.
+        // the cost of being wrong is a permanently stalled rotation. A same-key
+        // reshare is exempt: its installation is signed by the CURRENT holders
+        // (who all hold usable shares) and names only the new configuration, so
+        // no overlap with the new arrangement is required.
         let proposed: Vec<DeviceId> = cfg
             .participants
             .iter()
             .filter_map(|p| p.as_device())
             .collect();
-        if !self.rotation_can_complete(&proposed) {
+        if !proposal.is_reshare() && !self.rotation_can_complete(&proposed) {
             return Err(anyhow!(
                 "refusing to authorize: too few of the current holders are in the proposed arrangement, so the resulting key could never be installed",
             ));
@@ -1172,19 +1284,34 @@ impl CeremonyEngine<'_> {
         let mut progressed = false;
         // DKG transcripts naming me as a participant, under an *accepted*
         // proposal. Acceptance (not just a valid signature) is the gate — see
-        // `accepted_proposal`.
-        let dkg_ids: Vec<crate::dkg::TranscriptId> = board
+        // `accepted_proposal`. A same-key reshare additionally involves the
+        // standing arrangement's OLD holders (the dealers), who need not be
+        // new participants.
+        let dkg_ids: Vec<(crate::dkg::TranscriptId, bool)> = board
             .dkg
             .iter()
-            .filter(|(id, t)| {
-                self.accepted_proposal(id, t)
-                    .is_some_and(|(_, _, participants)| participants.contains(&self.me))
+            .filter_map(|(id, t)| {
+                let (_, _, participants) = self.accepted_proposal(id, t)?;
+                let reshare = t.proposal.as_ref().and_then(|p| match &p.op {
+                    crate::dkg::CeremonyOp::DkgPropose(prop) => prop.reshare_context(),
+                    _ => None,
+                });
+                match reshare {
+                    Some(ctx) => (participants.contains(&self.me)
+                        || ctx.old_devices.contains(&self.me))
+                    .then_some((*id, true)),
+                    None => participants.contains(&self.me).then_some((*id, false)),
+                }
             })
-            .map(|(id, _)| *id)
             .collect();
-        for id in dkg_ids {
+        for (id, is_reshare) in dkg_ids {
             let t = &board.dkg[&id];
-            match self.dkg_advance_session(&id, t) {
+            let outcome = if is_reshare {
+                self.reshare_advance_session(&id, t)
+            } else {
+                self.dkg_advance_session(&id, t)
+            };
+            match outcome {
                 Ok(p) => progressed |= p,
                 Err(e) => tracing::warn!("dkg ceremony advance failed (skipped): {e:#}"),
             }
@@ -1711,18 +1838,24 @@ impl CeremonyEngine<'_> {
                 return Some(crate::authority::AuthorityId::single(pubkey));
             }
         }
+        // Prefer the manifest whose configuration is the STANDING one (same-key
+        // reshares leave several transcripts sharing the key); fall back to the
+        // key-only match.
+        let mut key_only: Option<crate::authority::AuthorityId> = None;
         for (id, manifest) in self.dkg_manifests() {
             let Some(group_key) = self.group_key_of_transcript(&id) else {
                 continue;
             };
             if crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit) {
-                return Some(crate::authority::AuthorityId::new(
-                    group_key,
-                    &manifest.configuration,
-                ));
+                let claimed =
+                    crate::authority::AuthorityId::new(group_key, &manifest.configuration);
+                if claimed.configuration == cur.configuration {
+                    return Some(claimed);
+                }
+                key_only.get_or_insert(claimed);
             }
         }
-        None
+        key_only
     }
 
     /// Every acceptance record on this device, keyed by transcript.
@@ -1807,9 +1940,12 @@ impl CeremonyEngine<'_> {
         };
         // Well-formedness and scheme support are the configuration's own rules,
         // re-checked at every acceptor rather than trusted from the proposer.
-        // `frost_config` also refuses a transition this phase does not implement
-        // (Reshare), so an unimplemented promise cannot enter a ceremony.
+        // A reshare proposal must additionally carry valid standing-arrangement
+        // bindings (configuration hash, derivable old group key).
         let cfg = p.frost_config()?;
+        if p.is_reshare() && p.reshare_context().is_none() {
+            return None;
+        }
         let participants = p.frost_devices()?;
         let (n, k) = (participants.len() as u16, cfg.k);
 
@@ -1872,14 +2008,25 @@ impl CeremonyEngine<'_> {
             &self.space,
             &self.ledger.space_authority_events(),
         );
-        self.dkg_manifests().into_iter().find_map(|(id, _)| {
-            (self
-                .group_key_of_transcript(&id)
-                .as_ref()
-                .and_then(crate::space::recovery_commit)
-                == Some(cur.recovery_commit))
-            .then_some(id)
-        })
+        // A same-key reshare leaves several transcripts sharing the standing
+        // KEY; the standing *arrangement* disambiguates. Prefer the manifest
+        // whose configuration is on-plane, falling back to key-only match for
+        // material predating the configuration commitment.
+        let matches: Vec<(crate::dkg::TranscriptId, crate::dkg::DkgManifest)> = self
+            .dkg_manifests()
+            .into_iter()
+            .filter(|(id, _)| {
+                self.group_key_of_transcript(id)
+                    .as_ref()
+                    .and_then(crate::space::recovery_commit)
+                    == Some(cur.recovery_commit)
+            })
+            .collect();
+        matches
+            .iter()
+            .find(|(_, m)| m.configuration.id() == cur.configuration)
+            .or_else(|| matches.first())
+            .map(|(id, _)| *id)
     }
 
     /// The standing transcript **whose share this device can actually use**.
@@ -2432,6 +2579,336 @@ impl CeremonyEngine<'_> {
             return Ok(changed);
         }
         Ok(false)
+    }
+
+    /// The transcript this device accepted for the standing arrangement a
+    /// reshare proposal redistributes — where its old share artifacts live.
+    fn transcript_of_reshare_source(
+        &self,
+        ctx: &crate::dkg::ReshareContext,
+    ) -> Option<crate::dkg::TranscriptId> {
+        self.dkg_manifests().into_iter().find_map(|(id, m)| {
+            (m.configuration.id() == ctx.authority.configuration
+                && self.group_key_of_transcript(&id).as_ref() == Some(&ctx.authority.public_key))
+            .then_some(id)
+        })
+    }
+
+    /// Advance one **same-key reshare** transcript over the bulletin board.
+    ///
+    /// Roles, all driven from this one pass:
+    /// - an OLD holder deals: posts its Feldman commitments once and a sealed
+    ///   sub-share to every new participant, from persisted material (a retry
+    ///   re-posts the SAME polynomial, never a second one);
+    /// - the proposal author freezes the qualified old set (a `ResharePlan`)
+    ///   once enough dealers posted complete material — every combiner must
+    ///   use the same set, or their shares would belong to different
+    ///   polynomials;
+    /// - a NEW participant combines once the plan and every qualified dealer's
+    ///   material are present, verifying each dealer's `C_0` against the
+    ///   authenticated old verifying shares, and persists its share + package;
+    /// - the CURRENT group opens/joins the threshold signing of the terminal
+    ///   `Reshare` installation — gated on complete material and, for an
+    ///   indispensable new arrangement, on every custodian's attestation.
+    fn reshare_advance_session(
+        &mut self,
+        dkg: &crate::dkg::TranscriptId,
+        t: &crate::dkg::DkgTranscript,
+    ) -> Result<bool> {
+        let Some(proposal_node) = t.proposal.as_ref() else {
+            return Ok(false);
+        };
+        let crate::dkg::CeremonyOp::DkgPropose(p) = &proposal_node.op else {
+            return Ok(false);
+        };
+        let Some(ctx) = p.reshare_context() else {
+            return Ok(false);
+        };
+        // Record acceptance the first time we act on this proposal (the same
+        // rule as a rotation DKG: a later authority change must not orphan a
+        // transcript mid-flight).
+        if self.dkg_manifest(dkg).is_none() {
+            let cur = crate::space::replay(
+                &self.ledger.genesis().clone(),
+                &self.space,
+                &self.ledger.space_authority_events(),
+            );
+            let authorized_by = t
+                .auths
+                .values()
+                .find(|g| crate::space::recovery_commit(&g.author) == Some(cur.recovery_commit))
+                .map(|g| g.author.clone());
+            if let Some(authorized_by) = authorized_by {
+                let manifest = crate::dkg::DkgManifest {
+                    proposal: *dkg,
+                    proposal_author: proposal_node.author.clone(),
+                    authorized_by,
+                    configuration: p.configuration.clone(),
+                };
+                self.dkg_write(dkg, "manifest", &postcard::to_stdvec(&manifest)?)?;
+            }
+        }
+        let new_k = ctx.new_config.k;
+        let new_n = ctx.new_devices.len() as u16;
+        let old_k = ctx.old_config.k;
+        let old_index_of = |dev: &DeviceId| {
+            ctx.old_devices
+                .iter()
+                .position(|d| d == dev)
+                .map(|i| i as u16 + 1)
+        };
+        let new_index_of = |dev: &DeviceId| {
+            ctx.new_devices
+                .iter()
+                .position(|d| d == dev)
+                .map(|i| i as u16 + 1)
+        };
+
+        // Index the posted reshare material. Authors outside the old set
+        // resolve to no index and are dropped; the plan counts only from the
+        // proposal author.
+        let mut commits: std::collections::BTreeMap<u16, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut deals: std::collections::BTreeMap<(u16, DeviceId), Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut plan: Option<Vec<u16>> = None;
+        for v in &t.rounds {
+            match &v.op {
+                crate::dkg::CeremonyOp::ReshareCommit { commitments, .. } => {
+                    if let Some(i) = old_index_of(&v.author) {
+                        commits.entry(i).or_insert_with(|| commitments.clone());
+                    }
+                }
+                crate::dkg::CeremonyOp::ReshareDeal { to, sealed, .. } => {
+                    if let Some(i) = old_index_of(&v.author) {
+                        deals
+                            .entry((i, to.clone()))
+                            .or_insert_with(|| sealed.clone());
+                    }
+                }
+                crate::dkg::CeremonyOp::ResharePlan { qualified, .. }
+                    if v.author == proposal_node.author =>
+                {
+                    plan.get_or_insert(qualified.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Step 1 — dealer: an OLD holder posts commitments + sealed deals,
+        // exactly once, from persisted material.
+        if let Some(my_old) = old_index_of(&self.me) {
+            if let Some(old_tx) = self.transcript_of_reshare_source(&ctx) {
+                if let Some(old_share) = self.dkg_read(&old_tx, "share") {
+                    let material: Option<(Vec<u8>, crate::dkg::Packages)> =
+                        match self.dkg_read(dkg, "rdeal") {
+                            Some(raw) => postcard::from_bytes(&raw).ok(),
+                            None => {
+                                let dealt = crate::dkg::reshare_deal(&old_share, new_k, new_n)?;
+                                self.dkg_write_new(dkg, "rdeal", &postcard::to_stdvec(&dealt)?)?;
+                                Some(dealt)
+                            }
+                        };
+                    if let Some((blob, subs)) = material {
+                        let mut posted_any = false;
+                        if !commits.contains_key(&my_old) {
+                            self.post_ceremony(crate::dkg::CeremonyOp::ReshareCommit {
+                                dkg: *dkg,
+                                commitments: blob,
+                            })?;
+                            posted_any = true;
+                        }
+                        for (j, device) in ctx.new_devices.iter().enumerate() {
+                            let jdx = j as u16 + 1;
+                            if deals.contains_key(&(my_old, device.clone())) {
+                                continue;
+                            }
+                            let Some(sub) = subs.get(&jdx) else { continue };
+                            let Some(sealed) = crate::crypto::seal_to(device, sub) else {
+                                continue;
+                            };
+                            self.post_ceremony(crate::dkg::CeremonyOp::ReshareDeal {
+                                dkg: *dkg,
+                                to: device.clone(),
+                                sealed,
+                            })?;
+                            posted_any = true;
+                        }
+                        if posted_any {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2 — the proposal author freezes the qualified old set once
+        // enough dealers posted complete material (commit + a deal to every
+        // new participant).
+        let dealer_complete = |i: &u16| {
+            commits.contains_key(i)
+                && ctx
+                    .new_devices
+                    .iter()
+                    .all(|d| deals.contains_key(&(*i, d.clone())))
+        };
+        if plan.is_none() && self.me == proposal_node.author {
+            let complete: Vec<u16> = commits.keys().copied().filter(dealer_complete).collect();
+            if complete.len() >= old_k as usize {
+                let qualified: Vec<u16> = complete.into_iter().take(old_k as usize).collect();
+                self.post_ceremony(crate::dkg::CeremonyOp::ResharePlan {
+                    dkg: *dkg,
+                    qualified,
+                })?;
+                return Ok(true);
+            }
+        }
+        let Some(qualified) = plan else {
+            return Ok(false);
+        };
+        // The plan is a coordinator's CHOICE, never trusted arithmetic.
+        let plan_ok = qualified.len() == old_k as usize
+            && qualified.windows(2).all(|w| w[0] < w[1])
+            && qualified
+                .iter()
+                .all(|i| *i >= 1 && (*i as usize) <= ctx.old_devices.len());
+        if !plan_ok {
+            anyhow::bail!("refusing to combine: the reshare plan does not validate");
+        }
+
+        // Step 3 — a NEW participant combines once every qualified dealer's
+        // commitments and deal-to-me are present. `reshare_finalize`
+        // re-verifies each dealer's C_0 against the authenticated old
+        // verifying shares and that the recombined key IS the standing key.
+        if let Some(my_new) = new_index_of(&self.me) {
+            if !self.dkg_has(dkg, "share") {
+                let mut my_commits: std::collections::BTreeMap<u16, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+                let mut my_subs: std::collections::BTreeMap<u16, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+                let mut complete = true;
+                for &i in &qualified {
+                    let (Some(c), Some(sealed)) =
+                        (commits.get(&i), deals.get(&(i, self.me.clone())))
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    let Some(sub) = crate::crypto::open_sealed(&self.seed, &self.me, sealed) else {
+                        complete = false;
+                        break;
+                    };
+                    my_commits.insert(i, c.clone());
+                    my_subs.insert(i, sub);
+                }
+                if complete {
+                    let (share, pkp, _group) = crate::dkg::reshare_finalize(
+                        my_new,
+                        new_k,
+                        new_n,
+                        &qualified,
+                        &my_commits,
+                        &my_subs,
+                        &ctx.old_public_package,
+                    )?;
+                    self.dkg_write(dkg, "share", &share)?;
+                    self.dkg_write_portable(dkg, "pkp", &pkp)?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Step 4 — the CURRENT group threshold-signs the terminal `Reshare`
+        // installation. Consent binds to the transcript we accepted; material
+        // must be complete for the whole qualified set, and an indispensable
+        // new arrangement waits for every custodian's attestation.
+        let cur = crate::space::replay(
+            &self.ledger.genesis().clone(),
+            &self.space,
+            &self.ledger.space_authority_events(),
+        );
+        if cur.configuration == p.configuration.id() {
+            return Ok(false); // already installed
+        }
+        let consented = self
+            .dkg_read(dkg, "intent")
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|h| h == dkg.to_hex());
+        if !consented {
+            return Ok(false);
+        }
+        if !qualified.iter().all(dealer_complete) {
+            return Ok(false);
+        }
+        let outstanding = self.custody_outstanding(dkg, t, &ctx.new_devices);
+        if !outstanding.is_empty() {
+            tracing::info!(
+                "holding the reshare installation for {}: {} custodian(s) have not verified a portable backup",
+                dkg.to_hex(),
+                outstanding.len()
+            );
+            return Ok(false);
+        }
+        if self.active_dkg_session().is_some() {
+            let (_, changed) = self.open_reshare_install(p.configuration.id(), cur.gen + 1)?;
+            return Ok(changed);
+        }
+        Ok(false)
+    }
+
+    /// Open (or join) a threshold-signing transcript asking the standing group
+    /// to install the reshared arrangement, and record our consent.
+    fn open_reshare_install(
+        &mut self,
+        next_configuration: crate::authority::AuthorityConfigurationId,
+        gen: u32,
+    ) -> Result<(crate::dkg::TranscriptId, bool)> {
+        let authority = self
+            .active_dkg_session()
+            .ok_or_else(|| anyhow!("this device holds no share of the current group key"))?;
+        let op = crate::space::SpaceOp::Reshare {
+            next_configuration,
+            gen,
+        };
+        let op_bytes = postcard::to_stdvec(&op)?;
+        let events = self.ledger.ceremony_nodes();
+        let board = self.ceremony_board(&events);
+        let threshold = board
+            .dkg
+            .get(&authority)
+            .and_then(|t| self.accepted_proposal(&authority, t))
+            .map(|(_, k, _)| k)
+            .unwrap_or(0);
+        let mut changed = false;
+        let signing = match self.canonical_signing_session(
+            &board,
+            &authority,
+            crate::dkg::SignTarget::SpaceOp,
+            &op_bytes,
+            threshold,
+        ) {
+            Some(id) => id,
+            None => {
+                let req = crate::dkg::CeremonyOp::SignRequest {
+                    nonce: rand16(),
+                    authority,
+                    target: crate::dkg::SignTarget::SpaceOp,
+                    coordinator: self.me.clone(),
+                    op: op_bytes.clone(),
+                };
+                let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space);
+                let id = crate::dkg::TranscriptId::of(&ev)
+                    .ok_or_else(|| anyhow!("could not derive the request id"))?;
+                self.commit_ceremony_material(ev)?;
+                changed = true;
+                id
+            }
+        };
+        if self.dkg_read(&signing, "intent").as_deref() != Some(op_bytes.as_slice()) {
+            self.dkg_write(&signing, "intent", &op_bytes)?;
+            changed = true;
+        }
+        Ok((signing, changed))
     }
 
     /// Open (or join) a threshold-signing transcript asking the standing group to

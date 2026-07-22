@@ -78,6 +78,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::SpaceElevate { .. }
         | Request::SpaceRecoverApprove { .. }
         | Request::SpaceElevateApprove { .. }
+        | Request::SpaceReshare { .. }
         // …and custody, which handles a holder's own key material and a
         // passphrase, so it belongs to the operator at the machine and not to a
         // browser session…
