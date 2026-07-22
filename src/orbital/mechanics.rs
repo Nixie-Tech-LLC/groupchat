@@ -1520,6 +1520,134 @@ impl OrbitalMechanics {
         )
     }
 
+    /// Resolve an actor by its actor id or one of its device keys (the
+    /// public who-ref seam for access commands).
+    pub fn resolve_actor_ref(&self, who: &str) -> Option<ActorId> {
+        self.lock().resolve_actor(who)
+    }
+
+    /// Install a role's exact expanded assignments as ONE atomic authority
+    /// batch (all-or-nothing; the grant ops chain causally). Deterministic
+    /// salts make an exact retry derive identical grant ids, so replay is
+    /// idempotent. Returns the granted ids (already-effective assignments are
+    /// skipped).
+    pub fn grant_assignments(
+        &self,
+        actor: &ActorId,
+        assignments: &[(
+            mechanics::demand::PolicyCapability,
+            mechanics::demand::PolicyResource,
+        )],
+    ) -> Result<Vec<[u8; 32]>> {
+        let mut inner = self.lock();
+        let me = inner
+            .my_actor()
+            .ok_or_else(|| anyhow!("no actor identity"))?;
+        let acl_state = inner.acl();
+        if !acl_state.is_member(actor) {
+            return Err(anyhow!("that actor is not a member of this space"));
+        }
+        // All-or-nothing: the local author must be able to delegate EVERY
+        // assignment before any op is staged.
+        for (capability, resource) in assignments {
+            if !acl_state.may_delegate(&me, capability, resource) {
+                return Err(anyhow!(
+                    "you may not delegate `{}` — the whole expansion is refused",
+                    capability.name
+                ));
+            }
+        }
+        let actor_asof = inner.ledger.actor_heads(&me);
+        let mut prev: Option<String> = None;
+        let mut effects: Vec<Vec<u8>> = Vec::new();
+        let mut granted = Vec::new();
+        for (capability, resource) in assignments {
+            let mut salt_input = Vec::new();
+            salt_input.extend_from_slice(actor.as_str().as_bytes());
+            salt_input.push(0);
+            salt_input.extend_from_slice(capability.name.as_bytes());
+            salt_input.push(0);
+            salt_input.extend_from_slice(resource.segments.join("/").as_bytes());
+            let salt: [u8; 16] = blake3::derive_key("lait.access-grant-salt.v1", &salt_input)[..16]
+                .try_into()
+                .expect("16 bytes");
+            let grant_id = acl::capability_grant_id(actor, capability, resource, &salt)
+                .ok_or_else(|| anyhow!("grant id"))?;
+            if acl_state
+                .effective_capability_grants(actor, capability, resource)
+                .contains(&grant_id)
+            {
+                continue; // already effective: idempotent
+            }
+            let op = acl::sign_op(
+                &inner.seed,
+                &AclOp {
+                    action: AclAction::GrantCapability {
+                        grant_id,
+                        actor: actor.clone(),
+                        capability: capability.clone(),
+                        resource: resource.clone(),
+                        salt,
+                    },
+                    by: me.clone(),
+                    actor_asof: actor_asof.clone(),
+                    nonce: None,
+                },
+                prev.clone()
+                    .map(|p| vec![p])
+                    .unwrap_or_else(|| inner.ledger.acl_heads()),
+                &inner.space,
+            );
+            prev = Some(op.hash());
+            effects.push(LedgerEffect::Acl(op).encode());
+            granted.push(grant_id);
+        }
+        if effects.is_empty() {
+            return Ok(granted);
+        }
+        inner
+            .ledger
+            .commit_batch(&effects, &[])
+            .map_err(|e| anyhow!("assignment commit: {e}"))?;
+        Ok(granted)
+    }
+
+    /// Revoke one effective assignment by grant id — a policy-admin/delegate
+    /// authored authority effect.
+    pub fn revoke_assignment(&self, grant_id: [u8; 32]) -> Result<()> {
+        let mut inner = self.lock();
+        inner.author(
+            AclAction::RevokeCapability { grant_id },
+            None,
+            vec![],
+            vec![],
+        )
+    }
+
+    /// The effective scoped assignments (all members, or one actor's).
+    pub fn assignment_rows(&self, actor: Option<&ActorId>) -> Vec<crate::dto::AssignmentDto> {
+        let mut inner = self.lock();
+        let acl_state = inner.acl();
+        let subjects: Vec<ActorId> = match actor {
+            Some(a) => vec![a.clone()],
+            None => acl_state.members().into_iter().map(|(a, _)| a).collect(),
+        };
+        let mut rows = Vec::new();
+        for subject in subjects {
+            for (id, grant) in acl_state.effective_assignments(&subject) {
+                rows.push(crate::dto::AssignmentDto {
+                    grant_id: data_encoding::HEXLOWER.encode(&id),
+                    actor: subject.as_str().to_string(),
+                    world: grant.capability.world.clone(),
+                    capability: grant.capability.name.clone(),
+                    resource: grant.resource.segments.clone(),
+                });
+            }
+        }
+        rows.sort_by(|a, b| (&a.actor, &a.capability).cmp(&(&b.actor, &b.capability)));
+        rows
+    }
+
     /// Grant one scoped capability to an actor — an admin/policy-admin authored
     /// authority effect (the IAM assignment seam). Idempotent by grant id.
     pub fn grant_actor_capability(

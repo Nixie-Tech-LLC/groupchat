@@ -316,6 +316,15 @@ impl<'a> IssueRouter<'a> {
                 | Request::ProjectList
                 | Request::LabelNew { .. }
                 | Request::LabelList
+                | Request::RoleList
+                | Request::RoleShow { .. }
+                | Request::RoleCreate { .. }
+                | Request::RoleEdit { .. }
+                | Request::RoleDelete { .. }
+                | Request::RoleResolve { .. }
+                | Request::WorkflowShow { .. }
+                | Request::WorkflowValidate { .. }
+                | Request::WorkflowSet { .. }
         )
     }
 
@@ -640,6 +649,183 @@ impl<'a> IssueRouter<'a> {
                 let labels: Vec<LabelDto> =
                     self.query(&IssueQuery::Labels).map_err(Self::effect_err)?;
                 Ok((Response::Labels { labels }, false))
+            }
+            Request::RoleList => {
+                let roles: serde_json::Value =
+                    self.query(&IssueQuery::Roles).map_err(Self::effect_err)?;
+                Ok((
+                    Response::Text {
+                        text: serde_json::to_string_pretty(&roles).unwrap_or_default(),
+                    },
+                    false,
+                ))
+            }
+            Request::RoleShow { role } => {
+                let view: serde_json::Value = self
+                    .query(&IssueQuery::RoleShow { role })
+                    .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Text {
+                        text: serde_json::to_string_pretty(&view).unwrap_or_default(),
+                    },
+                    false,
+                ))
+            }
+            Request::RoleCreate {
+                name,
+                description,
+                project,
+                capabilities,
+            } => {
+                // The adapter mints the id and resolves the project selector;
+                // the World re-validates everything.
+                let scope_project = match project {
+                    None => None,
+                    Some(sel) => Some(
+                        snapshot
+                            .resolve_project(&sel)
+                            .ok_or_else(|| Response::not_found("no such project"))?,
+                    ),
+                };
+                let role_id = format!(
+                    "role_{}",
+                    crate::ids::ProjectId::mint(self.clock)
+                        .as_str()
+                        .trim_start_matches("prj_")
+                );
+                self.submit(&IssueIntent::RoleCreate {
+                    role_id: role_id.clone(),
+                    scope_project,
+                    name,
+                    description: description.unwrap_or_default(),
+                    capabilities,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Ok {
+                        message: Some(format!("created role {role_id}")),
+                    },
+                    true,
+                ))
+            }
+            Request::RoleEdit {
+                role,
+                expect_revision,
+                name,
+                description,
+                capabilities,
+            } => {
+                self.submit(&IssueIntent::RoleEdit {
+                    role_id: role.clone(),
+                    expected_revision: expect_revision,
+                    name,
+                    description,
+                    capabilities,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Ok {
+                        message: Some(format!("edited role {role} (a new revision is the head)")),
+                    },
+                    true,
+                ))
+            }
+            Request::RoleDelete {
+                role,
+                expect_revision,
+            } => {
+                self.submit(&IssueIntent::RoleDelete {
+                    role_id: role.clone(),
+                    expected_revision: expect_revision,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Ok {
+                        message: Some(format!(
+                            "tombstoned role {role} — existing assignments keep their \
+                             originally granted expansion until explicitly revoked"
+                        )),
+                    },
+                    true,
+                ))
+            }
+            Request::RoleResolve {
+                role,
+                expect_heads,
+                body_json,
+            } => {
+                self.submit(&IssueIntent::RoleResolve {
+                    role_id: role.clone(),
+                    expected_heads: expect_heads,
+                    body_json,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Ok {
+                        message: Some(format!("resolved role {role} to one head")),
+                    },
+                    true,
+                ))
+            }
+            Request::WorkflowShow { project } => {
+                let project = snapshot
+                    .resolve_project(&project)
+                    .ok_or_else(|| Response::not_found("no such project"))?;
+                let view: serde_json::Value = self
+                    .query(&IssueQuery::Workflow { project })
+                    .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Text {
+                        text: serde_json::to_string_pretty(&view).unwrap_or_default(),
+                    },
+                    false,
+                ))
+            }
+            Request::WorkflowValidate { body_json } => {
+                // Pure local validation — nothing is committed.
+                match serde_json::from_str::<crate::world::workflow::WorkflowBody>(&body_json) {
+                    Ok(body) => match body.validate() {
+                        Ok(()) => Ok((
+                            Response::Ok {
+                                message: Some("the workflow body is valid".into()),
+                            },
+                            false,
+                        )),
+                        Err(why) => Err(Response::err(format!("invalid workflow: {why}"))),
+                    },
+                    Err(e) => Err(Response::err(format!("workflow body does not decode: {e}"))),
+                }
+            }
+            Request::WorkflowSet {
+                project,
+                expect_heads,
+                body_json,
+            } => {
+                let project = snapshot
+                    .resolve_project(&project)
+                    .ok_or_else(|| Response::not_found("no such project"))?;
+                self.submit(&IssueIntent::WorkflowReplace {
+                    project_id: project.clone(),
+                    expected_heads: expect_heads,
+                    body_json,
+                    device: facts.device.clone(),
+                    ts: facts.now,
+                })
+                .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Ok {
+                        message: Some("workflow replaced (a new revision is the head)".into()),
+                    },
+                    true,
+                ))
             }
             other => Err(Response::err(format!(
                 "request not routed to the issues world: {other:?}"

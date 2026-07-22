@@ -1247,6 +1247,203 @@ pub fn specs() -> Vec<Spec> {
                 })
             },
         ),
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "show",
+                    "One role's pinned definition (revision, capabilities, scope).",
+                    vec![A::pos("role", "The role id (built-in or role_<ULID>).")],
+                    |m| {
+                        Ok(Request::RoleShow {
+                            role: req_str(m, "role"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "create",
+                    "Create a custom role from registered capability ids. Space-scoped \
+                     by default; -p makes it Project-scoped.",
+                    vec![
+                        A::pos("name", "Display name."),
+                        A::multi("cap", "A registered capability id (repeatable).").required(),
+                        A::val("project", "Make it a Project role, scoped for this project.")
+                            .short('p'),
+                        A::val("description", "What the role is for."),
+                    ],
+                    |m| {
+                        Ok(Request::RoleCreate {
+                            name: req_str(m, "name"),
+                            description: opt_str(m, "description"),
+                            project: opt_str(m, "project"),
+                            capabilities: multi(m, "cap"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "edit",
+                    "Edit a custom role at an exact expected revision (a new revision \
+                     becomes the head; existing assignments keep their original grant).",
+                    vec![
+                        A::pos("role", "The role id."),
+                        A::val("expect-revision", "The head revision this edit builds on.")
+                            .required(),
+                        A::val("name", "Replacement display name."),
+                        A::val("description", "Replacement description."),
+                        A::multi("cap", "Replacement capability set (repeatable)."),
+                    ],
+                    |m| {
+                        let caps = multi(m, "cap");
+                        Ok(Request::RoleEdit {
+                            role: req_str(m, "role"),
+                            expect_revision: req_str(m, "expect-revision"),
+                            name: opt_str(m, "name"),
+                            description: opt_str(m, "description"),
+                            capabilities: if caps.is_empty() { None } else { Some(caps) },
+                        })
+                    },
+                ),
+                Spec::req(
+                    "delete",
+                    "Tombstone a custom role at an exact expected revision.",
+                    vec![
+                        A::pos("role", "The role id."),
+                        A::val("expect-revision", "The head revision this delete builds on.")
+                            .required(),
+                    ],
+                    |m| {
+                        Ok(Request::RoleDelete {
+                            role: req_str(m, "role"),
+                            expect_revision: req_str(m, "expect-revision"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "resolve",
+                    "Resolve concurrent role heads with a complete replacement body.",
+                    vec![
+                        A::pos("role", "The role id."),
+                        A::multi("expect-head", "Every current head (repeatable).").required(),
+                        A::val("file", "Path to the canonical JSON body.").required(),
+                    ],
+                    |m| {
+                        let path = req_str(m, "file");
+                        let body_json = std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow!("read {path}: {e}"))?;
+                        Ok(Request::RoleResolve {
+                            role: req_str(m, "role"),
+                            expect_heads: multi(m, "expect-head"),
+                            body_json,
+                        })
+                    },
+                ),
+                Spec::req("ls", "List every role definition.", vec![], |_| {
+                    Ok(Request::RoleList)
+                }),
+            ],
+            ..Spec::req(
+                "role",
+                "Author product roles (Catalog definitions). `role` lists.",
+                vec![],
+                |_| Ok(Request::RoleList),
+            )
+        },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "grant",
+                    "Expand a role's pinned definition and install the exact scoped \
+                     assignments (authority-first, all-or-nothing).",
+                    vec![
+                        A::pos("actor", "The member's actor id or petname."),
+                        A::val("role", "The role to expand.").required(),
+                        A::val("project", "The project scope, for a Project role.").short('p'),
+                    ],
+                    |m| {
+                        Ok(Request::AccessGrant {
+                            actor: req_str(m, "actor"),
+                            role: req_str(m, "role"),
+                            project: opt_str(m, "project"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "revoke",
+                    "Revoke one effective assignment by its grant id.",
+                    vec![A::pos("grant_id", "The 64-hex grant id (from `access ls`).")],
+                    |m| {
+                        Ok(Request::AccessRevoke {
+                            grant_id: req_str(m, "grant_id"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "ls",
+                    "Effective scoped assignments (Mechanics authority history).",
+                    vec![A::val("actor", "Only this member's assignments.")],
+                    |m| {
+                        Ok(Request::AccessList {
+                            actor: opt_str(m, "actor"),
+                        })
+                    },
+                ),
+            ],
+            ..Spec::req(
+                "access",
+                "Effective scoped capability assignments. `access` lists.",
+                vec![],
+                |_| Ok(Request::AccessList { actor: None }),
+            )
+        },
+        Spec {
+            subs: vec![
+                Spec::req(
+                    "show",
+                    "A project's workflow revision head(s).",
+                    vec![A::pos("project", "The project (key or prj_ id).")],
+                    |m| {
+                        Ok(Request::WorkflowShow {
+                            project: req_str(m, "project"),
+                        })
+                    },
+                ),
+                Spec::req(
+                    "validate",
+                    "Validate a canonical workflow JSON body without committing.",
+                    vec![A::val("file", "Path to the canonical JSON body.").required()],
+                    |m| {
+                        let path = req_str(m, "file");
+                        let body_json = std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow!("read {path}: {e}"))?;
+                        Ok(Request::WorkflowValidate { body_json })
+                    },
+                ),
+                Spec::req(
+                    "set",
+                    "Replace a project's workflow at exactly the current heads.",
+                    vec![
+                        A::pos("project", "The project (key or prj_ id)."),
+                        A::multi("expect-head", "Every current head (repeatable).").required(),
+                        A::val("file", "Path to the canonical JSON body.").required(),
+                    ],
+                    |m| {
+                        let path = req_str(m, "file");
+                        let body_json = std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow!("read {path}: {e}"))?;
+                        Ok(Request::WorkflowSet {
+                            project: req_str(m, "project"),
+                            expect_heads: multi(m, "expect-head"),
+                            body_json,
+                        })
+                    },
+                ),
+            ],
+            ..Spec::req(
+                "workflow",
+                "Author deterministic workflow gates. Subcommand required.",
+                vec![],
+                |_| Err(anyhow!("workflow needs a subcommand: show | validate | set")),
+            )
+        },
         Spec::req(
             "reshare-recovery",
             "Reshare the group recovery key onto a new K-of-N arrangement \

@@ -1326,6 +1326,26 @@ pub fn print_response(resp: &Response, out: Out) -> i32 {
             }
             0
         }
+        Response::Assignments { rows } => {
+            if rows.is_empty() {
+                println!("(no effective assignments)");
+            }
+            for r in rows.iter() {
+                let scope = if r.resource.is_empty() {
+                    "space".to_string()
+                } else {
+                    r.resource.join("/")
+                };
+                println!(
+                    "{}  {:<24} {:<28} {}",
+                    &r.grant_id[..12.min(r.grant_id.len())],
+                    r.capability,
+                    scope,
+                    r.actor
+                );
+            }
+            0
+        }
         Response::Members { members } => {
             if members.is_empty() {
                 println!("(no members)");

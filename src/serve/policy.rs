@@ -39,6 +39,11 @@ pub fn is_read(req: &Request) -> bool {
         | Request::SeedList
         | Request::Log { .. }
         | Request::Who
+        | Request::RoleList
+        | Request::RoleShow { .. }
+        | Request::AccessList { .. }
+        | Request::WorkflowShow { .. }
+        | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
 
         // Reads the inbox, but `clear` advances the watermark on the way out.
@@ -88,6 +93,14 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Connect { .. }
         | Request::SeedAdd { .. }
         | Request::SeedRemove { .. }
+        // …role/access/workflow authoring mutates replicated policy…
+        | Request::RoleCreate { .. }
+        | Request::RoleEdit { .. }
+        | Request::RoleDelete { .. }
+        | Request::RoleResolve { .. }
+        | Request::AccessGrant { .. }
+        | Request::AccessRevoke { .. }
+        | Request::WorkflowSet { .. }
         // …and node control.
         | Request::ConfigReload
         | Request::Stop => false,

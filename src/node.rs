@@ -1474,6 +1474,23 @@ impl Node {
             Err(resp) => return Ok(resp),
         };
         match req {
+            // ---- role/access/workflow authoring: orbital-only (this legacy
+            // node is deleted by M5 and never serves the authoring surface) --
+            Request::RoleList
+            | Request::RoleShow { .. }
+            | Request::RoleCreate { .. }
+            | Request::RoleEdit { .. }
+            | Request::RoleDelete { .. }
+            | Request::RoleResolve { .. }
+            | Request::AccessList { .. }
+            | Request::AccessGrant { .. }
+            | Request::AccessRevoke { .. }
+            | Request::WorkflowShow { .. }
+            | Request::WorkflowValidate { .. }
+            | Request::WorkflowSet { .. } => Ok(Response::err(
+                "role/access/workflow authoring requires the orbital daemon",
+            )),
+
             // ---- replica ----
             Request::IssueNew { .. }
             | Request::IssueEdit { .. }

@@ -68,6 +68,17 @@ pub fn demand_contributor() -> Vec<u8> {
     .expect("canonical contributor demand")
 }
 
+/// `Any(Require(<capability>, Space), Require(space.admin, Space))` — a
+/// Space-scoped registry/policy mutation with the explicit admin override.
+pub fn demand_space_any(capability: &str) -> Vec<u8> {
+    AuthorizationDemand::Any(vec![
+        AuthorizationDemand::require(space_cap(capability), space_resource()),
+        AuthorizationDemand::require(space_cap("space.admin"), space_resource()),
+    ])
+    .encode_canonical()
+    .expect("canonical space-any demand")
+}
+
 /// `Require(space.issue.read, Space)` — every query's read demand.
 pub fn demand_read() -> Vec<u8> {
     AuthorizationDemand::require(space_cap("space.issue.read"), space_resource())
@@ -377,6 +388,58 @@ pub enum IssueIntent {
         device: String,
         ts: u64,
     },
+    /// Create a custom role definition (a grow-only Catalog revision with no
+    /// predecessor). The daemon mints `role_id` (`role_<ULID>`); the World
+    /// validates the registry membership of every capability for the declared
+    /// scope.
+    RoleCreate {
+        role_id: String,
+        /// `None` = a Space-scoped role; `Some(project)` = Project-scoped
+        /// (the project must exist; capabilities must be Project-registered).
+        scope_project: Option<String>,
+        name: String,
+        description: String,
+        capabilities: Vec<String>,
+        device: String,
+        ts: u64,
+    },
+    /// Edit a custom role: a new revision whose predecessor is the exact
+    /// expected head. Built-ins are immutable in every field.
+    RoleEdit {
+        role_id: String,
+        expected_revision: String,
+        name: Option<String>,
+        description: Option<String>,
+        capabilities: Option<Vec<String>>,
+        device: String,
+        ts: u64,
+    },
+    /// Tombstone a custom role (a complete revision; grow-only).
+    RoleDelete {
+        role_id: String,
+        expected_revision: String,
+        device: String,
+        ts: u64,
+    },
+    /// Resolve concurrent role heads: a successor naming ALL current heads.
+    RoleResolve {
+        role_id: String,
+        expected_heads: Vec<String>,
+        /// The complete replacement body (product canonical JSON).
+        body_json: String,
+        device: String,
+        ts: u64,
+    },
+    /// Replace a project's workflow: a new revision whose predecessors are
+    /// exactly the current heads (also the conflict-resolution path).
+    WorkflowReplace {
+        project_id: String,
+        expected_heads: Vec<String>,
+        /// The complete replacement body (product canonical JSON).
+        body_json: String,
+        device: String,
+        ts: u64,
+    },
 }
 
 /// Build the canonical `InitializeTracker` intent from captured formation
@@ -457,6 +520,16 @@ pub enum IssueQuery {
     },
     Projects,
     Labels,
+    /// Every role definition: built-ins plus custom heads (with conflict
+    /// head lists).
+    Roles,
+    RoleShow {
+        role: String,
+    },
+    /// A project's workflow revision head(s).
+    Workflow {
+        project: String,
+    },
 }
 
 impl IssueQuery {

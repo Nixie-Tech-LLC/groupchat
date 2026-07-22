@@ -376,6 +376,75 @@ pub enum Request {
         who: String,
         name: String,
     },
+
+    // ---- role / access / workflow authoring (plan 04) ----
+    /// Every role definition: built-ins plus custom heads.
+    RoleList,
+    RoleShow {
+        role: String,
+    },
+    /// Create a custom role (Space-scoped, or Project-scoped with `project`).
+    RoleCreate {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        project: Option<String>,
+        capabilities: Vec<String>,
+    },
+    /// Edit a custom role at an exact expected revision head.
+    RoleEdit {
+        role: String,
+        expect_revision: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
+    },
+    /// Tombstone a custom role at an exact expected revision head.
+    RoleDelete {
+        role: String,
+        expect_revision: String,
+    },
+    /// Resolve concurrent role heads with a complete replacement body.
+    RoleResolve {
+        role: String,
+        expect_heads: Vec<String>,
+        body_json: String,
+    },
+    /// Effective scoped assignments (Mechanics history, not Catalog state).
+    AccessList {
+        #[serde(default)]
+        actor: Option<String>,
+    },
+    /// Expand a role's pinned definition and install the exact assignments —
+    /// authority-first, all-or-nothing.
+    AccessGrant {
+        actor: String,
+        role: String,
+        #[serde(default)]
+        project: Option<String>,
+    },
+    /// Revoke one effective assignment by its grant id (64-hex).
+    AccessRevoke {
+        grant_id: String,
+    },
+    /// A project's workflow revision head(s).
+    WorkflowShow {
+        project: String,
+    },
+    /// Validate a canonical workflow body without committing anything.
+    WorkflowValidate {
+        body_json: String,
+    },
+    /// Replace a project's workflow at exactly the current heads.
+    WorkflowSet {
+        project: String,
+        expect_heads: Vec<String>,
+        body_json: String,
+    },
     /// Streaming dirty notifications for live clients. Turns the one-shot handler into a
     /// stream of [`Doorbell`] frames until the client disconnects.
     Subscribe {
@@ -522,7 +591,16 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::ProjectList
         | Request::LabelNew { .. }
         | Request::LabelList
-        | Request::Activity { .. } => Session,
+        | Request::Activity { .. }
+        | Request::RoleList
+        | Request::RoleShow { .. }
+        | Request::RoleCreate { .. }
+        | Request::RoleEdit { .. }
+        | Request::RoleDelete { .. }
+        | Request::RoleResolve { .. }
+        | Request::WorkflowShow { .. }
+        | Request::WorkflowValidate { .. }
+        | Request::WorkflowSet { .. } => Session,
 
         // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
         Request::MemberAdd { .. }
@@ -546,6 +624,9 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::Recover
         | Request::Invite { .. }
         | Request::Join { .. }
+        | Request::AccessList { .. }
+        | Request::AccessGrant { .. }
+        | Request::AccessRevoke { .. }
         | Request::Id => Mechanics,
 
         // ---- Station: connect/neighbor/Contact ----
@@ -652,6 +733,44 @@ pub fn representative_requests() -> Vec<Request> {
         },
         Request::LabelList,
         Request::Activity { since: 0 },
+        Request::RoleList,
+        Request::RoleShow { role: s() },
+        Request::RoleCreate {
+            name: s(),
+            description: None,
+            project: None,
+            capabilities: vec![],
+        },
+        Request::RoleEdit {
+            role: s(),
+            expect_revision: s(),
+            name: None,
+            description: None,
+            capabilities: None,
+        },
+        Request::RoleDelete {
+            role: s(),
+            expect_revision: s(),
+        },
+        Request::RoleResolve {
+            role: s(),
+            expect_heads: vec![],
+            body_json: s(),
+        },
+        Request::AccessList { actor: None },
+        Request::AccessGrant {
+            actor: s(),
+            role: s(),
+            project: None,
+        },
+        Request::AccessRevoke { grant_id: s() },
+        Request::WorkflowShow { project: s() },
+        Request::WorkflowValidate { body_json: s() },
+        Request::WorkflowSet {
+            project: s(),
+            expect_heads: vec![],
+            body_json: s(),
+        },
         Request::Inbox { clear: false },
         Request::MemberAdd {
             who: s(),
@@ -788,6 +907,10 @@ pub enum Response {
     },
     Members {
         members: Vec<MemberDto>,
+    },
+    /// Effective scoped assignments (reply to [`Request::AccessList`]).
+    Assignments {
+        rows: Vec<crate::dto::AssignmentDto>,
     },
     /// The membership audit log (reply to [`Request::MemberLog`]).
     MemberLog {

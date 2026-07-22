@@ -359,6 +359,39 @@ impl OrbitalDaemon {
                 passphrase,
                 force,
             } => self.space_custody_import(path, passphrase, force),
+            Request::AccessList { actor } => {
+                let subject = match actor.as_deref() {
+                    None => None,
+                    Some(who) => match self.mechanics.resolve_actor_ref(who) {
+                        Some(a) => Some(a),
+                        None => return Response::not_found(format!("no actor matches '{who}'")),
+                    },
+                };
+                Response::Assignments {
+                    rows: self.mechanics.assignment_rows(subject.as_ref()),
+                }
+            }
+            Request::AccessGrant {
+                actor,
+                role,
+                project,
+            } => self.access_grant(&actor, &role, project.as_deref()),
+            Request::AccessRevoke { grant_id } => {
+                let raw = match data_encoding::HEXLOWER_PERMISSIVE
+                    .decode(grant_id.trim().as_bytes())
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                {
+                    Some(id) => id,
+                    None => return Response::err("expected a 64-hex grant id"),
+                };
+                match self.mechanics.revoke_assignment(raw) {
+                    Ok(()) => Response::Ok {
+                        message: Some("revoked the assignment".into()),
+                    },
+                    Err(e) => Response::err(format!("{e}")),
+                }
+            }
             // The production classifier routed this here; any other variant
             // reaching this arm is a routing invariant violation, not a
             // servable request.
@@ -829,6 +862,122 @@ impl OrbitalDaemon {
                     }),
                 }
             }
+            Err(e) => Response::err(format!("{e}")),
+        }
+    }
+
+    /// Query the docked Session for a JSON projection (role/workflow views).
+    fn session_query_json(
+        &self,
+        query: crate::world::contract::IssueQuery,
+    ) -> Option<serde_json::Value> {
+        if !self.ensure_session() {
+            return None;
+        }
+        let guard = self.session.lock().expect("session lock");
+        let session = guard.as_ref()?;
+        let bytes = session
+            .query(runtime::WorldQuery {
+                schema: crate::world::contract::issue_schema(),
+                schema_version: crate::world::contract::ISSUE_SCHEMA_VERSION,
+                payload: query.to_json(),
+            })
+            .ok()?
+            .bytes;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Expand a role's pinned definition (read from the Manifest-pinned
+    /// Catalog through the Session) and install the exact assignments as one
+    /// Mechanics authority batch. IssuesWorld plans the expansion; Runtime
+    /// validates; Mechanics commits authority-first.
+    fn access_grant(&self, actor: &str, role: &str, project: Option<&str>) -> Response {
+        let Some(subject) = self.mechanics.resolve_actor_ref(actor) else {
+            return Response::not_found(format!("no actor matches '{actor}'"));
+        };
+        let Some(view) = self.session_query_json(crate::world::contract::IssueQuery::RoleShow {
+            role: role.to_string(),
+        }) else {
+            return Response::not_found(format!("no role `{role}` in this space"));
+        };
+        let conflicts = view["conflict_heads"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !conflicts.is_empty() {
+            return Response::err(format!(
+                "role `{role}` has {} concurrent revision heads — resolve them with                  `role resolve` before assigning",
+                conflicts.len()
+            ));
+        }
+        let Some(revision) = view.get("revision").filter(|r| !r.is_null()) else {
+            return Response::not_found(format!("role `{role}` has no usable revision"));
+        };
+        let body = &revision["body"];
+        if body["tombstone"].as_bool() == Some(true) {
+            return Response::err(format!("role `{role}` is tombstoned"));
+        }
+        let scope_kind = body["scope_kind"].as_str().unwrap_or("space");
+        let world = crate::world::contract::PRODUCT_WORLD;
+        let resource = match (scope_kind, project) {
+            ("space", None) => mechanics::demand::PolicyResource::space(world),
+            ("space", Some(_)) => {
+                return Response::err("that is a Space role — it takes no --project")
+            }
+            ("project", Some(sel)) => {
+                let Some(snapshot) =
+                    self.session_query_json(crate::world::contract::IssueQuery::Snapshot)
+                else {
+                    return Response::err("the catalog is unavailable");
+                };
+                let projects = snapshot["catalog"]["projects"].as_object().cloned();
+                let resolved = projects.and_then(|m| {
+                    let upper = sel.to_ascii_uppercase();
+                    if m.contains_key(sel) {
+                        return Some(sel.to_string());
+                    }
+                    m.iter()
+                        .find(|(_, meta)| meta["key"].as_str() == Some(upper.as_str()))
+                        .map(|(id, _)| id.clone())
+                });
+                match resolved {
+                    Some(id) => mechanics::demand::PolicyResource::project(world, &id),
+                    None => return Response::not_found(format!("no project matches '{sel}'")),
+                }
+            }
+            ("project", None) => {
+                return Response::err("that is a Project role — pass -p <project>")
+            }
+            _ => return Response::err("unrecognized role scope"),
+        };
+        let assignments: Vec<(
+            mechanics::demand::PolicyCapability,
+            mechanics::demand::PolicyResource,
+        )> = body["capabilities"]
+            .as_array()
+            .map(|caps| {
+                caps.iter()
+                    .filter_map(|c| c.as_str())
+                    .map(|c| {
+                        (
+                            mechanics::demand::PolicyCapability::new(world, c),
+                            resource.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if assignments.is_empty() {
+            return Response::err(format!("role `{role}` expands to no capabilities"));
+        }
+        match self.mechanics.grant_assignments(&subject, &assignments) {
+            Ok(granted) => Response::Ok {
+                message: Some(format!(
+                    "granted {} capability assignment(s) from role `{role}` to {}",
+                    granted.len(),
+                    subject.short()
+                )),
+            },
             Err(e) => Response::err(format!("{e}")),
         }
     }

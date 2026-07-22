@@ -51,12 +51,13 @@ pub struct CatalogState {
     pub parents: BTreeMap<String, String>,
     /// project id -> ordered `(stable element id, doc id)` board entries.
     pub boards: BTreeMap<String, Vec<(String, String)>>,
-    /// project id -> current workflow revision (the deterministic transition
-    /// gates; seeded by `InitializeTracker`/`ProjectNew`, replaced by
-    /// `workflow set`).
-    pub workflow_revisions: BTreeMap<String, crate::world::workflow::WorkflowRevision>,
-    /// role id -> stored role revision (built-ins + custom roles).
+    /// project id -> grow-only workflow revision log (every revision ever
+    /// committed; heads are revisions no successor names as a predecessor).
+    pub workflow_revisions: BTreeMap<String, Vec<crate::world::workflow::WorkflowRevision>>,
+    /// role id -> the immutable BUILT-IN definition (seeded at formation).
     pub roles: BTreeMap<String, StoredRoleRevision>,
+    /// role id -> grow-only custom-role revision log.
+    pub role_revisions: BTreeMap<String, Vec<StoredRoleRevision>>,
 }
 
 /// A role revision as stored in the catalog `roles` map: hex revision id,
@@ -115,15 +116,35 @@ impl CatalogState {
         if state.workflow.is_empty() {
             state.workflow = default_workflow_states();
         }
-        for (project, raw) in map_str(view, "workflow_revisions") {
+        for (key, raw) in map_str(view, "workflow_revisions") {
+            // Key: `<project>/<revision hex>` — grow-only log entries.
+            let Some((project, _hex)) = key.rsplit_once('/') else {
+                continue;
+            };
             if let Ok(rev) = serde_json::from_str::<crate::world::workflow::WorkflowRevision>(&raw)
             {
-                state.workflow_revisions.insert(project, rev);
+                state
+                    .workflow_revisions
+                    .entry(project.to_string())
+                    .or_default()
+                    .push(rev);
             }
         }
         for (id, raw) in map_str(view, "roles") {
             if let Ok(rev) = serde_json::from_str::<StoredRoleRevision>(&raw) {
                 state.roles.insert(id, rev);
+            }
+        }
+        for (key, raw) in map_str(view, "role_revisions") {
+            let Some((role, _hex)) = key.rsplit_once('/') else {
+                continue;
+            };
+            if let Ok(rev) = serde_json::from_str::<StoredRoleRevision>(&raw) {
+                state
+                    .role_revisions
+                    .entry(role.to_string())
+                    .or_default()
+                    .push(rev);
             }
         }
         for (project, raw) in map_str(view, "aliases") {
@@ -596,4 +617,66 @@ pub fn default_workflow_states() -> Vec<WorkflowState> {
         .into_iter()
         .filter_map(|v| serde_json::from_value(v).ok())
         .collect()
+}
+
+/// Revision-head computation over a grow-only log: the heads are entries no
+/// other entry names as a predecessor. One head is usable; several are an
+/// explicit conflict the caller must surface.
+fn heads_of<'a, T, I: Fn(&T) -> &str, P: Fn(&T) -> &[String]>(
+    log: &'a [T],
+    id_of: I,
+    preds_of: P,
+) -> Vec<&'a T> {
+    use std::collections::BTreeSet;
+    let referenced: BTreeSet<&str> = log
+        .iter()
+        .flat_map(|r| preds_of(r).iter().map(|s| s.as_str()))
+        .collect();
+    log.iter()
+        .filter(|r| !referenced.contains(id_of(r)))
+        .collect()
+}
+
+impl CatalogState {
+    /// The workflow revision heads for a project (empty = never seeded;
+    /// more than one = concurrent edits pending explicit resolution).
+    pub fn workflow_heads(&self, project: &str) -> Vec<&crate::world::workflow::WorkflowRevision> {
+        self.workflow_revisions
+            .get(project)
+            .map(|log| heads_of(log, |r| r.revision_id.as_str(), |r| &r.predecessor_ids))
+            .unwrap_or_default()
+    }
+
+    /// The single usable workflow head, or `None` (missing or conflicted).
+    pub fn workflow_head(
+        &self,
+        project: &str,
+    ) -> Option<&crate::world::workflow::WorkflowRevision> {
+        let heads = self.workflow_heads(project);
+        match heads.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
+    /// The custom-role revision heads for a role id.
+    pub fn role_heads(&self, role: &str) -> Vec<&StoredRoleRevision> {
+        self.role_revisions
+            .get(role)
+            .map(|log| heads_of(log, |r| r.revision_id.as_str(), |r| &r.predecessor_ids))
+            .unwrap_or_default()
+    }
+
+    /// The single usable role head: a built-in's immutable definition, or the
+    /// custom role's sole head. `None` for unknown or conflicted roles.
+    pub fn role_head(&self, role: &str) -> Option<&StoredRoleRevision> {
+        if let Some(built_in) = self.roles.get(role) {
+            return Some(built_in);
+        }
+        let heads = self.role_heads(role);
+        match heads.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
 }

@@ -511,6 +511,22 @@ pub struct MemberLogEntry {
     pub authorized: bool,
 }
 
+/// One effective scoped capability assignment (Mechanics authority history,
+/// projected for `access ls`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssignmentDto {
+    /// The grant id (64-hex) — the revocation handle.
+    pub grant_id: String,
+    /// The subject actor id.
+    pub actor: String,
+    /// The capability's World namespace.
+    pub world: String,
+    /// The capability name.
+    pub capability: String,
+    /// The exact resource segments (empty = the Space resource).
+    pub resource: Vec<String>,
+}
+
 /// A pinned seed ("remote") projection for `seed ls` / `remote ls`. A seed
 /// is a bootstrap + backfill anchor, never a trust authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

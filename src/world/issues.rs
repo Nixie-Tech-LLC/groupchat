@@ -273,10 +273,13 @@ fn transition_gate(
     from: &str,
     to: &str,
 ) -> Result<(Vec<u8>, crate::world::workflow::WorkflowTransitionEvidence), WorldError> {
-    let revision = catalog
-        .workflow_revisions
-        .get(project)
-        .ok_or(WorldError::WorldStateCorrupt)?;
+    // The single usable head gates transitions; concurrent heads block them
+    // (and further ordinary edits) until `workflow set --expect-head`
+    // resolves. A project with NO revision at all is corrupt catalog state.
+    if !catalog.workflow_revisions.contains_key(project) {
+        return Err(WorldError::WorldStateCorrupt);
+    }
+    let revision = catalog.workflow_head(project).ok_or(WorldError::Conflict)?;
     let transition = revision
         .body
         .transition_for(from, to)
@@ -294,6 +297,75 @@ fn transition_gate(
         resolved_demand_digest: data_encoding::HEXLOWER.encode(&digest),
     };
     Ok((bytes, evidence))
+}
+
+/// Whether every capability id is registered for the declared scope kind
+/// (sorted, unique, non-empty).
+fn validate_role_caps(
+    caps: &[String],
+    scope: crate::world::roles::ScopeKind,
+) -> Result<(), WorldError> {
+    if caps.is_empty() {
+        return Err(WorldError::InvalidRequest);
+    }
+    let mut sorted = caps.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != caps.len() {
+        return Err(WorldError::InvalidRequest);
+    }
+    let registered = |c: &str| match scope {
+        crate::world::roles::ScopeKind::Space => contract::is_space_capability(c),
+        crate::world::roles::ScopeKind::Project => contract::is_project_capability(c),
+    };
+    if caps.iter().any(|c| !registered(c)) {
+        return Err(WorldError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// The single usable custom-role head, which must match `expected` exactly.
+/// Multiple heads are a typed conflict that blocks edits until resolved.
+fn expect_single_head<'a>(
+    catalog: &'a CatalogState,
+    role_id: &str,
+    expected: &str,
+) -> Result<&'a crate::world::views::StoredRoleRevision, WorldError> {
+    let heads = catalog.role_heads(role_id);
+    match heads.as_slice() {
+        [] => Err(WorldError::InvalidRequest),
+        [one] if one.body.tombstone => Err(WorldError::InvalidRequest),
+        [one] if one.revision_id == expected => Ok(one),
+        [_one] => Err(WorldError::Conflict),
+        _ => Err(WorldError::Conflict),
+    }
+}
+
+fn decode_hex32(hex: &str) -> Result<[u8; 32], WorldError> {
+    let raw = data_encoding::HEXLOWER
+        .decode(hex.as_bytes())
+        .map_err(|_| WorldError::InvalidRequest)?;
+    raw.as_slice()
+        .try_into()
+        .map_err(|_| WorldError::InvalidRequest)
+}
+
+/// Stage one role revision into the grow-only log.
+fn stage_role_revision(staging: &mut Staging, revision: &crate::world::roles::RoleRevision) {
+    let stored = crate::world::views::StoredRoleRevision {
+        revision_id: data_encoding::HEXLOWER.encode(&revision.revision_id),
+        predecessor_ids: revision
+            .predecessor_ids
+            .iter()
+            .map(|p| data_encoding::HEXLOWER.encode(p))
+            .collect(),
+        body: revision.body.clone(),
+    };
+    staging.catalog(map_set(
+        "role_revisions",
+        format!("{}/{}", revision.body.role_id, stored.revision_id),
+        serde_json::to_vec(&stored).expect("role revision json"),
+    ));
 }
 
 fn event(kind: &str, device: &str, ts: u64) -> IssueEvent {
@@ -547,7 +619,7 @@ impl World for IssuesWorld {
                 }
                 staging.catalog(map_set(
                     "workflow_revisions",
-                    project_id.clone(),
+                    format!("{project_id}/{}", workflow_revision.revision_id),
                     serde_json::to_vec(&workflow_revision).expect("workflow revision json"),
                 ));
                 staging.catalog(map_set(
@@ -1153,7 +1225,7 @@ impl World for IssuesWorld {
                 let revision = crate::world::workflow::default_workflow_revision(&id);
                 staging.catalog(map_set(
                     "workflow_revisions",
-                    id,
+                    format!("{id}/{}", revision.revision_id),
                     serde_json::to_vec(&revision).expect("workflow revision json"),
                 ));
                 Ok(staging.into_effect(None))
@@ -1184,6 +1256,182 @@ impl World for IssuesWorld {
                     }))
                     .expect("label json"),
                 ));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::RoleCreate {
+                role_id,
+                scope_project,
+                name,
+                description,
+                capabilities,
+                device: _,
+                ts: _,
+            } => {
+                // Custom ids only: `role_<ULID>`; built-in ids and free-form
+                // ids reject. The daemon mints the id; the World re-validates.
+                if !role_id.starts_with("role_")
+                    || role_id.len() > 64
+                    || crate::world::roles::built_in(&role_id).is_some()
+                {
+                    return Err(WorldError::InvalidRequest);
+                }
+                if catalog.roles.contains_key(&role_id)
+                    || catalog.role_revisions.contains_key(&role_id)
+                {
+                    return Err(WorldError::Conflict);
+                }
+                let scope_kind = match &scope_project {
+                    None => crate::world::roles::ScopeKind::Space,
+                    Some(project) => {
+                        if !catalog.projects.contains_key(project) {
+                            return Err(WorldError::InvalidRequest);
+                        }
+                        crate::world::roles::ScopeKind::Project
+                    }
+                };
+                validate_role_caps(&capabilities, scope_kind)?;
+                let body = crate::world::roles::RoleBody {
+                    role_id: role_id.clone(),
+                    scope_kind,
+                    name,
+                    description,
+                    capabilities,
+                    tombstone: false,
+                };
+                let revision = crate::world::roles::build_revision(body, vec![])
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                stage_role_revision(&mut staging, &revision);
+                staging.require(contract::demand_space_any("policy.configure"));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::RoleEdit {
+                role_id,
+                expected_revision,
+                name,
+                description,
+                capabilities,
+                device: _,
+                ts: _,
+            } => {
+                if catalog.roles.contains_key(&role_id) {
+                    // Built-ins are immutable in every field.
+                    return Err(WorldError::InvalidRequest);
+                }
+                let head = expect_single_head(&catalog, &role_id, &expected_revision)?;
+                let mut body = head.body.clone();
+                if let Some(name) = name {
+                    body.name = name;
+                }
+                if let Some(description) = description {
+                    body.description = description;
+                }
+                if let Some(capabilities) = capabilities {
+                    validate_role_caps(&capabilities, body.scope_kind)?;
+                    body.capabilities = capabilities;
+                }
+                let predecessor = decode_hex32(&expected_revision)?;
+                let revision = crate::world::roles::build_revision(body, vec![predecessor])
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                stage_role_revision(&mut staging, &revision);
+                staging.require(contract::demand_space_any("policy.configure"));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::RoleDelete {
+                role_id,
+                expected_revision,
+                device: _,
+                ts: _,
+            } => {
+                if catalog.roles.contains_key(&role_id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let head = expect_single_head(&catalog, &role_id, &expected_revision)?;
+                let mut body = head.body.clone();
+                body.tombstone = true;
+                let predecessor = decode_hex32(&expected_revision)?;
+                let revision = crate::world::roles::build_revision(body, vec![predecessor])
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                stage_role_revision(&mut staging, &revision);
+                staging.require(contract::demand_space_any("policy.configure"));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::RoleResolve {
+                role_id,
+                expected_heads,
+                body_json,
+                device: _,
+                ts: _,
+            } => {
+                if catalog.roles.contains_key(&role_id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let mut current: Vec<String> = catalog
+                    .role_heads(&role_id)
+                    .iter()
+                    .map(|h| h.revision_id.clone())
+                    .collect();
+                current.sort();
+                let mut expected = expected_heads.clone();
+                expected.sort();
+                expected.dedup();
+                if current.is_empty() || current != expected {
+                    return Err(WorldError::Conflict);
+                }
+                let body: crate::world::roles::RoleBody =
+                    serde_json::from_str(&body_json).map_err(|_| WorldError::InvalidRequest)?;
+                if body.role_id != role_id {
+                    return Err(WorldError::InvalidRequest);
+                }
+                validate_role_caps(&body.capabilities, body.scope_kind)?;
+                let predecessors: Vec<[u8; 32]> = expected
+                    .iter()
+                    .map(|h| decode_hex32(h))
+                    .collect::<Result<_, _>>()?;
+                let revision = crate::world::roles::build_revision(body, predecessors)
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                stage_role_revision(&mut staging, &revision);
+                staging.require(contract::demand_space_any("policy.configure"));
+                Ok(staging.into_effect(None))
+            }
+            IssueIntent::WorkflowReplace {
+                project_id,
+                expected_heads,
+                body_json,
+                device: _,
+                ts: _,
+            } => {
+                if !catalog.projects.contains_key(&project_id) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let mut current: Vec<String> = catalog
+                    .workflow_heads(&project_id)
+                    .iter()
+                    .map(|h| h.revision_id.clone())
+                    .collect();
+                current.sort();
+                let mut expected = expected_heads.clone();
+                expected.sort();
+                expected.dedup();
+                if current.is_empty() || current != expected {
+                    return Err(WorldError::Conflict);
+                }
+                let body: crate::world::workflow::WorkflowBody =
+                    serde_json::from_str(&body_json).map_err(|_| WorldError::InvalidRequest)?;
+                if body.project_id != project_id {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let predecessors: Vec<[u8; 32]> = expected
+                    .iter()
+                    .map(|h| decode_hex32(h))
+                    .collect::<Result<_, _>>()?;
+                let revision = crate::world::workflow::build_revision(body, predecessors)
+                    .map_err(|_| WorldError::InvalidRequest)?;
+                staging.catalog(map_set(
+                    "workflow_revisions",
+                    format!("{project_id}/{}", revision.revision_id),
+                    serde_json::to_vec(&revision).expect("workflow revision json"),
+                ));
+                staging.require(contract::demand_space_any("catalog.workflow.configure"));
                 Ok(staging.into_effect(None))
             }
         }
@@ -1358,6 +1606,70 @@ impl World for IssuesWorld {
                 labels.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(projection(
                     serde_json::to_vec(&labels).expect("labels json"),
+                ))
+            }
+            IssueQuery::Roles => {
+                let mut roles: Vec<serde_json::Value> = Vec::new();
+                for (id, rev) in &catalog.roles {
+                    roles.push(serde_json::json!({
+                        "role_id": id,
+                        "built_in": true,
+                        "revision": rev,
+                        "conflict_heads": [],
+                    }));
+                }
+                for id in catalog.role_revisions.keys() {
+                    let heads = catalog.role_heads(id);
+                    let head = catalog.role_head(id);
+                    roles.push(serde_json::json!({
+                        "role_id": id,
+                        "built_in": false,
+                        "revision": head,
+                        "conflict_heads": if head.is_some() {
+                            Vec::new()
+                        } else {
+                            heads.iter().map(|h| h.revision_id.clone()).collect()
+                        },
+                    }));
+                }
+                roles.sort_by(|a, b| a["role_id"].as_str().cmp(&b["role_id"].as_str()));
+                Ok(projection(serde_json::to_vec(&roles).expect("roles json")))
+            }
+            IssueQuery::RoleShow { role } => {
+                let heads = catalog.role_heads(&role);
+                let head = catalog.role_head(&role);
+                if head.is_none() && heads.is_empty() {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let view = serde_json::json!({
+                    "role_id": role,
+                    "built_in": catalog.roles.contains_key(&role),
+                    "revision": head,
+                    "conflict_heads": if head.is_some() {
+                        Vec::new()
+                    } else {
+                        heads.iter().map(|h| h.revision_id.clone()).collect()
+                    },
+                });
+                Ok(projection(serde_json::to_vec(&view).expect("role json")))
+            }
+            IssueQuery::Workflow { project } => {
+                if !catalog.projects.contains_key(&project) {
+                    return Err(WorldError::InvalidRequest);
+                }
+                let heads = catalog.workflow_heads(&project);
+                let head = catalog.workflow_head(&project);
+                let view = serde_json::json!({
+                    "project_id": project,
+                    "revision": head,
+                    "conflict_heads": if head.is_some() {
+                        Vec::new()
+                    } else {
+                        heads.iter().map(|h| h.revision_id.clone()).collect()
+                    },
+                });
+                Ok(projection(
+                    serde_json::to_vec(&view).expect("workflow json"),
                 ))
             }
         }
