@@ -904,7 +904,7 @@ impl OrbitalDaemon {
                 let kind = e["kind"].as_str().unwrap_or_default();
                 let mapped = match kind {
                     "assigned" => "assigned",
-                    "comment" => "comment",
+                    "commented" => "comment",
                     "edited"
                         if e["changes"].as_array().is_some_and(|c| {
                             c.iter().any(|f| f["field"].as_str() == Some("status"))

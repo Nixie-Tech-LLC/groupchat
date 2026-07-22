@@ -84,3 +84,21 @@ fn the_generated_routing_table_comes_from_the_production_classifier() {
         let _ = std::fs::write(dir.join("request-routing.tsv"), out);
     }
 }
+
+#[test]
+fn every_session_owned_request_is_served_by_the_issue_router() {
+    // The defect this pins: `Activity` was classified Session but the issue
+    // router neither claimed nor served it, so a public `lait activity` died
+    // with "request not routed to the issues world". Classification and the
+    // router's claim set must agree in BOTH directions — a Session-owned
+    // request the router refuses is an unreachable public verb, and a
+    // router-claimed request under another owner would never reach it.
+    for req in representative_requests() {
+        let claimed = lait::world::router::IssueRouter::handles(&req);
+        let session = classify(&req) == RequestOwner::Session;
+        assert_eq!(
+            session, claimed,
+            "classification/router disagreement on {req:?}: classified-Session={session}, router-handles={claimed}"
+        );
+    }
+}

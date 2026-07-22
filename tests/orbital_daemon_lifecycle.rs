@@ -181,6 +181,27 @@ fn the_orbital_daemon_serves_the_issue_surface_over_the_control_socket() {
     assert_eq!(view.comments.len(), 1);
     assert_eq!(view.comments[0].body, "a socket comment");
 
+    // The space-wide activity feed serves through daemon dispatch (this pins
+    // the classification/routing defect where `lait activity` was refused with
+    // "request not routed to the issues world"): the created issue and the
+    // comment appear as feed rows, and re-pulling from the returned cursor
+    // yields nothing new.
+    let resp = req(&client_rt, &home, Request::Activity { since: 0 });
+    let Response::Activity { events, last } = resp else {
+        panic!("expected Activity, got {resp:?}");
+    };
+    assert!(last >= 2, "created + comment rows expected, last={last}");
+    assert!(events.iter().any(|e| e.kind == "created"));
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "commented" && e.text == "a socket comment"));
+    let resp = req(&client_rt, &home, Request::Activity { since: last });
+    let Response::Activity { events, last: l2 } = resp else {
+        panic!("expected Activity, got {resp:?}");
+    };
+    assert!(events.is_empty(), "cursor resume must yield no repeats");
+    assert_eq!(l2, last);
+
     // List reflects it.
     let resp = req(
         &client_rt,

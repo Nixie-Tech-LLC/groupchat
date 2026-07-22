@@ -1580,6 +1580,50 @@ impl World for IssuesWorld {
                 let value = serde_json::json!({ "events": events, "last": last });
                 Ok(projection(serde_json::to_vec(&value).expect("history")))
             }
+            IssueQuery::Activity { since } => {
+                // The whole-space feed: every event of every issue (tombstoned
+                // issues keep their history — the rows already happened),
+                // ordered deterministically by `(ts, doc, per-doc index)` so
+                // every converged replica derives the identical sequence. The
+                // cursor is a position in that total order: `since = last`
+                // resumes exactly after the previously served tail.
+                let issues = load_issues(ctx);
+                let mut feed: Vec<(u64, &String, usize, &IssueEvent)> = Vec::new();
+                for (doc, issue) in &issues {
+                    for (i, e) in issue.events.iter().enumerate() {
+                        feed.push((e.t, doc, i, e));
+                    }
+                }
+                feed.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+                let last = feed.len() as u64;
+                let events: Vec<ActivityEvent> = feed
+                    .into_iter()
+                    .enumerate()
+                    .map(|(pos, (_, doc, _, e))| ActivityEvent {
+                        seq: (pos + 1) as u64,
+                        doc_id: DocId::parse(doc),
+                        reff: canonical_for(&aliases, doc),
+                        kind: e.k.clone(),
+                        changes: e
+                            .c
+                            .iter()
+                            .map(|c| FieldChange {
+                                field: c.f.clone(),
+                                from: c.from.clone(),
+                                to: c.to.clone(),
+                            })
+                            .collect(),
+                        actor: crate::ids::DeviceId::parse(&e.d),
+                        actor_nick: String::new(),
+                        text: e.x.clone(),
+                        ts: e.t,
+                        collision: false,
+                    })
+                    .filter(|e| e.seq > since)
+                    .collect();
+                let value = serde_json::json!({ "events": events, "last": last });
+                Ok(projection(serde_json::to_vec(&value).expect("activity")))
+            }
             IssueQuery::Projects => {
                 let projects: Vec<crate::dto::ProjectDto> = catalog
                     .projects

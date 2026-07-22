@@ -316,6 +316,7 @@ impl<'a> IssueRouter<'a> {
                 | Request::ProjectList
                 | Request::LabelNew { .. }
                 | Request::LabelList
+                | Request::Activity { .. }
                 | Request::RoleList
                 | Request::RoleShow { .. }
                 | Request::RoleCreate { .. }
@@ -606,6 +607,23 @@ impl<'a> IssueRouter<'a> {
                     Response::Activity {
                         events: hist.events,
                         last: hist.last,
+                    },
+                    false,
+                ))
+            }
+            Request::Activity { since } => {
+                #[derive(serde::Deserialize)]
+                struct Feed {
+                    events: Vec<crate::dto::ActivityEvent>,
+                    last: u64,
+                }
+                let feed: Feed = self
+                    .query(&IssueQuery::Activity { since })
+                    .map_err(Self::effect_err)?;
+                Ok((
+                    Response::Activity {
+                        events: feed.events,
+                        last: feed.last,
                     },
                     false,
                 ))

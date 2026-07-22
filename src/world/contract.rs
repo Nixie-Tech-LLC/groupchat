@@ -526,6 +526,14 @@ pub enum IssueQuery {
     RoleShow {
         role: String,
     },
+    /// The space-wide activity feed: every issue event across the tracker,
+    /// ordered by `(ts, doc, per-doc index)` with a monotone `seq` cursor over
+    /// the whole feed. `since` filters to rows the caller has not yet seen
+    /// (`Activity { since: last }` resumes exactly where the previous pull
+    /// stopped); `last` in the projection is the total feed length.
+    Activity {
+        since: u64,
+    },
     /// A project's workflow revision head(s).
     Workflow {
         project: String,
