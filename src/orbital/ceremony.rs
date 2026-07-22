@@ -47,7 +47,8 @@ impl Inner {
     /// The private `bootstrap_root_epoch_if_needed` helper performs the re-key.
     pub(super) fn space_recover_cmd(&mut self) -> Result<SpaceRecovery> {
         let genesis = self.ledger.genesis().clone();
-        let cur = crate::space::replay(&genesis, &self.space, &self.ledger.ceremony_events());
+        let cur =
+            crate::space::replay(&genesis, &self.space, &self.ledger.space_authority_events());
         // Solo path: a held recovery key that IS the current authority signs the
         // Recover directly.
         if let Some(secret) = self.read_space_recovery_key() {
@@ -96,7 +97,7 @@ impl Inner {
             gen: cur.gen + 1,
         };
         let ev = crate::space::sign_op(secret, &op, vec![], &self.space);
-        self.commit_ceremony(ev)?;
+        self.commit_space_authority(ev)?;
         // The re-root is now durable. The follow-on re-key fences the old root,
         // and if it fails the space is left re-rooted but readable under the old
         // key — degraded, not un-recovered. Reporting that as an error would
@@ -183,7 +184,7 @@ impl Inner {
             gen: cur.gen + 1,
         };
         let op_bytes = postcard::to_stdvec(&op).map_err(|e| anyhow!("encode recover op: {e}"))?;
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let threshold = board
             .dkg
@@ -213,7 +214,7 @@ impl Inner {
                 let Some(id) = crate::dkg::TranscriptId::of(&ev) else {
                     return Err(anyhow!("could not derive the request id"));
                 };
-                self.commit_ceremony(ev)?;
+                self.commit_ceremony_material(ev)?;
                 id
             }
         };
@@ -234,7 +235,7 @@ impl Inner {
         let after = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         let installed = after.gen > cur.gen && after.root == vec![me_actor.clone()];
         // If the re-root installed on this pass, a follow-on failure *is* the
@@ -296,7 +297,7 @@ impl Inner {
         // The exact op the request asks the group to sign, taken from the
         // VERIFIED board and from the transcript the id names — not from the
         // first raw decode that happens to match.
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let request = board.signing.get(&session).and_then(|t| t.request.as_ref());
         let Some((op_bytes, req_target)) = request.and_then(|r| match &r.op {
@@ -320,7 +321,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         let target = match postcard::from_bytes::<crate::space::SpaceOp>(&op_bytes) {
             Ok(crate::space::SpaceOp::Recover { new_root, gen })
@@ -431,9 +432,9 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         board
             .dkg
@@ -540,7 +541,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         let holds_solo = self
             .read_space_recovery_key()
@@ -608,7 +609,7 @@ impl Inner {
         // it consents to. Written before posting so a crash leaves an orphan
         // marker (harmless) rather than a proposal nobody will install.
         self.dkg_write(&transcript, "intent", transcript.to_hex().as_bytes())?;
-        self.commit_ceremony(ev)?;
+        self.commit_ceremony_material(ev)?;
 
         // ---- the proposal is durable from here ----
         //
@@ -637,7 +638,7 @@ impl Inner {
                         &crate::dkg::CeremonyOp::DkgAuthorize(grant),
                         &self.space,
                     );
-                    incomplete = self.commit_ceremony(auth_ev).err();
+                    incomplete = self.commit_ceremony_material(auth_ev).err();
                 }
                 None => incomplete = Some(anyhow!("recovery key disappeared mid-elevation")),
             }
@@ -690,7 +691,7 @@ impl Inner {
             .ok_or_else(|| anyhow!("cannot derive the current group key"))?;
         let (op_bytes, _payload) =
             crate::dkg::authority_grant_payload(&self.space, &group_key, proposal);
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let threshold = board
             .dkg
@@ -718,7 +719,7 @@ impl Inner {
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space);
                 let id = crate::dkg::TranscriptId::of(&ev)
                     .ok_or_else(|| anyhow!("could not derive the request id"))?;
-                self.commit_ceremony(ev)?;
+                self.commit_ceremony_material(ev)?;
                 changed = true;
                 id
             }
@@ -756,7 +757,7 @@ impl Inner {
                 "this device holds no share of the current group key — nothing to co-sign",
             ));
         }
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let Some((op_bytes, target)) = board
             .signing
@@ -883,7 +884,7 @@ impl Inner {
         // discovered session, so forged events both manufactured transcripts and
         // multiplied the work (`transcripts × board`, attacker-controlled on
         // both axes).
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         // Per-transcript advancement is best-effort: a malformed, signature-valid
         // package from one participant must never fail the whole import (which
@@ -947,7 +948,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         crate::space::recovery_commit(&claimed.public_key) == Some(cur.recovery_commit)
             && claimed.configuration == cur.configuration
@@ -1039,7 +1040,7 @@ impl Inner {
         // The ceremony to export for: one we hold a share of. A pending
         // arrangement takes precedence, since that is the one whose install is
         // waiting on this attestation.
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let standing = self.active_dkg_session();
         let Some(dkg) = board
@@ -1163,7 +1164,7 @@ impl Inner {
         }
         self.post_ceremony(crate::dkg::CeremonyOp::CustodyAck { dkg })?;
         // Recompute from the board so the count reflects our own attestation.
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let outstanding = board
             .dkg
@@ -1212,7 +1213,7 @@ impl Inner {
         let Some(dkg) = crate::dkg::TranscriptId::parse_hex(&package.ceremony) else {
             return Err(anyhow!("that package names no valid ceremony"));
         };
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let Some(t) = board.dkg.get(&dkg) else {
             return Err(anyhow!(
@@ -1323,7 +1324,7 @@ impl Inner {
         // case worth reporting: its install is blocked on this device, and
         // saying "Ready" because some other authority is currently fine would
         // hide the one thing the operator needs to act on.
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let mine: Vec<crate::dkg::TranscriptId> = board
             .dkg
@@ -1423,7 +1424,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         if let Some(secret) = self.read_space_recovery_key() {
             let pubkey = crate::space::recovery_pub_of(&secret);
@@ -1536,7 +1537,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         // `parse_board` already checked every detached signature; what it cannot
         // know is which signer is the standing authority. Scanning ALL retained
@@ -1593,7 +1594,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         self.dkg_manifests().into_iter().find_map(|(id, _)| {
             (self
@@ -1878,13 +1879,13 @@ impl Inner {
                 crate::dkg::SignTarget::SpaceOp => {
                     let fresh = !self
                         .ledger
-                        .ceremony_events()
+                        .space_authority_events()
                         .iter()
                         .any(|e| e.hash() == node.hash());
                     if fresh
                         && node.verify_sig(crate::space::SPACE_EVENT_DOMAIN, self.space.as_str())
                     {
-                        self.commit_ceremony(node)?;
+                        self.commit_space_authority(node)?;
                         // The re-root is durable now. Re-keying fences the old
                         // root, and if it fails the space stays readable under
                         // the old key — a degraded state, not a failed recovery.
@@ -1899,7 +1900,7 @@ impl Inner {
                 }
                 crate::dkg::SignTarget::AuthorityGrant => {
                     if crate::dkg::authority_grant_of(&node, &self.space).is_some() {
-                        let already = self.ledger.ceremony_events().iter().any(|e| {
+                        let already = self.ledger.ceremony_nodes().iter().any(|e| {
                             matches!(
                                 postcard::from_bytes::<crate::dkg::CeremonyOp>(&e.op),
                                 Ok(crate::dkg::CeremonyOp::DkgAuthorize(g)) if g.hash() == node.hash()
@@ -1935,7 +1936,7 @@ impl Inner {
             let cur = crate::space::replay(
                 &self.ledger.genesis().clone(),
                 &self.space,
-                &self.ledger.ceremony_events(),
+                &self.ledger.space_authority_events(),
             );
             // Pin WHICH authorization we accepted, not merely that one existed.
             let authorized_by = t
@@ -2086,7 +2087,7 @@ impl Inner {
         let cur = crate::space::replay(
             &self.ledger.genesis().clone(),
             &self.space,
-            &self.ledger.ceremony_events(),
+            &self.ledger.space_authority_events(),
         );
         let already = crate::space::recovery_commit(&group_key) == Some(cur.recovery_commit);
         if already {
@@ -2130,7 +2131,7 @@ impl Inner {
                     gen: cur.gen + 1,
                 };
                 let ev = crate::space::sign_op(&secret, &op, vec![], &self.space);
-                self.commit_ceremony(ev)?;
+                self.commit_space_authority(ev)?;
                 return Ok(true);
             }
         }
@@ -2181,7 +2182,7 @@ impl Inner {
             gen,
         };
         let op_bytes = postcard::to_stdvec(&op)?;
-        let events = self.ledger.ceremony_events();
+        let events = self.ledger.ceremony_nodes();
         let board = self.ceremony_board(&events);
         let threshold = board
             .dkg
@@ -2209,7 +2210,7 @@ impl Inner {
                 let ev = crate::dkg::sign_ceremony(&self.seed, &req, &self.space);
                 let id = crate::dkg::TranscriptId::of(&ev)
                     .ok_or_else(|| anyhow!("could not derive the request id"))?;
-                self.commit_ceremony(ev)?;
+                self.commit_ceremony_material(ev)?;
                 changed = true;
                 id
             }
@@ -2223,7 +2224,7 @@ impl Inner {
 
     fn post_ceremony(&mut self, op: crate::dkg::CeremonyOp) -> Result<()> {
         let ev = crate::dkg::sign_ceremony(&self.seed, &op, &self.space);
-        self.commit_ceremony(ev)
+        self.commit_ceremony_material(ev)
     }
 }
 

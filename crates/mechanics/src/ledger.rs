@@ -85,16 +85,23 @@ impl From<JournalError> for LedgerError {
     }
 }
 
-/// One replicated authority effect: a signed node on one of the three
-/// mechanics planes. The canonical wire encoding is postcard of this enum.
+/// One replicated **authoritative** effect: a signed node on one of the three
+/// mechanics authority planes. The canonical wire encoding is postcard of this
+/// enum (variant tags 0/1/2 — [`CeremonyMaterial`] owns the distinct tag 3 and
+/// is *not* a `LedgerEffect`: ceremony transcript traffic never enters an
+/// authority frontier).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LedgerEffect {
     /// Actor-plane event (inception, device add/revoke, recovery rotate).
     Actor(SignedEvent),
     /// Membership/ACL op (add/remove/grants/epoch mint/invite revoke).
     Acl(SignedOp),
-    /// Ceremony/space event (recovery, elevation, reshare control plane).
-    Ceremony(SignedSpaceEvent),
+    /// A **terminal** space-authority event (`Recover` / `Rotate` / `Reshare`
+    /// installation) under the Space-event signing domain — the ONLY ceremony
+    /// outcome that is an authority effect. A successful transcript produces
+    /// exactly one of these; proposals, rounds, custody attestations and
+    /// completion progress are [`CeremonyMaterial`] and never appear here.
+    SpaceAuthority(SignedSpaceEvent),
 }
 
 impl LedgerEffect {
@@ -118,26 +125,22 @@ impl LedgerEffect {
     /// The effect's content hash — its inner signed node's DAG hash.
     pub fn hash(&self) -> String {
         match self {
-            LedgerEffect::Actor(n) | LedgerEffect::Acl(n) | LedgerEffect::Ceremony(n) => n.hash(),
+            LedgerEffect::Actor(n) | LedgerEffect::Acl(n) | LedgerEffect::SpaceAuthority(n) => {
+                n.hash()
+            }
         }
     }
 
     /// Verify the effect's signature under its plane's domain for `space`.
+    /// Each variant admits exactly ONE signing domain — a ceremony-domain node
+    /// wrapped as `SpaceAuthority` (or any other cross-domain substitution)
+    /// fails here, refusing the whole batch before journal mutation.
     pub fn verify(&self, space: &SpaceId) -> bool {
         match self {
             LedgerEffect::Actor(n) => n.verify_sig(actor::ACTOR_DOMAIN, space.as_str()),
             LedgerEffect::Acl(n) => n.verify_sig(acl::ACL_DOMAIN, space.as_str()),
-            // A ceremony effect is either a terminal space event (Recover /
-            // Rotate, `SPACE_EVENT_DOMAIN`) or a FROST ceremony-board node
-            // (propose / authorize / round / sign, `CEREMONY_DOMAIN`). Both
-            // ride this variant so the whole ceremony transcript replicates and
-            // replays from the one effect history; `parse_board` re-verifies
-            // each node under `CEREMONY_DOMAIN` and `space::replay` under
-            // `SPACE_EVENT_DOMAIN`, so a node lands where its own domain admits
-            // it and nowhere else.
-            LedgerEffect::Ceremony(n) => {
+            LedgerEffect::SpaceAuthority(n) => {
                 n.verify_sig(crate::space::SPACE_EVENT_DOMAIN, space.as_str())
-                    || n.verify_sig(crate::dkg::CEREMONY_DOMAIN, space.as_str())
             }
         }
     }
@@ -146,14 +149,129 @@ impl LedgerEffect {
         match self {
             LedgerEffect::Actor(_) => 0,
             LedgerEffect::Acl(_) => 1,
-            LedgerEffect::Ceremony(_) => 2,
+            LedgerEffect::SpaceAuthority(_) => 2,
         }
     }
 
     fn parents(&self) -> &[String] {
         match self {
-            LedgerEffect::Actor(n) | LedgerEffect::Acl(n) | LedgerEffect::Ceremony(n) => &n.parents,
+            LedgerEffect::Actor(n) | LedgerEffect::Acl(n) | LedgerEffect::SpaceAuthority(n) => {
+                &n.parents
+            }
         }
+    }
+}
+
+/// The encoded material-class tag [`CeremonyMaterial`] leads with — distinct
+/// from every [`LedgerEffect`] variant tag (0/1/2), so neither class of bytes
+/// can decode as the other.
+pub const CEREMONY_MATERIAL_TAG: u8 = 3;
+
+/// One replicated **ceremony-material** record: a FROST ceremony-board node
+/// (proposal, authorization, DKG/signing round, custody attestation,
+/// completion/abort progress) under the ceremony signing domain.
+///
+/// Ceremony material shares the one crash-safe Mechanics journal and the
+/// mechanics-material Contact channel with authority effects, but it is a
+/// distinct tagged material class with its own bounded synchronization cursor:
+/// it never enters an [`AuthorityFrontier`], an authority checkpoint, a World
+/// transaction, or an authorization receipt, and lifetime transcript traffic
+/// never grows an ordinary frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeremonyMaterial {
+    /// Always [`CEREMONY_MATERIAL_TAG`]; validated on decode.
+    tag: u8,
+    /// The signed ceremony-board node (verified ONLY under the ceremony
+    /// domain — a Space-event-domain node substituted here rejects).
+    pub node: SignedSpaceEvent,
+}
+
+impl CeremonyMaterial {
+    pub fn new(node: SignedSpaceEvent) -> Self {
+        Self {
+            tag: CEREMONY_MATERIAL_TAG,
+            node,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("encode ceremony material")
+    }
+
+    /// Canonical decode: tag check plus exact re-encode equality.
+    pub fn decode(bytes: &[u8]) -> Result<Self, LedgerError> {
+        let material: CeremonyMaterial = postcard::from_bytes(bytes)
+            .map_err(|e| LedgerError::InvalidRecord(format!("undecodable ceremony record: {e}")))?;
+        if material.tag != CEREMONY_MATERIAL_TAG {
+            return Err(LedgerError::InvalidRecord(format!(
+                "ceremony record carries material-class tag {} (expected {CEREMONY_MATERIAL_TAG})",
+                material.tag
+            )));
+        }
+        if material.encode() != bytes {
+            return Err(LedgerError::InvalidRecord(
+                "non-canonical ceremony record encoding".into(),
+            ));
+        }
+        Ok(material)
+    }
+
+    /// The node's content hash.
+    pub fn hash(&self) -> String {
+        self.node.hash()
+    }
+
+    /// Verify under the **ceremony** signing domain only. A terminal
+    /// Space-authority event smuggled into the ceremony class fails here.
+    pub fn verify(&self, space: &SpaceId) -> bool {
+        self.node
+            .verify_sig(crate::dkg::CEREMONY_DOMAIN, space.as_str())
+    }
+}
+
+/// BLAKE3 derive-key context for a ceremony compaction audit commitment.
+const CEREMONY_AUDIT_CONTEXT: &str = "lait.ceremony-audit.v1";
+
+/// The durable audit record terminal ceremony compaction leaves behind: a
+/// commitment over the exact dropped packet hashes, so the terminal outcome
+/// remains auditable after its transcript traffic is reclaimed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeremonyAuditRecord {
+    pub version: u16,
+    pub space: SpaceId,
+    /// Sorted hashes of the dropped ceremony packets.
+    pub dropped: Vec<String>,
+    /// The commitment over `space` + `dropped` (derive-key, domain-separated).
+    pub commitment: [u8; 32],
+}
+
+impl CeremonyAuditRecord {
+    fn build(space: &SpaceId, mut dropped: Vec<String>) -> Self {
+        dropped.sort();
+        dropped.dedup();
+        let mut input = Vec::new();
+        input.extend_from_slice(space.as_str().as_bytes());
+        input.push(0x00);
+        for h in &dropped {
+            input.extend_from_slice(&(h.len() as u64).to_be_bytes());
+            input.extend_from_slice(h.as_bytes());
+        }
+        let commitment = blake3::derive_key(CEREMONY_AUDIT_CONTEXT, &input);
+        Self {
+            version: 1,
+            space: space.clone(),
+            dropped,
+            commitment,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        postcard::to_stdvec(self).expect("encode ceremony audit")
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, LedgerError> {
+        postcard::from_bytes(bytes)
+            .map_err(|e| LedgerError::Corrupt(format!("ceremony audit: {e}")))
     }
 }
 
@@ -196,7 +314,10 @@ struct FrontierBody {
     version: u16,
     acl_heads: Vec<String>,
     actor_heads: Vec<String>,
-    ceremony_heads: Vec<String>,
+    /// Heads of the terminal Space-authority plane (kind 2). Terminal effects
+    /// are rare — one per completed recovery/elevation/reshare — so this list
+    /// stays bounded; ceremony transcript traffic never appears here.
+    space_authority_heads: Vec<String>,
 }
 
 impl FrontierBody {
@@ -213,7 +334,11 @@ impl FrontierBody {
                 body.version
             )));
         }
-        for list in [&body.acl_heads, &body.actor_heads, &body.ceremony_heads] {
+        for list in [
+            &body.acl_heads,
+            &body.actor_heads,
+            &body.space_authority_heads,
+        ] {
             if list.windows(2).any(|w| w[0] >= w[1]) {
                 return Err(LedgerError::MalformedFrontier(
                     "frontier heads unsorted or duplicated".into(),
@@ -375,6 +500,10 @@ struct CheckpointObject {
     /// Sorted hashes of the actor events in the closure (the continuation
     /// precondition input).
     actor_events: Vec<String>,
+    /// Sorted hashes of the terminal Space-authority events in the closure —
+    /// they seed the effective bootstrap root, so a continuation is only valid
+    /// while this set is unchanged.
+    space_events: Vec<String>,
     replay: ReplayCheckpoint,
 }
 
@@ -394,6 +523,12 @@ struct LedgerMeta {
     receipts: Vec<([u8; 32], ObjectRef)>,
     /// The current frontier's canonical bytes.
     frontier: Vec<u8>,
+    /// The ceremony-material log: (sequence, node hash, object), append order.
+    ceremony: Vec<(u64, String, ObjectRef)>,
+    /// The next ceremony sequence — the bounded synchronization cursor.
+    ceremony_next_seq: u64,
+    /// Durable compaction audit records: (commitment, object).
+    ceremony_audits: Vec<([u8; 32], ObjectRef)>,
 }
 
 /// A resolved view of the authority state at one frontier.
@@ -446,6 +581,14 @@ pub struct AuthorityLedger {
     receipts: BTreeMap<[u8; 32], BatchReceipt>,
     receipt_refs: BTreeMap<[u8; 32], ObjectRef>,
     frontier: Vec<u8>,
+    /// The ceremony-material log, in append (sequence) order.
+    ceremony: Vec<(u64, String, SignedSpaceEvent)>,
+    /// Held ceremony records by node hash → (sequence, object).
+    ceremony_refs: BTreeMap<String, (u64, ObjectRef)>,
+    /// The next ceremony sequence to assign (the bounded cursor).
+    ceremony_next_seq: u64,
+    /// Durable compaction audit records: (commitment, object), oldest first.
+    ceremony_audits: Vec<([u8; 32], ObjectRef)>,
     /// The replay-semantics version this handle materializes at (the crate
     /// const in production; parameterized so the explicit rebuild path is
     /// testable).
@@ -477,6 +620,10 @@ impl AuthorityLedger {
             receipts: BTreeMap::new(),
             receipt_refs: BTreeMap::new(),
             frontier: Vec::new(),
+            ceremony: Vec::new(),
+            ceremony_refs: BTreeMap::new(),
+            ceremony_next_seq: 0,
+            ceremony_audits: Vec::new(),
             semantics: LEDGER_SEMANTICS_VERSION,
         };
         // Commit the empty-frontier baseline: genesis-only state, materialized.
@@ -569,6 +716,49 @@ impl AuthorityLedger {
             // A stale-semantics checkpoint is dropped from the index: state is
             // rebuilt from the signed effects on demand.
         }
+        let mut ceremony: Vec<(u64, String, SignedSpaceEvent)> = Vec::new();
+        let mut ceremony_refs = BTreeMap::new();
+        for (seq, hash, obj) in &meta.ceremony {
+            let bytes = store.read_object(obj)?;
+            let material = CeremonyMaterial::decode(&bytes)
+                .map_err(|e| LedgerError::Corrupt(format!("stored ceremony record: {e}")))?;
+            if material.hash() != *hash {
+                return Err(LedgerError::Corrupt(format!(
+                    "stored ceremony record {hash} fails its index binding"
+                )));
+            }
+            if !material.verify(&meta.genesis.space_id) {
+                return Err(LedgerError::Corrupt(format!(
+                    "stored ceremony record {hash} fails ceremony-domain verification"
+                )));
+            }
+            ceremony.push((*seq, hash.clone(), material.node));
+            ceremony_refs.insert(hash.clone(), (*seq, *obj));
+        }
+        ceremony.sort_by_key(|(seq, _, _)| *seq);
+        if ceremony
+            .iter()
+            .any(|(seq, _, _)| *seq >= meta.ceremony_next_seq)
+        {
+            return Err(LedgerError::Corrupt(
+                "ceremony log sequence exceeds its cursor".into(),
+            ));
+        }
+        let mut ceremony_audits = Vec::new();
+        for (commitment, obj) in &meta.ceremony_audits {
+            let bytes = store.read_object(obj)?;
+            let audit = CeremonyAuditRecord::decode(&bytes)?;
+            if audit.commitment != *commitment
+                || CeremonyAuditRecord::build(&meta.genesis.space_id, audit.dropped.clone())
+                    .commitment
+                    != *commitment
+            {
+                return Err(LedgerError::Corrupt(
+                    "ceremony audit record fails its commitment binding".into(),
+                ));
+            }
+            ceremony_audits.push((*commitment, *obj));
+        }
         let frontier = meta.frontier.clone();
         let genesis = meta.genesis.clone();
         let mut ledger = Self {
@@ -582,6 +772,10 @@ impl AuthorityLedger {
             receipts,
             receipt_refs,
             frontier,
+            ceremony,
+            ceremony_refs,
+            ceremony_next_seq: meta.ceremony_next_seq,
+            ceremony_audits,
             semantics,
         };
         // The current frontier must be materializable (rebuilds if stale).
@@ -674,15 +868,173 @@ impl AuthorityLedger {
             .collect()
     }
 
-    /// All held ceremony/space events.
-    pub fn ceremony_events(&self) -> Vec<SignedSpaceEvent> {
+    /// All held **terminal** Space-authority events (kind 2) — the input to
+    /// `space::replay`. Ceremony transcript traffic is NOT here; see
+    /// [`AuthorityLedger::ceremony_nodes`].
+    pub fn space_authority_events(&self) -> Vec<SignedSpaceEvent> {
         self.effects
             .values()
             .filter_map(|e| match e {
-                LedgerEffect::Ceremony(ev) => Some(ev.clone()),
+                LedgerEffect::SpaceAuthority(ev) => Some(ev.clone()),
                 _ => None,
             })
             .collect()
+    }
+
+    // ---- the ceremony-material class: its own log, cursor and retention ----
+
+    /// The verified ceremony-board nodes, in append order — the bounded
+    /// projection input for `dkg::parse_board`.
+    pub fn ceremony_nodes(&self) -> Vec<SignedSpaceEvent> {
+        self.ceremony.iter().map(|(_, _, n)| n.clone()).collect()
+    }
+
+    /// The ceremony log's bounded synchronization cursor: the next sequence
+    /// number this ledger will assign. Monotone across appends, restarts and
+    /// compaction (compaction never renumbers).
+    pub fn ceremony_cursor(&self) -> u64 {
+        self.ceremony_next_seq
+    }
+
+    /// The held ceremony records with sequence >= `cursor`, as
+    /// `(sequence, canonical record bytes)` — the incremental-sync seam. A
+    /// consumer resumes from its durable cursor instead of rescanning history.
+    pub fn ceremony_after(&self, cursor: u64) -> Vec<(u64, Vec<u8>)> {
+        self.ceremony
+            .iter()
+            .filter(|(seq, _, _)| *seq >= cursor)
+            .map(|(seq, _, n)| (*seq, CeremonyMaterial::new(n.clone()).encode()))
+            .collect()
+    }
+
+    /// Every currently retained ceremony record's canonical bytes (the Contact
+    /// export seam). Post-compaction, terminal transcript traffic is absent.
+    pub fn export_ceremony(&self) -> Vec<Vec<u8>> {
+        self.ceremony
+            .iter()
+            .map(|(_, _, n)| CeremonyMaterial::new(n.clone()).encode())
+            .collect()
+    }
+
+    /// The durable ceremony compaction audit commitments, oldest first.
+    pub fn ceremony_audit_commitments(&self) -> Vec<[u8; 32]> {
+        self.ceremony_audits.iter().map(|(c, _)| *c).collect()
+    }
+
+    /// Durably, atomically append one ceremony-material batch: canonical
+    /// [`CeremonyMaterial`] records, **validated completely in memory first**
+    /// under the ceremony signing domain — one undecodable, misbound, or
+    /// cross-domain record refuses the whole batch with the durable ledger
+    /// unchanged. Idempotent by node hash: an already-held record is skipped,
+    /// and a batch with nothing new writes nothing. The ordinary authority
+    /// frontier, checkpoints and receipts are untouched — ceremony material
+    /// never enters them. Returns the resulting cursor.
+    pub fn commit_ceremony_batch(&mut self, records: &[Vec<u8>]) -> Result<u64, LedgerError> {
+        // 1. Validate the complete batch in memory.
+        let mut fresh: Vec<(String, SignedSpaceEvent, Vec<u8>)> = Vec::new();
+        for record in records {
+            let material = CeremonyMaterial::decode(record)?;
+            if !material.verify(&self.genesis.space_id) {
+                return Err(LedgerError::InvalidRecord(format!(
+                    "ceremony record {} fails ceremony-domain verification for this Space",
+                    material.hash()
+                )));
+            }
+            let hash = material.hash();
+            if self.ceremony_refs.contains_key(&hash) {
+                continue; // already held: idempotent
+            }
+            if fresh.iter().any(|(h, _, _)| h == &hash) {
+                continue;
+            }
+            fresh.push((hash, material.node, record.clone()));
+        }
+        if fresh.is_empty() {
+            return Ok(self.ceremony_next_seq);
+        }
+
+        // 2. Stage: assign monotone sequences and object refs.
+        let prior_next = self.ceremony_next_seq;
+        let mut new_objects: Vec<Vec<u8>> = Vec::new();
+        for (hash, node, bytes) in &fresh {
+            let obj = ObjectRef {
+                hash: journal::object_content_hash(bytes),
+                len: bytes.len() as u64,
+            };
+            let seq = self.ceremony_next_seq;
+            self.ceremony_next_seq += 1;
+            self.ceremony.push((seq, hash.clone(), node.clone()));
+            self.ceremony_refs.insert(hash.clone(), (seq, obj));
+            new_objects.push(bytes.clone());
+        }
+        let (mut keep, meta) = self.assemble_meta();
+        let new_hashes: BTreeSet<[u8; 32]> = new_objects
+            .iter()
+            .map(|b| journal::object_content_hash(b))
+            .collect();
+        keep.retain(|r| !new_hashes.contains(&r.hash));
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        new_objects.retain(|b| seen.insert(journal::object_content_hash(b)));
+
+        // 3. One journal commit; unwind the staged in-memory state on failure.
+        if let Err(e) = self.store.commit(&new_objects, &keep, meta) {
+            for (hash, _, _) in &fresh {
+                self.ceremony_refs.remove(hash);
+            }
+            self.ceremony.retain(|(seq, _, _)| *seq < prior_next);
+            self.ceremony_next_seq = prior_next;
+            return Err(e.into());
+        }
+        Ok(self.ceremony_next_seq)
+    }
+
+    /// Compact terminal ceremony transcript traffic: durably drop the named
+    /// packet hashes, recording a [`CeremonyAuditRecord`] whose commitment
+    /// covers exactly the dropped set — in the SAME journal commit, so the
+    /// audit commitment is durable before (never after) the material is gone.
+    /// Every named hash must be held; the cursor is never renumbered. Which
+    /// packets are *safe* to drop (terminal, not active, not required for
+    /// validation or custody evidence) is the caller's policy — see
+    /// `ceremony::terminal_compactable`.
+    pub fn compact_ceremony(&mut self, drop_hashes: &[String]) -> Result<[u8; 32], LedgerError> {
+        for h in drop_hashes {
+            if !self.ceremony_refs.contains_key(h) {
+                return Err(LedgerError::InvalidRecord(format!(
+                    "compaction names an unheld ceremony record {h}"
+                )));
+            }
+        }
+        if drop_hashes.is_empty() {
+            return Err(LedgerError::InvalidRecord(
+                "compaction with an empty drop set".into(),
+            ));
+        }
+        let audit = CeremonyAuditRecord::build(&self.genesis.space_id, drop_hashes.to_vec());
+        let audit_bytes = audit.encode();
+        let audit_obj = ObjectRef {
+            hash: journal::object_content_hash(&audit_bytes),
+            len: audit_bytes.len() as u64,
+        };
+
+        // Stage: remove the dropped records, add the audit.
+        let dropped: BTreeSet<&String> = drop_hashes.iter().collect();
+        let prior_ceremony = self.ceremony.clone();
+        let prior_refs = self.ceremony_refs.clone();
+        self.ceremony.retain(|(_, h, _)| !dropped.contains(h));
+        for h in &dropped {
+            self.ceremony_refs.remove(*h);
+        }
+        self.ceremony_audits.push((audit.commitment, audit_obj));
+        let (mut keep, meta) = self.assemble_meta();
+        keep.retain(|r| r.hash != audit_obj.hash);
+
+        if let Err(e) = self.store.commit(&[audit_bytes], &keep, meta) {
+            self.ceremony = prior_ceremony;
+            self.ceremony_refs = prior_refs;
+            self.ceremony_audits.pop();
+            return Err(e.into());
+        }
+        Ok(audit.commitment)
     }
 
     /// The heads of one actor's event log — the `actor_asof` frontier an
@@ -748,7 +1100,7 @@ impl AuthorityLedger {
             version: 1,
             acl_heads: self.plane_heads(1),
             actor_heads: self.plane_heads(0),
-            ceremony_heads: self.plane_heads(2),
+            space_authority_heads: self.plane_heads(2),
         }
     }
 
@@ -955,7 +1307,7 @@ impl AuthorityLedger {
         for (heads, kind) in [
             (&body.acl_heads, 1u8),
             (&body.actor_heads, 0u8),
-            (&body.ceremony_heads, 2u8),
+            (&body.space_authority_heads, 2u8),
         ] {
             for h in heads {
                 match self.effects.get(h) {
@@ -1032,6 +1384,13 @@ impl AuthorityLedger {
     /// Replay the closure of `body` into a checkpoint object. Uses the
     /// strict-descendant continuation from the best durable ancestor
     /// checkpoint when its preconditions hold; falls back to complete replay.
+    ///
+    /// The **effective bootstrap root** seeds the ACL replay: the terminal
+    /// Space-authority events in the closure replay to a `RootState`, and a
+    /// `Recover` replaces the genesis root exactly as the space plane
+    /// specifies. Continuation is only valid while the closure's space-event
+    /// set is unchanged (a terminal effect re-seeds the root, so the suffix
+    /// rule no longer applies).
     fn build_checkpoint(
         &mut self,
         body: &FrontierBody,
@@ -1053,13 +1412,26 @@ impl AuthorityLedger {
             })
             .collect();
         let actor_hashes: BTreeSet<String> = actor_events.iter().map(|e| e.hash()).collect();
+        let space_events: Vec<SignedSpaceEvent> = closure
+            .iter()
+            .filter_map(|h| match self.effects.get(h) {
+                Some(LedgerEffect::SpaceAuthority(ev)) => Some(ev.clone()),
+                _ => None,
+            })
+            .collect();
+        let space_hashes: BTreeSet<String> = space_events.iter().map(|e| e.hash()).collect();
+        let root_state = crate::space::replay(&self.genesis, &self.genesis.space_id, &space_events);
+        let effective_genesis = Genesis {
+            founding_actors: root_state.root,
+            ..self.genesis.clone()
+        };
 
         // Try continuation from the current frontier's cached checkpoint (the
         // common case: a new batch extends the tip).
         let replay = self
-            .try_continue(&actor_events, &acl_ops)
+            .try_continue(&effective_genesis, &space_hashes, &actor_events, &acl_ops)
             .unwrap_or_else(|| {
-                let (cp, _) = acl::replay_checkpointed(&self.genesis, &actor_events, &acl_ops);
+                let (cp, _) = acl::replay_checkpointed(&effective_genesis, &actor_events, &acl_ops);
                 cp
             });
 
@@ -1068,24 +1440,33 @@ impl AuthorityLedger {
             frontier: frontier_bytes.to_vec(),
             effect_set: closure.into_iter().collect(),
             actor_events: actor_hashes.into_iter().collect(),
+            space_events: space_hashes.into_iter().collect(),
             replay,
         })
     }
 
     /// The strict-descendant continuation attempt, from the current frontier's
-    /// in-memory checkpoint.
+    /// in-memory checkpoint. Refused when the space-event set changed: a
+    /// terminal Space-authority effect re-seeds the effective root, so the
+    /// prior materialization is not a valid replay prefix.
     fn try_continue(
         &self,
+        effective_genesis: &Genesis,
+        space_hashes: &BTreeSet<String>,
         actor_events: &[SignedEvent],
         acl_ops: &[SignedOp],
     ) -> Option<ReplayCheckpoint> {
         let digest = frontier_digest(&self.genesis.space_id, &self.frontier);
         let prior = self.checkpoint_cache.get(&digest)?;
+        let prior_space: BTreeSet<String> = prior.space_events.iter().cloned().collect();
+        if prior_space != *space_hashes {
+            return None;
+        }
         let prior_actor: BTreeSet<String> = prior.actor_events.iter().cloned().collect();
         acl::replay_continue(
             &prior.replay,
             &prior_actor,
-            &self.genesis,
+            effective_genesis,
             actor_events,
             acl_ops,
         )
@@ -1138,6 +1519,17 @@ impl AuthorityLedger {
             receipts.push((*digest, *obj));
             keep.push(*obj);
         }
+        let mut ceremony = Vec::new();
+        for (seq, hash, _) in &self.ceremony {
+            let (_, obj) = self.ceremony_refs[hash];
+            ceremony.push((*seq, hash.clone(), obj));
+            keep.push(obj);
+        }
+        let mut ceremony_audits = Vec::new();
+        for (commitment, obj) in &self.ceremony_audits {
+            ceremony_audits.push((*commitment, *obj));
+            keep.push(*obj);
+        }
         let meta = LedgerMeta {
             version: 1,
             genesis: self.genesis.clone(),
@@ -1146,6 +1538,9 @@ impl AuthorityLedger {
             checkpoints,
             receipts,
             frontier: self.frontier.clone(),
+            ceremony,
+            ceremony_next_seq: self.ceremony_next_seq,
+            ceremony_audits,
         };
         keep.sort_by_key(|r| r.hash);
         keep.dedup_by_key(|r| r.hash);
@@ -1534,7 +1929,7 @@ mod tests {
             version: 1,
             acl_heads: vec!["ab".repeat(32)],
             actor_heads: vec![],
-            ceremony_heads: vec![],
+            space_authority_heads: vec![],
         }
         .encode();
         match ledger.state_at(&fake) {
@@ -1560,7 +1955,7 @@ mod tests {
                 version: 2,
                 acl_heads: vec![],
                 actor_heads: vec![],
-                ceremony_heads: vec![],
+                space_authority_heads: vec![],
             }
             .encode(),
         ] {
@@ -1574,7 +1969,7 @@ mod tests {
             version: 1,
             acl_heads: vec!["bb".repeat(32), "aa".repeat(32)],
             actor_heads: vec![],
-            ceremony_heads: vec![],
+            space_authority_heads: vec![],
         };
         let bytes = postcard::to_stdvec(&unsorted).unwrap();
         match ledger.state_at(&bytes) {

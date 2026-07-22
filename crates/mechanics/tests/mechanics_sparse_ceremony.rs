@@ -106,8 +106,13 @@ fn ten_thousand_ordinary_operations_invoke_no_ceremony() {
             .commit_batch(&[LedgerEffect::Acl(op).encode()], &[])
             .unwrap();
         assert!(
-            ledger.ceremony_events().is_empty(),
-            "an ordinary authority mutation must never emit a ceremony effect"
+            ledger.space_authority_events().is_empty(),
+            "an ordinary authority mutation must never emit a terminal space-authority effect"
+        );
+        assert_eq!(
+            ledger.ceremony_cursor(),
+            0,
+            "an ordinary authority mutation must never emit ceremony material"
         );
     }
 
@@ -132,8 +137,13 @@ fn ten_thousand_ordinary_operations_invoke_no_ceremony() {
 
     // The invariant: no ceremony effect exists after all this ordinary traffic.
     assert!(
-        ledger.ceremony_events().is_empty(),
+        ledger.space_authority_events().is_empty(),
         "ordinary World/authority traffic must invoke no ceremony/FROST"
+    );
+    assert_eq!(
+        ledger.ceremony_cursor(),
+        0,
+        "ordinary World/authority traffic must produce zero ceremony material"
     );
     let _ = demand;
     let _ = ActorId::from_incept_hash;
@@ -158,11 +168,33 @@ fn an_explicit_ceremony_command_is_the_positive_control() {
     ledger
         .commit_batch(&[LedgerEffect::Actor(incept).encode()], &[])
         .unwrap();
-    assert!(ledger.ceremony_events().is_empty());
+    assert!(ledger.space_authority_events().is_empty());
 
-    // A signed space/ceremony event (the elevation/recovery control plane) —
-    // the kind a FROST elevation produces and installs.
-    let ceremony = mechanics::space::sign_op(
+    // An explicit ceremony emits ceremony MATERIAL (proposal/round traffic on
+    // its own bounded log) followed by exactly ONE terminal SpaceAuthority
+    // effect that alone changes the standing recovery configuration.
+    let proposal = mechanics::dkg::sign_ceremony(
+        &seed(1),
+        &mechanics::dkg::CeremonyOp::DkgPropose(mechanics::dkg::frost_rotation_proposal(
+            [7u8; 16],
+            1,
+            vec![mechanics::authority::PrincipalId::of_device(
+                &mechanics::crypto::device_from_seed(&seed(1)),
+            )],
+            mechanics::authority::AuthorityId::single(mechanics::space::recovery_pub_of(&seed(1))),
+        )),
+        &space,
+    );
+    ledger
+        .commit_ceremony_batch(&[mechanics::ledger::CeremonyMaterial::new(proposal).encode()])
+        .unwrap();
+    assert_eq!(ledger.ceremony_cursor(), 1, "ceremony material logged");
+    assert!(
+        ledger.space_authority_events().is_empty(),
+        "ceremony material alone changes no authority"
+    );
+
+    let terminal = mechanics::space::sign_op(
         &seed(1),
         &mechanics::space::SpaceOp::Rotate {
             new_recovery_key: mechanics::space::recovery_pub_of(&seed(9)),
@@ -173,12 +205,12 @@ fn an_explicit_ceremony_command_is_the_positive_control() {
         &space,
     );
     ledger
-        .commit_batch(&[LedgerEffect::Ceremony(ceremony).encode()], &[])
+        .commit_batch(&[LedgerEffect::SpaceAuthority(terminal).encode()], &[])
         .unwrap();
     assert_eq!(
-        ledger.ceremony_events().len(),
+        ledger.space_authority_events().len(),
         1,
-        "an explicit ceremony command emits a ceremony effect"
+        "the transcript's ONE terminal effect lands on the authority plane"
     );
     cleanup(&dir);
 }

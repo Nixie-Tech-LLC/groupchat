@@ -98,9 +98,15 @@ fn persist_hex_key(dir: &Path, file: &str, secret: &[u8; 32]) -> Result<()> {
 /// One authority-record unit riding Contact's authority section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthorityRecord {
-    /// One canonical signed ledger effect (actor event, ACL op, or ceremony
-    /// event). Import validates the complete batch, then commits atomically.
+    /// One canonical signed ledger effect (actor event, ACL op, or terminal
+    /// SpaceAuthority event). Import validates the complete batch, then
+    /// commits atomically.
     Effect(Vec<u8>),
+    /// One canonical [`mechanics::ledger::CeremonyMaterial`] record — ceremony
+    /// transcript traffic under its distinct material-class tag and signing
+    /// domain. Rides the same mechanics channel but commits to the ledger's
+    /// separate bounded ceremony log, never an authority frontier.
+    Ceremony(Vec<u8>),
     /// One sealed key-epoch envelope record (canonical
     /// [`SealedKeyRecord`] bytes). Authorization is the signed mint;
     /// a forged envelope is inert.
@@ -253,15 +259,32 @@ impl Inner {
         Ok(())
     }
 
-    /// Append one signed ceremony/space event to the authority history as a
-    /// [`LedgerEffect::Ceremony`] — the orbital replacement for the legacy
-    /// `membership.add_ceremony_event` + `persist_membership`. Idempotent (the
-    /// ledger dedups by node hash), so replaying the same board node is a
-    /// no-op, and the node replicates to peers as an ordinary authority record.
-    pub(super) fn commit_ceremony(&mut self, ev: crate::space::SignedSpaceEvent) -> Result<()> {
+    /// Commit one **terminal** Space-authority event (`Recover` / `Rotate` /
+    /// `Reshare` installation) to the authority history as a
+    /// [`LedgerEffect::SpaceAuthority`]. This is the ONLY ceremony outcome
+    /// that enters an authority frontier; idempotent by node hash.
+    pub(super) fn commit_space_authority(
+        &mut self,
+        ev: crate::space::SignedSpaceEvent,
+    ) -> Result<()> {
         self.ledger
-            .commit_batch(&[LedgerEffect::Ceremony(ev).encode()], &[])
-            .map_err(|e| anyhow!("ceremony commit: {e}"))?;
+            .commit_batch(&[LedgerEffect::SpaceAuthority(ev).encode()], &[])
+            .map_err(|e| anyhow!("space-authority commit: {e}"))?;
+        Ok(())
+    }
+
+    /// Append one signed ceremony-board node to the ledger's **ceremony
+    /// material** log — proposals, authorizations, rounds, custody
+    /// attestations and progress. Distinct material class with its own
+    /// bounded cursor; never an authority-frontier head. Idempotent by node
+    /// hash, and the node replicates to peers as a `Ceremony` record.
+    pub(super) fn commit_ceremony_material(
+        &mut self,
+        ev: crate::space::SignedSpaceEvent,
+    ) -> Result<()> {
+        self.ledger
+            .commit_ceremony_batch(&[mechanics::ledger::CeremonyMaterial::new(ev).encode()])
+            .map_err(|e| anyhow!("ceremony-material commit: {e}"))?;
         Ok(())
     }
 
@@ -1273,6 +1296,9 @@ impl OrbitalMechanics {
         for sealed in inner.ledger.export_sealed() {
             records.push(AuthorityRecord::SealedKey(sealed).encode());
         }
+        for ceremony in inner.ledger.export_ceremony() {
+            records.push(AuthorityRecord::Ceremony(ceremony).encode());
+        }
         if let (Some(admission), Some(inception)) =
             (&inner.pending_admission, &inner.pending_inception)
         {
@@ -1548,12 +1574,14 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
         // admissions are redeemed after, each producing its own batch.
         let mut effects: Vec<Vec<u8>> = Vec::new();
         let mut sealed: Vec<Vec<u8>> = Vec::new();
+        let mut ceremony: Vec<Vec<u8>> = Vec::new();
         type Redemption = (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32]);
         let mut admissions: Vec<Redemption> = Vec::new();
         for raw in records {
             match AuthorityRecord::decode(raw) {
                 Some(AuthorityRecord::Effect(bytes)) => effects.push(bytes),
                 Some(AuthorityRecord::SealedKey(bytes)) => sealed.push(bytes),
+                Some(AuthorityRecord::Ceremony(bytes)) => ceremony.push(bytes),
                 Some(AuthorityRecord::Admission {
                     admission,
                     inception,
@@ -1563,10 +1591,28 @@ impl replica::AuthorityIncorporator for OrbitalMechanics {
                 None => return Err("unrecognized authority record".into()),
             }
         }
+        // Pre-validate the ceremony batch (decode + ceremony-domain signature)
+        // BEFORE committing anything, so one invalid record refuses the whole
+        // incorporation with the durable ledger unchanged — no material class
+        // commits ahead of another's validation failure.
+        for record in &ceremony {
+            let material =
+                mechanics::ledger::CeremonyMaterial::decode(record).map_err(|e| e.to_string())?;
+            if !material.verify(&inner.space) {
+                return Err("ceremony record fails ceremony-domain verification".into());
+            }
+        }
         let prior = inner.frontier();
         let receipt = inner
             .ledger
             .commit_batch(&effects, &sealed)
+            .map_err(|e| e.to_string())?;
+        // The ceremony-material class commits at its own linearization point,
+        // after the authority batch (a crash between the two exposes the
+        // complete earlier phase; idempotent retry re-lands the rest).
+        inner
+            .ledger
+            .commit_ceremony_batch(&ceremony)
             .map_err(|e| e.to_string())?;
         for (admission, inception, proof, coords_digest) in &admissions {
             // Best-effort: only an admin holding the key can redeem;
