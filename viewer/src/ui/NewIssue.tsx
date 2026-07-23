@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { X } from "lucide-react";
+import { Calendar, X } from "lucide-react";
 
 import { rpc } from "../api";
 import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
@@ -9,6 +9,7 @@ import {
   type LabelDto,
   type MemberDto,
   type Priority,
+  type ProjectDto,
   type WorkflowState,
 } from "../types";
 import { Avatar, AvatarStack } from "./Avatar";
@@ -38,16 +39,19 @@ export function NewIssue({
   spaceId,
   canonicalSpaceId,
   projectKey,
+  projects,
   states,
   labels,
   members,
   defaultStatus,
   onClose,
   onError,
+  onCreated,
 }: {
   spaceId: string;
   canonicalSpaceId: string;
   projectKey: string;
+  projects: ProjectDto[];
   states: WorkflowState[];
   labels: LabelDto[];
   members: MemberDto[];
@@ -55,11 +59,14 @@ export function NewIssue({
   defaultStatus?: string | undefined;
   onClose: () => void;
   onError: (m: string) => void;
+  onCreated: (message: string) => void;
 }) {
   const draftSubject = `new:${projectKey}`;
   const [title, setTitle] = useState(() => loadDraft(canonicalSpaceId, draftSubject, "new-title"));
   const [body, setBody] = useState(() => loadDraft(canonicalSpaceId, draftSubject, "new-body"));
   const [priority, setPriority] = useState<Priority>("none");
+  const [project, setProject] = useState(projectKey);
+  const [due, setDue] = useState("");
   const [status, setStatus] = useState(defaultStatus ?? states[0]?.id ?? "backlog");
   /** Label **names** — `issue_new` resolves names, not ids, and creates on first use. */
   const [picked, setPicked] = useState<string[]>([]);
@@ -67,6 +74,13 @@ export function NewIssue({
   const [assignees, setAssignees] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [again, setAgain] = useState(false);
+  const [failure, setFailure] = useState("");
+  const [recovered] = useState(() =>
+    Boolean(
+      loadDraft(canonicalSpaceId, draftSubject, "new-title") ||
+      loadDraft(canonicalSpaceId, draftSubject, "new-body"),
+    ),
+  );
 
   const state = states.find((s) => s.id === status) ?? null;
   const landsIn = states[0]?.id ?? "backlog";
@@ -84,6 +98,8 @@ export function NewIssue({
     const t = title.trim();
     if (!t || busy) return;
     setBusy(true);
+    setFailure("");
+    let created: string | null = null;
     try {
       const r = await rpc(spaceId, {
         cmd: "issue_new",
@@ -92,7 +108,10 @@ export function NewIssue({
         ...(priority !== "none" ? { priority } : {}),
         ...(picked.length ? { labels: picked } : {}),
         ...(assignees.length ? { assignees } : {}),
+        ...(project !== projectKey ? { project } : {}),
+        ...(due ? { due } : {}),
       });
+      if (r.kind === "ref") created = r.reff;
       // `issue_new` can't set status, so honour a non-default column with a
       // follow-up rather than pretending the field exists.
       if (r.kind === "ref" && status !== landsIn) {
@@ -105,12 +124,21 @@ export function NewIssue({
         // related issues shouldn't mean re-picking the same labels five times.
         setTitle("");
         setBody("");
+        onCreated(`Created ${created ?? "issue"} · ready for another`);
       } else {
+        onCreated(`Created ${created ?? "issue"}`);
         onClose();
       }
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-      onClose();
+      const message = e instanceof Error ? e.message : String(e);
+      if (created) {
+        clearDraft(canonicalSpaceId, draftSubject, "new-title");
+        clearDraft(canonicalSpaceId, draftSubject, "new-body");
+        onError(`Created ${created}, but an optional field was not applied: ${message}`);
+        onClose();
+      } else {
+        setFailure(message);
+      }
     } finally {
       setBusy(false);
     }
@@ -175,6 +203,20 @@ export function NewIssue({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+            <Combobox
+              label="Project"
+              value={{
+                id: project,
+                label: projects.find((candidate) => candidate.key === project)?.name ?? project,
+              }}
+              options={projects.map((candidate) => ({
+                id: candidate.key,
+                label: candidate.name,
+                hint: candidate.key,
+                swatch: catalogColor(candidate.color),
+              }))}
+              onPick={setProject}
+            />
             <Combobox
               label="Status"
               value={
@@ -262,13 +304,47 @@ export function NewIssue({
               // creates it on first use, so nothing needs minting here.
               onCreate={(name) => setPicked((p) => (p.includes(name) ? p : [...p, name]))}
             />
+            <label className="border-line hover:bg-hover flex items-center gap-1.5 rounded-full border px-2 py-1 text-sm">
+              <Calendar className="text-mute size-3.5" />
+              <span className="sr-only">Due date</span>
+              <input
+                type="date"
+                value={due}
+                onChange={(event) => setDue(event.target.value)}
+                className="bg-transparent text-sm outline-none"
+                aria-label="Due date"
+              />
+            </label>
           </div>
 
-          <footer className="border-line flex items-center gap-3 border-t px-4 py-3">
+          <footer className="border-line flex flex-wrap items-center gap-3 border-t px-4 py-3">
+            <span className={failure ? "text-danger w-full text-xs" : "text-mute w-full text-xs"} role={failure ? "alert" : "status"}>
+              {failure
+                ? `Not created. Draft remains on this device: ${failure}`
+                : recovered
+                  ? "Recovered local draft · saved as you type"
+                  : title || body
+                    ? "Draft saved on this device"
+                    : "Draft saves on this device"}
+            </span>
             <label className="text-mute flex items-center gap-2 text-sm">
               <input type="checkbox" checked={again} onChange={(e) => setAgain(e.target.checked)} />
               Create more
             </label>
+            {(title || body) && !busy && (
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  clearDraft(canonicalSpaceId, draftSubject, "new-title");
+                  clearDraft(canonicalSpaceId, draftSubject, "new-body");
+                  setTitle("");
+                  setBody("");
+                  onClose();
+                }}
+              >
+                Discard draft
+              </Button>
+            )}
             <span className="ml-auto flex items-center gap-2">
               <Kbd>↵</Kbd>
               <Button variant="primary" size="md" disabled={!title.trim() || busy} onClick={() => void create()}>

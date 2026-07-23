@@ -1465,12 +1465,14 @@ export function App() {
           spaceId={current}
           canonicalSpaceId={routeSpace}
           projectKey={board.project.key}
+          projects={projects}
           states={states}
           labels={labels}
           members={members}
           defaultStatus={composing.status}
           onClose={() => setComposing(null)}
           onError={setError}
+          onCreated={setToast}
         />
       )}
       {composingProject && current && (
