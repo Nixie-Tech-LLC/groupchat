@@ -80,6 +80,7 @@ export const coreCommands = contribute({
       [
         ["list", "l", "Issues"],
         ["board", "b", "Board"],
+        ["projects", "p", "Projects"],
         ["inbox", "i", "Inbox"],
         ["activity", "a", "Activity"],
         ["members", "m", "Members"],

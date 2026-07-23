@@ -72,6 +72,10 @@ export function LoadingState(props: Omit<React.ComponentProps<typeof Application
   return <ApplicationState kind="loading" {...props} />;
 }
 
+export function ProgressState(props: Omit<React.ComponentProps<typeof ApplicationState>, "kind">) {
+  return <ApplicationState kind="progress" {...props} />;
+}
+
 function StateIcon({ kind }: { kind: ApplicationStateKind }) {
   if (kind === "loading" || kind === "progress") return <LoaderCircle className="size-5 animate-spin" />;
   if (kind === "filtered-empty") return <SearchX className="size-5" />;

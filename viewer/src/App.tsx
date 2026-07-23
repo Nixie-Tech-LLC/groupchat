@@ -43,6 +43,7 @@ import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
 import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Projects } from "./ui/Projects";
+import { SurfaceHeader } from "./ui/layout";
 import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
@@ -1110,7 +1111,7 @@ export function App() {
           badge. Ours had a segmented control, a primary button, and a `Ctrl K`
           chip all shouting at once; the work is the content, not the toolbar.
         */}
-        <header className="border-line flex h-11 shrink-0 items-center gap-1 border-b px-2">
+        <SurfaceHeader>
           <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
             <PanelLeft className="size-4" />
           </IconButton>
@@ -1230,7 +1231,7 @@ export function App() {
               </IconButton>
             )}
           </span>
-        </header>
+        </SurfaceHeader>
 
         {error && (
           <InlineError

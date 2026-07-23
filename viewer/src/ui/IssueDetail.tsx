@@ -54,6 +54,7 @@ import { PriorityIcon, StatusIcon } from "./icons";
 import { Markdown } from "./Markdown";
 import { Combobox, type Option } from "./Picker";
 import { Button, IconButton } from "./primitives";
+import { MenuContent, MenuItem, PropertyRow, SectionHeader, SurfaceHeader, Toast } from "./layout";
 import * as ask from "./dialogs";
 import { dueLabel, dueToInput, dueTone, short, when } from "./time";
 
@@ -314,7 +315,7 @@ export function IssueDetail({
 
   return (
     <aside className="issue-detail border-line flex h-full min-h-0 flex-col overflow-y-auto border-l">
-      <header className="border-line flex h-11 shrink-0 items-center gap-2 border-b px-3">
+      <SurfaceHeader className="gap-2 px-3">
         <span className="text-mute font-mono text-xs tabular-nums">
           {issue.key_alias ?? issue.reff}
         </span>
@@ -379,16 +380,11 @@ export function IssueDetail({
             <X className="size-3.5" />
           </IconButton>
         </span>
-      </header>
+      </SurfaceHeader>
 
       <div className="issue-detail-body flex flex-col gap-4 p-4">
         {undoWork && (
-          <div
-            className="border-line bg-raised text-dim flex items-center gap-3 rounded border px-3 py-2 text-sm shadow-sm"
-            role="status"
-          >
-            <span className="min-w-0 flex-1">{undoWork.message}</span>
-            <Button
+          <Toast action={<Button
               variant="ghost"
               onClick={() => {
                 const action = undoWork.action;
@@ -397,6 +393,22 @@ export function IssueDetail({
               }}
             >
               Undo
+            </Button>}>
+            {undoWork.message}
+          </Toast>
+        )}
+        {events.some((event) => event.collision) && (
+          <div className="border-warn/30 bg-warn/5 text-dim flex items-start gap-2 rounded border p-3 text-sm" role="status">
+            <AlertTriangle className="text-warn mt-0.5 size-3.5 shrink-0" />
+            <span className="min-w-0 flex-1">
+              Concurrent edits converged to the current values. Review the marked history entry;
+              if its outcome is not what you intended, reapply the field above as a new explicit change.
+            </span>
+            <Button
+              variant="ghost"
+              onClick={() => document.getElementById("issue-activity")?.scrollIntoView({ block: "start" })}
+            >
+              Review history
             </Button>
           </div>
         )}
@@ -460,7 +472,7 @@ export function IssueDetail({
           that came from somewhere else.
         */}
         <dl className="issue-detail-properties flex flex-col gap-1 text-sm">
-          <Prop label="Status">
+          <PropertyRow label="Status">
             <Combobox
               variant="bare"
               label="Status"
@@ -489,9 +501,9 @@ export function IssueDetail({
                 )
               }
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Priority">
+          <PropertyRow label="Priority">
             <Combobox
               variant="bare"
               label="Priority"
@@ -517,9 +529,9 @@ export function IssueDetail({
                 )
               }
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Assignees">
+          <PropertyRow label="Assignees">
             <Combobox
               variant="bare"
               multi
@@ -564,9 +576,9 @@ export function IssueDetail({
                 void send(() => rpc(spaceId, { cmd: "assign", reff, who: [key], add }));
               }}
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Labels">
+          <PropertyRow label="Labels">
             <Combobox
               variant="bare"
               multi
@@ -612,9 +624,9 @@ export function IssueDetail({
                 void send(() => rpc(spaceId, { cmd: "label", reff, add: [name] }))
               }
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Due date">
+          <PropertyRow label="Due date">
             <DueDate
               value={issue.due_date ?? null}
               readOnly={locked}
@@ -622,9 +634,9 @@ export function IssueDetail({
                 void send(() => rpc(spaceId, { cmd: "issue_edit", reff, due }))
               }
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Estimate">
+          <PropertyRow label="Estimate">
             <Combobox
               variant="bare"
               label="Estimate"
@@ -645,9 +657,9 @@ export function IssueDetail({
                 void send(() => rpc(spaceId, { cmd: "issue_edit", reff, estimate: id }))
               }
             />
-          </Prop>
+          </PropertyRow>
 
-          <Prop label="Project">
+          <PropertyRow label="Project">
             <Combobox
               variant="bare"
               label="Project"
@@ -674,7 +686,7 @@ export function IssueDetail({
                 void send(() => rpc(spaceId, { cmd: "issue_move", reff, project: id }));
               }}
             />
-          </Prop>
+          </PropertyRow>
         </dl>
 
         <Description
@@ -801,7 +813,7 @@ function IssueOverflow({
         <IconButton label="More issue actions"><MoreHorizontal className="size-3.5" /></IconButton>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
-        <DropdownMenu.Content align="end" sideOffset={4} className="ui-surface border-line-strong bg-raised shadow-overlay z-50 min-w-52 rounded-lg border p-1 text-sm">
+        <MenuContent align="end" className="min-w-52">
           <MenuItem onSelect={() => void navigator.clipboard.writeText(issueRef)}><Copy className="size-3.5" /> Copy reference</MenuItem>
           {!locked && !tombstone && (
             <>
@@ -816,14 +828,10 @@ function IssueOverflow({
           {!locked && (tombstone
             ? <MenuItem onSelect={onRestore}><ArchiveRestore className="size-3.5" /> Restore issue</MenuItem>
             : <MenuItem danger onSelect={onDelete}><Trash2 className="size-3.5" /> Delete issue</MenuItem>)}
-        </DropdownMenu.Content>
+        </MenuContent>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
   );
-}
-
-function MenuItem({ children, danger, ...props }: React.ComponentProps<typeof DropdownMenu.Item> & { danger?: boolean }) {
-  return <DropdownMenu.Item {...props} className={`flex h-7 cursor-default select-none items-center gap-2 rounded px-2 outline-none data-[highlighted]:bg-hover data-[disabled]:opacity-50 ${danger ? "text-danger" : "text-dim"}`}>{children}</DropdownMenu.Item>;
 }
 
 /**
@@ -873,16 +881,6 @@ function DueDate({
         </IconButton>
       )}
     </span>
-  );
-}
-
-/** A property row. The `group/prop` is what reveals the trigger's chevron. */
-function Prop({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="group/prop flex min-h-7 items-center gap-2">
-      <dt className="text-mute w-20 shrink-0">{label}</dt>
-      <dd className="min-w-0 flex-1">{children}</dd>
-    </div>
   );
 }
 
@@ -1060,6 +1058,21 @@ function Relations({
       {(graph.children.length > 0 || subDraft !== null) && (
         // `done/total`, Linear's sub-issue progress at a glance.
         <RelGroup label={`Sub-issues · ${doneChildren}/${graph.children.length}`}>
+          {graph.children.length > 0 && (
+            <div
+              className="bg-line h-1.5 overflow-hidden rounded-full"
+              role="progressbar"
+              aria-label="Sub-issue completion"
+              aria-valuemin={0}
+              aria-valuemax={graph.children.length}
+              aria-valuenow={doneChildren}
+            >
+              <span
+                className="bg-ok block h-full rounded-full transition-[width]"
+                style={{ width: `${(doneChildren / graph.children.length) * 100}%` }}
+              />
+            </div>
+          )}
           {graph.children.map((r) => (
             <RelRow
               key={r.reff}
@@ -1357,19 +1370,19 @@ function Timeline({
   const visibleEntries = boundedTail(entries, visibleCount);
 
   return (
-    <section className="flex flex-col gap-3">
-      <h3 className="text-mute flex items-center gap-1.5 text-2xs font-semibold tracking-wider uppercase">
-        Activity
-        {comments.length > 0 && <span className="normal-case">· {comments.length} comments</span>}
-        {/* Said once, quietly. This feed is durable and attributed now — worth
-            saying, because it wasn't before. */}
-        <span
-          title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The space-wide Activity view is a lighter, per-session feed.)"
-          className="cursor-help"
-        >
-          <Info className="size-3" />
-        </span>
-      </h3>
+    <section id="issue-activity" className="flex flex-col gap-3 scroll-mt-3">
+      <SectionHeader
+        title="Activity"
+        meta={comments.length > 0 ? `${comments.length} comments` : undefined}
+        action={
+          <span
+            title="This issue's full history, read from its change log on disk — it survives restarts and shows who made each change. (The space-wide Activity view is a lighter, per-session feed.)"
+            className="cursor-help"
+          >
+            <Info className="size-3" />
+          </span>
+        }
+      />
 
       {entries.length === 0 && <p className="text-mute text-sm">Nothing yet.</p>}
       {entries.length > visibleCount && (
