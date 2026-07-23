@@ -128,7 +128,7 @@ export function Combobox(props: Props) {
       {single?.swatch && (
         <span className="size-2 shrink-0 rounded-full" style={{ background: single.swatch }} />
       )}
-      <span className={cn(!single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
+      <span className={cn("min-w-0 truncate", !single && "text-mute")}>{single?.label ?? placeholder ?? label}</span>
     </>
   );
 

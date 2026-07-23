@@ -1200,7 +1200,10 @@ export function App() {
           badge. Ours had a segmented control, a primary button, and a `Ctrl K`
           chip all shouting at once; the work is the content, not the toolbar.
         */}
-        <SurfaceHeader>
+        {/* `@container`: the tab labels below collapse on the *header's* own
+            width, not the viewport's — the detail pane stealing half the main
+            column is what actually crowds this row. */}
+        <SurfaceHeader className="@container">
           <IconButton label="Toggle sidebar" chord="⌘B" onClick={() => run("view.sidebar")}>
             <PanelLeft className="size-4" />
           </IconButton>
@@ -1941,7 +1944,9 @@ function ViewSwitcher({ view, onPick }: { view: WorkView; onPick: (v: WorkView) 
             }`}
           >
             {WORK_VIEW_META[v].icon}
-            <span className="max-md:hidden">{WORK_VIEW_META[v].label}</span>
+            {/* Icon-only when the header is cramped (container query, so the
+                open detail pane counts). The title tooltip still names it. */}
+            <span className="@max-4xl:hidden">{WORK_VIEW_META[v].label}</span>
           </button>
         );
       })}

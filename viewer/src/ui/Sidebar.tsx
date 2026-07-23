@@ -1,8 +1,10 @@
+import { useState } from "react";
 import {
   Activity,
   Bookmark,
   Bot,
   ChevronDown,
+  ChevronRight,
   CircleDot,
   Clock3,
   Cog,
@@ -75,6 +77,20 @@ export function Sidebar({
 }) {
   const space = spaces.find((s) => s.id === current) ?? null;
   const agent = space?.identity.kind === "agent" ? space.identity.name : null;
+  // Linear's density model: favorites are the always-visible projects; the full
+  // list folds behind its section header. Default-collapsed once you have
+  // favorites (curation replaces enumeration), open until then so a fresh space
+  // never hides its projects. The choice sticks per device.
+  const [projectsOpen, setProjectsOpen] = useState<boolean>(() => {
+    const stored = localStorage.getItem("lait.sidebar.allProjects");
+    return stored !== null ? stored === "1" : favoriteProjects.length === 0;
+  });
+  const toggleProjects = () => {
+    setProjectsOpen((open) => {
+      localStorage.setItem("lait.sidebar.allProjects", open ? "0" : "1");
+      return !open;
+    });
+  };
 
   return (
     <nav aria-label="Workspace" className="flex h-full min-h-0 flex-col p-2">
@@ -110,7 +126,16 @@ export function Sidebar({
         {favoriteProjects.length > 0 && <MiniSection title="Favorites" />}
         {favoriteProjects.map((key) => {
           const favorite = projects.find((candidate) => candidate.key === key);
-          return favorite ? <NavItem key={key} icon={<Star />} label={favorite.name} onClick={() => onPickProject(key)} compact /> : null;
+          return favorite ? (
+            <ProjectRow
+              key={key}
+              project={favorite}
+              active={favorite.key === currentProject}
+              favorited
+              onPick={onPickProject}
+              onToggleFavorite={onToggleFavorite}
+            />
+          ) : null;
         })}
         {savedViews.length > 0 && <MiniSection title="Saved views" />}
         {savedViews.map((saved) => (
@@ -122,48 +147,55 @@ export function Sidebar({
         ))}
       </div>
 
-      <Section
-        title="Projects"
-        action={
-          !agent ? (
-            <IconButton label="New project" onClick={onCreateProject}>
-              <Plus className="size-3" />
-            </IconButton>
-          ) : null
-        }
-      />
+      <div className="mt-3 mb-1 flex h-6 items-center justify-between px-2">
+        <button
+          className="text-mute hover:text-fg flex min-w-0 items-center gap-1 text-xs font-semibold uppercase"
+          onClick={toggleProjects}
+          aria-expanded={projectsOpen}
+        >
+          <ChevronRight className={cn("size-3 shrink-0 transition-transform", projectsOpen && "rotate-90")} />
+          <span className="truncate">All projects</span>
+          <span className="font-normal tabular-nums">{projects.length}</span>
+        </button>
+        {!agent && (
+          <IconButton label="New project" onClick={onCreateProject}>
+            <Plus className="size-3" />
+          </IconButton>
+        )}
+      </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {projects.length === 0 ? (
-          <p className="text-mute px-2 py-1 text-sm">No projects yet.</p>
+        {projectsOpen ? (
+          projects.length === 0 ? (
+            <p className="text-mute px-2 py-1 text-sm">No projects yet.</p>
+          ) : (
+            projects.map((project) => (
+              <ProjectRow
+                key={project.id}
+                project={project}
+                active={project.key === currentProject}
+                favorited={favoriteProjects.includes(project.key)}
+                onPick={onPickProject}
+                onToggleFavorite={onToggleFavorite}
+              />
+            ))
+          )
         ) : (
-          projects.map((project) => {
-            const active = project.key === currentProject;
-            return (
-              <div key={project.id} className="group/project relative mb-0.5">
-                <button
-                  onClick={() => onPickProject(project.key)}
-                  className={cn(
-                    "flex h-7 w-full min-w-0 items-center gap-2 rounded px-2 text-left text-sm",
-                    active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
-                  )}
-                >
-                  <span className="size-2 shrink-0 rounded-sm" style={{ background: catalogColor(project.color) }} />
-                  <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                  <span className="text-mute font-mono text-2xs">{project.key}</span>
-                </button>
-                <IconButton
-                  label={favoriteProjects.includes(project.key) ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`}
-                  className={cn(
-                    "absolute top-0.5 right-0.5 size-6 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100",
-                    active ? "bg-active hover:bg-hover" : "bg-hover",
-                  )}
-                  onClick={() => onToggleFavorite(project.key)}
-                >
-                  {favoriteProjects.includes(project.key) ? <StarOff className="size-3" /> : <Star className="size-3" />}
-                </IconButton>
-              </div>
+          // Collapsed still anchors you: the project you're in stays visible
+          // unless it's already pinned under Favorites.
+          (() => {
+            const active = projects.find(
+              (project) => project.key === currentProject && !favoriteProjects.includes(project.key),
             );
-          })
+            return active ? (
+              <ProjectRow
+                project={active}
+                active
+                favorited={false}
+                onPick={onPickProject}
+                onToggleFavorite={onToggleFavorite}
+              />
+            ) : null;
+          })()
         )}
       </div>
 
@@ -240,6 +272,49 @@ function SpaceSwitcher({
         )}
       </div>
     </details>
+  );
+}
+
+/** One project in the nav — color dot, name, key, and a hover star to (un)pin.
+ *  Shared by Favorites and the collapsible all-projects list so the two render
+ *  identically and a pin just moves the row up. */
+function ProjectRow({
+  project,
+  active,
+  favorited,
+  onPick,
+  onToggleFavorite,
+}: {
+  project: ProjectDto;
+  active: boolean;
+  favorited: boolean;
+  onPick: (key: string) => void;
+  onToggleFavorite: (key: string) => void;
+}) {
+  return (
+    <div className="group/project relative mb-0.5">
+      <button
+        onClick={() => onPick(project.key)}
+        className={cn(
+          "flex h-7 w-full min-w-0 items-center gap-2 rounded px-2 text-left text-sm",
+          active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
+        )}
+      >
+        <span className="size-2 shrink-0 rounded-sm" style={{ background: catalogColor(project.color) }} />
+        <span className="min-w-0 flex-1 truncate">{project.name}</span>
+        <span className="text-mute font-mono text-2xs">{project.key}</span>
+      </button>
+      <IconButton
+        label={favorited ? `Remove ${project.name} from favorites` : `Add ${project.name} to favorites`}
+        className={cn(
+          "absolute top-0.5 right-0.5 size-6 opacity-0 group-hover/project:opacity-100 focus-visible:opacity-100",
+          active ? "bg-active hover:bg-hover" : "bg-hover",
+        )}
+        onClick={() => onToggleFavorite(project.key)}
+      >
+        {favorited ? <StarOff className="size-3" /> : <Star className="size-3" />}
+      </IconButton>
+    </div>
   );
 }
 
