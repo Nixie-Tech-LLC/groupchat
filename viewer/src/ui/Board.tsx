@@ -112,7 +112,12 @@ export function Board({
           onCreate={onCreate}
           onDragStart={(reff) => setDrag({ reff, from: col.state.id })}
           onDragEnd={reset}
-          onOver={(pos) => setOver({ col: col.state.id, pos })}
+          onOver={(pos) =>
+            setOver((current) => {
+              const next = { col: col.state.id, pos };
+              return sameBoardTarget(current, next) ? current : next;
+            })
+          }
           onDrop={() => finish(col)}
           onMove={move}
           onEdit={onEdit}
@@ -122,6 +127,17 @@ export function Board({
       ))}
     </div>
   );
+}
+
+function sameBoardTarget(
+  left: { col: string; pos: BoardPos } | null,
+  right: { col: string; pos: BoardPos },
+): boolean {
+  if (!left || left.col !== right.col || left.pos.at !== right.pos.at) return false;
+  if (left.pos.at === "before" || left.pos.at === "after") {
+    return right.pos.at === left.pos.at && right.pos.reff === left.pos.reff;
+  }
+  return true;
 }
 
 /** Done is append-only in the daemon; live columns accept an explicit tail. */

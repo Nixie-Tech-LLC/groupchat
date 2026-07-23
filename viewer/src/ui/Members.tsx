@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from "react";
-import QRCode from "qrcode";
 import {
   Check,
   Copy,
@@ -310,7 +309,10 @@ function Invite({
     if (!link) return setQr(null);
     // Rendered locally. A remote QR service would mean handing an invite ticket —
     // which admits someone to an E2EE space — to a third party.
-    void QRCode.toDataURL(link, { margin: 1, width: 220, errorCorrectionLevel: "L" })
+    void import("qrcode")
+      .then(({ default: QRCode }) =>
+        QRCode.toDataURL(link, { margin: 1, width: 220, errorCorrectionLevel: "L" }),
+      )
       .then(setQr)
       .catch(() => setQr(null));
   }, [link]);

@@ -127,6 +127,9 @@
   #root {
     height: 100%;
   }
+  #root {
+    height: 100dvh;
+  }
 
   body {
     @apply bg-bg text-fg font-sans text-base antialiased;
