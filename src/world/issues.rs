@@ -85,7 +85,6 @@ impl IssuesWorld {
             }
         }
         let catalog = Arc::new(catalog_state(ctx)?);
-        let aliases = Arc::new(derive_aliases(&catalog));
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         let mut issues: BTreeMap<String, Arc<IssueState>> = BTreeMap::new();
         for doc in catalog.doc_ids() {
@@ -104,6 +103,9 @@ impl IssuesWorld {
             }
             issues.insert(doc, state);
         }
+        let aliases = Arc::new(derive_aliases(&catalog, |doc| {
+            issues.get(doc).map(|issue| issue.project.as_str())
+        }));
         // Registered docs are the live set: drop parses for departed docs.
         cache.issues.retain(|doc, _| issues.contains_key(doc));
         let snap = Arc::new(DerivedSnapshot {

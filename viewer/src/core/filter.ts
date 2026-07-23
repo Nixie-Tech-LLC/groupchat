@@ -61,15 +61,22 @@ export const isActive = (f: FilterState): boolean =>
 /** Whether the daemon has to be asked — i.e. the parts we refuse to guess at. */
 export const needsServer = (f: FilterState): boolean => f.mine || f.label !== null;
 
-/** Case-insensitive match over the fields a human would type. */
+/**
+ * Case-insensitive expression over title/ref/alias.
+ * Whitespace is AND, `|` separates OR branches, and `-term` excludes a term.
+ */
 export function matchesText(row: Row, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
-  return (
-    row.title.toLowerCase().includes(q) ||
-    row.reff.toLowerCase().includes(q) ||
-    (row.key_alias?.toLowerCase().includes(q) ?? false)
-  );
+  const haystack = [row.title, row.reff, row.key_alias ?? ""].join(" ").toLowerCase();
+  return q.split("|").some((branch) => {
+    const terms = branch.trim().split(/\s+/).filter(Boolean);
+    return terms.length > 0 && terms.every((term) =>
+      term.startsWith("-") && term.length > 1
+        ? !haystack.includes(term.slice(1))
+        : haystack.includes(term),
+    );
+  });
 }
 
 /**

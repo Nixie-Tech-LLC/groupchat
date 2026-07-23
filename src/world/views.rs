@@ -351,7 +351,10 @@ fn collision_suffix(i: usize) -> String {
     s
 }
 
-pub fn derive_aliases(catalog: &CatalogState) -> DerivedAliases {
+pub fn derive_aliases<'a>(
+    catalog: &CatalogState,
+    project_of: impl Fn(&str) -> Option<&'a str>,
+) -> DerivedAliases {
     let mut out = DerivedAliases::default();
     let mut docs: Vec<String> = catalog.doc_ids();
     docs.sort();
@@ -383,17 +386,20 @@ pub fn derive_aliases(catalog: &CatalogState) -> DerivedAliases {
         let Some(&seq) = catalog.seqs.get(doc) else {
             continue;
         };
-        // The issue's project comes from the issue Body; the alias group uses
-        // the project the seq was assigned under, recorded in the catalog by
-        // the same transaction. We group by current board membership when
-        // available, else fall back to any project claiming the doc.
+        // Live issues are present in board order. Done issues are deliberately
+        // removed from that movable list, so their authoritative Issue body is
+        // the fallback that keeps KEY-n aliases stable after completion.
         let project = catalog
             .boards
             .iter()
             .find(|(_, entries)| entries.iter().any(|(_, d)| d == doc))
-            .map(|(p, _)| p.clone());
+            .map(|(p, _)| p.as_str())
+            .or_else(|| project_of(doc));
         if let Some(project) = project {
-            groups.entry((project, seq)).or_default().push(doc.clone());
+            groups
+                .entry((project.to_string(), seq))
+                .or_default()
+                .push(doc.clone());
         }
     }
     for ((project, seq), mut members) in groups {
@@ -420,6 +426,36 @@ pub fn canonical_for(aliases: &DerivedAliases, doc: &str) -> String {
             .map(|d| d.short(CANONICAL_MIN))
             .unwrap_or_else(|| doc.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_issue_keeps_alias_from_authoritative_project() {
+        let doc = "iss_01JU6A5CHEI9UR3SGKEK05KIAR";
+        let mut catalog = CatalogState::default();
+        catalog.projects.insert(
+            "prj_board".into(),
+            ProjectMeta {
+                name: "Board".into(),
+                key: "BOARD".into(),
+                color: "blue".into(),
+            },
+        );
+        catalog.seqs.insert(doc.into(), 5);
+
+        let aliases = derive_aliases(&catalog, |candidate| {
+            (candidate == doc).then_some("prj_board")
+        });
+
+        assert_eq!(aliases.by_doc.get(doc).map(String::as_str), Some("BOARD-5"));
+        assert_eq!(
+            aliases.by_alias.get("board-5").map(String::as_str),
+            Some(doc)
+        );
+    }
 }
 
 fn assignee_summary(assignees: &[ActorId], me: Option<&ActorId>) -> String {

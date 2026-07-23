@@ -31,6 +31,8 @@ export function FilterBar({
   labels,
   states,
   focusToken,
+  resultCount,
+  totalCount,
   onChange,
   onClose,
 }: {
@@ -39,6 +41,8 @@ export function FilterBar({
   states: WorkflowState[];
   /** Bumped by the `/` command; refocuses without the bar owning the binding. */
   focusToken: number;
+  resultCount: number;
+  totalCount: number;
   onChange: (f: FilterState) => void;
   onClose: () => void;
 }) {
@@ -60,7 +64,7 @@ export function FilterBar({
       <input
         ref={input}
         value={filter.text}
-        placeholder="Filter by title, ref, or alias…"
+        placeholder="Filter issues… use spaces for AND, | for OR, - to exclude"
         onChange={(e) => onChange({ ...filter, text: e.target.value })}
         onKeyDown={(e) => {
           if (e.key === "Escape") {
@@ -144,9 +148,17 @@ export function FilterBar({
       )}
 
       {isActive(filter) && (
-        <IconButton label="Clear filter" onClick={() => onChange(EMPTY_FILTER)}>
-          <X className="size-3.5" />
-        </IconButton>
+        <>
+          <span
+            className="text-mute hidden shrink-0 text-2xs tabular-nums sm:inline"
+            aria-live="polite"
+          >
+            {resultCount} of {totalCount} · AND across chips
+          </span>
+          <IconButton label="Clear all filters" onClick={() => onChange(EMPTY_FILTER)}>
+            <X className="size-3.5" />
+          </IconButton>
+        </>
       )}
     </div>
   );

@@ -1249,6 +1249,14 @@ export function App() {
             labels={labels}
             states={states}
             focusToken={focusToken}
+            resultCount={shown?.columns.reduce(
+              (count, column) => count + column.rows.filter((row) => !row.tombstone).length,
+              0,
+            ) ?? 0}
+            totalCount={board?.columns.reduce(
+              (count, column) => count + column.rows.filter((row) => !row.tombstone).length,
+              0,
+            ) ?? 0}
             onChange={setFilter}
             onClose={() => setFilterOpen(false)}
           />
@@ -1582,6 +1590,8 @@ export function App() {
           spaceId={routeSpace}
           rpcSpaceId={current}
           rows={board.columns.flatMap((column) => column.rows).filter((row) => !row.tombstone)}
+          projects={projects}
+          states={states}
           onClose={() => setModal(null)}
           onOpen={(row) => {
             const destination = projects.find((candidate) => candidate.id === row.project_id);

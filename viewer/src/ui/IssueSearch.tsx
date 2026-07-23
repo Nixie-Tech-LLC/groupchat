@@ -5,8 +5,9 @@ import { useEffect, useMemo, useState } from "react";
 import { rpc } from "../api";
 import { cmdkFilter } from "../core/fuzzy";
 import { loadRecentIssues, rememberRecentIssue } from "../core/personalNav";
-import type { Row } from "../types";
-import { PriorityIcon } from "./icons";
+import type { ProjectDto, Row, WorkflowState } from "../types";
+import { catalogColor } from "./colors";
+import { PriorityIcon, StatusIcon } from "./icons";
 import { Kbd } from "./primitives";
 
 export function rememberIssue(spaceId: string, reff: string): void {
@@ -17,32 +18,49 @@ export function IssueSearch({
   spaceId,
   rpcSpaceId,
   rows,
+  projects,
+  states,
   onOpen,
   onClose,
 }: {
   spaceId: string;
   rpcSpaceId: string;
   rows: Row[];
+  projects: ProjectDto[];
+  states: WorkflowState[];
   onOpen: (row: Row) => void;
   onClose: () => void;
 }) {
   const [available, setAvailable] = useState(rows);
+  const [query, setQuery] = useState("");
   useEffect(() => {
     let alive = true;
-    void rpc(rpcSpaceId, { cmd: "list", project: null, filter: { all: true } })
-      .then((reply) => {
-        if (alive && reply.kind === "list") {
-          setAvailable(reply.rows.filter((row) => !row.tombstone));
+    void Promise.allSettled(
+      projects.map((project) =>
+        rpc(rpcSpaceId, { cmd: "board", project: project.key }),
+      ),
+    ).then((replies) => {
+      if (!alive) return;
+      const merged = new Map<string, Row>();
+      for (const result of replies) {
+        if (result.status !== "fulfilled" || result.value.kind !== "board") continue;
+        for (const column of result.value.columns) {
+          for (const row of column.rows) {
+            if (!row.tombstone) merged.set(row.reff, row);
+          }
         }
-      })
-      .catch(() => {
-        // The active board remains a useful, honest subset when the broader
-        // projection is unavailable.
-      });
+      }
+      if (merged.size) {
+        setAvailable([...merged.values()]);
+      }
+    }).catch(() => {
+      // The active board remains a useful, honest subset when every broader
+      // projection is unavailable.
+    });
     return () => {
       alive = false;
     };
-  }, [rpcSpaceId]);
+  }, [rpcSpaceId, projects]);
 
   const recents = useMemo(() => {
     const byRef = new Map(available.map((row) => [row.reff, row]));
@@ -51,6 +69,23 @@ export function IssueSearch({
       return row ? [row] : [];
     });
   }, [spaceId, available]);
+  const results = useMemo(() => {
+    const text = query.trim();
+    if (!text) return available;
+    return available
+      .map((row) => ({
+        row,
+        score: cmdkFilter(row.key_alias ?? row.reff, text, [
+          row.title,
+          row.reff,
+          row.project_id,
+          row.status,
+        ]),
+      }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(({ row }) => row);
+  }, [available, query]);
 
   const choose = (reff: string) => {
     const row = available.find((candidate) => candidate.reff === reff);
@@ -65,24 +100,35 @@ export function IssueSearch({
       <Command
         label="Search issues"
         loop
-        filter={cmdkFilter}
+        shouldFilter={false}
         onMouseDown={(event) => event.stopPropagation()}
         className="ui-surface border-line-strong bg-raised shadow-overlay flex h-fit max-h-[70vh] w-[min(680px,94vw)] flex-col overflow-hidden rounded-lg border"
       >
         <div className="border-line flex items-center gap-3 border-b px-4">
           <Search className="text-mute size-4" />
-          <Command.Input autoFocus placeholder="Search issues by title or reference…" className="placeholder:text-mute min-w-0 flex-1 bg-transparent py-3 text-lg outline-none" />
+          <Command.Input
+            autoFocus
+            value={query}
+            onValueChange={setQuery}
+            placeholder="Search issues by title, reference, project, or status…"
+            className="placeholder:text-mute min-w-0 flex-1 bg-transparent py-3 text-lg outline-none"
+          />
           <Kbd>Esc</Kbd>
         </div>
         <Command.List className="overflow-y-auto p-2">
-          <Command.Empty className="text-mute p-8 text-center">No issue matches this search.</Command.Empty>
-          {recents.length > 0 && (
+          {results.length === 0 && (
+            <div className="text-mute p-8 text-center">
+              <p>No issue matches “{query.trim()}”.</p>
+              <p className="mt-1 text-xs">Try a title, identifier, project, or status.</p>
+            </div>
+          )}
+          {!query.trim() && recents.length > 0 && (
             <Command.Group heading="Recent" className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
-              {recents.map((row) => <IssueResult key={`recent-${row.reff}`} row={row} recent onOpen={choose} />)}
+              {recents.map((row) => <IssueResult key={`recent-${row.reff}`} row={row} recent projects={projects} states={states} onOpen={choose} />)}
             </Command.Group>
           )}
-          <Command.Group heading="All issues" className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
-            {available.map((row) => <IssueResult key={row.reff} row={row} onOpen={choose} />)}
+          <Command.Group heading={query.trim() ? `${results.length} results` : "All issues"} className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
+            {results.map((row) => <IssueResult key={row.reff} row={row} projects={projects} states={states} onOpen={choose} />)}
           </Command.Group>
         </Command.List>
       </Command>
@@ -90,7 +136,9 @@ export function IssueSearch({
   );
 }
 
-function IssueResult({ row, recent, onOpen }: { row: Row; recent?: boolean; onOpen: (reff: string) => void }) {
+function IssueResult({ row, recent, projects, states, onOpen }: { row: Row; recent?: boolean; projects: ProjectDto[]; states: WorkflowState[]; onOpen: (reff: string) => void }) {
+  const project = projects.find((candidate) => candidate.id === row.project_id);
+  const state = states.find((candidate) => candidate.id === row.status);
   return (
     <Command.Item
       value={row.reff}
@@ -101,6 +149,13 @@ function IssueResult({ row, recent, onOpen }: { row: Row; recent?: boolean; onOp
       {recent ? <Clock3 className="text-mute size-3.5" /> : <PriorityIcon priority={row.priority} />}
       <span className="text-mute w-20 shrink-0 truncate font-mono text-xs">{row.key_alias ?? row.reff}</span>
       <span className="min-w-0 flex-1 truncate">{row.title}</span>
+      {project && <span className="text-mute shrink-0 text-xs">{project.key}</span>}
+      {state && (
+        <span className="text-mute flex shrink-0 items-center gap-1 text-xs">
+          <StatusIcon category={state.category} color={catalogColor(state.color)} />
+          {state.name}
+        </span>
+      )}
       {row.provisional && <span className="text-warn text-2xs">arriving</span>}
     </Command.Item>
   );
