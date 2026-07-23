@@ -34,6 +34,7 @@ export function Sidebar({
   unread,
   memberCount,
   membership,
+  currentName,
   favoriteProjects,
   recentIssues,
   savedViews,
@@ -55,6 +56,10 @@ export function Sidebar({
   unread: number;
   memberCount?: number | undefined;
   membership?: string | null | undefined;
+  /** The current space's authoritative catalog name (from `status`), which
+   *  refreshes on every doorbell — so a rename shows without reloading, unlike the
+   *  spaces-list `name` that only refetches on a catalog-dirty doorbell. */
+  currentName?: string | undefined;
   favoriteProjects: readonly string[];
   recentIssues: readonly string[];
   savedViews: readonly SavedView[];
@@ -76,6 +81,7 @@ export function Sidebar({
       <SpaceSwitcher
         spaces={spaces}
         current={current}
+        currentName={currentName}
         memberCount={memberCount}
         membership={membership}
         onPick={onPickSpace}
@@ -173,12 +179,14 @@ export function Sidebar({
 function SpaceSwitcher({
   spaces,
   current,
+  currentName,
   memberCount,
   membership,
   onPick,
 }: {
   spaces: SpaceRow[];
   current: string | null;
+  currentName?: string | undefined;
   memberCount?: number | undefined;
   membership?: string | null | undefined;
   onPick: (id: string) => void;
@@ -191,7 +199,7 @@ function SpaceSwitcher({
           {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
         </span>
         <span className="min-w-0 flex-1">
-          <strong className="block truncate text-sm">{selected?.name || selected?.space || "Choose a space"}</strong>
+          <strong className="block truncate text-sm">{(currentName?.trim() || selected?.name) || selected?.space || "Choose a space"}</strong>
           {selected && (
             <span className="text-mute block truncate text-[10px] font-normal">
               {selected.identity.kind === "agent"

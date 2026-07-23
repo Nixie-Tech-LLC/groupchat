@@ -1172,6 +1172,7 @@ export function App() {
           unread={unread}
           memberCount={members.length}
           membership={statusInfo?.membership}
+          currentName={statusInfo?.name}
           favoriteProjects={favoriteProjects}
           recentIssues={recentIssues}
           savedViews={sidebarSavedViews}
@@ -1431,7 +1432,7 @@ export function App() {
           ) : view === "settings" ? (
             <Settings
               spaceId={current}
-              spaceName={space?.name ?? ""}
+              spaceName={statusInfo?.name || space?.name || ""}
               spaceDescription={statusInfo?.description ?? ""}
               labels={labels}
               projects={projects}
@@ -1692,6 +1693,7 @@ export function App() {
               unread={unread}
               memberCount={members.length}
               membership={statusInfo?.membership}
+              currentName={statusInfo?.name}
               favoriteProjects={favoriteProjects}
               recentIssues={recentIssues}
               savedViews={sidebarSavedViews}
