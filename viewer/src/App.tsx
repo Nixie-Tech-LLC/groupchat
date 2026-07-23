@@ -963,6 +963,30 @@ export function App() {
     ],
   );
 
+  // Deep-link / automation hook: a `lait:nav` CustomEvent drives navigation
+  // without a synthetic DOM click. The handler DEFERS the actual navigation to a
+  // fresh task, so the dispatcher's call stack (e.g. a headless `eval`) unwinds
+  // before React re-renders — a re-render *inside* an eval detaches its execution
+  // context, which is why clicking a nav item from automation is unreliable but a
+  // dispatched event is not. Harmless in normal use: nothing dispatches it.
+  //   window.dispatchEvent(new CustomEvent("lait:nav", { detail: { view, project, issue } }))
+  useEffect(() => {
+    const onNav = (event: Event) => {
+      const detail = ((event as CustomEvent).detail ?? {}) as {
+        view?: View;
+        project?: string | null;
+        issue?: string | null;
+      };
+      setTimeout(() => {
+        if (typeof detail.view === "string") api.goto(detail.view);
+        if ("project" in detail) api.pickProject(detail.project ?? null);
+        if ("issue" in detail) api.select(detail.issue ?? null);
+      }, 0);
+    };
+    window.addEventListener("lait:nav", onNav as EventListener);
+    return () => window.removeEventListener("lait:nav", onNav as EventListener);
+  }, [api]);
+
   const ctx: Ctx = useMemo(
     () => ({
       view,

@@ -37,7 +37,27 @@ export function Projects({
   onError: (message: string) => void;
 }) {
   const [boards, setBoards] = useState<Map<string, BoardView> | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  // `?overview=<key>` deep-links a project's overview (and lets a headless driver
+  // reach it by `open`-ing the URL — no card click needed).
+  const [selected, setSelectedState] = useState<string | null>(
+    () => new URLSearchParams(window.location.search).get("overview"),
+  );
+  const setSelected = (key: string | null) => {
+    setSelectedState(key);
+    const url = new URL(window.location.href);
+    if (key) url.searchParams.set("overview", key);
+    else url.searchParams.delete("overview");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  };
+  // Reliable driver hook: `lait:nav { overview }` opens a project's overview.
+  useEffect(() => {
+    const onNav = (event: Event) => {
+      const detail = (event as CustomEvent).detail ?? {};
+      if ("overview" in detail) setSelected(detail.overview ?? null);
+    };
+    window.addEventListener("lait:nav", onNav as EventListener);
+    return () => window.removeEventListener("lait:nav", onNav as EventListener);
+  }, []);
 
   useEffect(() => {
     let alive = true;

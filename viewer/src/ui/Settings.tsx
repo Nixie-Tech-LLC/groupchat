@@ -44,7 +44,28 @@ export function Settings({
    *  while this page is open, so this is the way back. */
   onExit: () => void;
 }) {
-  const [tab, setTab] = useState<Tab>("general");
+  // Read the initial tab from `?tab=` so a settings sub-page is deep-linkable
+  // (and reliably reachable by a headless driver via `open`, no click needed).
+  const [tab, setTabState] = useState<Tab>(() => {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    return t === "labels" || t === "workflow" ? t : "general";
+  });
+  const setTab = (next: Tab) => {
+    setTabState(next);
+    const url = new URL(window.location.href);
+    if (next === "general") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", next);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  };
+  // Reliable driver hook: `lait:nav { tab }` selects a sub-page without a click.
+  useEffect(() => {
+    const onNav = (event: Event) => {
+      const t = (event as CustomEvent).detail?.tab;
+      if (t === "general" || t === "labels" || t === "workflow") setTab(t);
+    };
+    window.addEventListener("lait:nav", onNav as EventListener);
+    return () => window.removeEventListener("lait:nav", onNav as EventListener);
+  }, []);
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "general", label: "General", icon: <SlidersHorizontal className="size-3.5" /> },
     { id: "labels", label: "Labels", icon: <Tag className="size-3.5" /> },
