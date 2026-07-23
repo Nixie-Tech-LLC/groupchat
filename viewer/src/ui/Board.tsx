@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { Plus } from "lucide-react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { MoreHorizontal, Plus } from "lucide-react";
 
 import type { BoardColumn, BoardPos, BoardView, MemberDto, Row } from "../types";
 import { AvatarStack, stackFor } from "./Avatar";
@@ -65,6 +66,16 @@ export function Board({
     reset();
   };
 
+  const move = (row: Row, col: BoardColumn) => {
+    if (row.status === col.state.id) return;
+    onDrop(
+      row.reff,
+      col.state.id,
+      boardMovePosition(col),
+    );
+    setAnnouncement(`Moved ${row.key_alias ?? row.reff} to ${col.state.name}`);
+  };
+
   const reset = () => {
     setDrag(null);
     setOver(null);
@@ -88,11 +99,18 @@ export function Board({
           onDragEnd={reset}
           onOver={(pos) => setOver({ col: col.state.id, pos })}
           onDrop={() => finish(col)}
+          onMove={move}
+          columns={board.columns}
           readOnly={readOnly}
         />
       ))}
     </div>
   );
+}
+
+/** Done is append-only in the daemon; live columns accept an explicit tail. */
+export function boardMovePosition(col: BoardColumn): BoardPos | null {
+  return col.state.category === "done" ? null : { at: "bottom" };
 }
 
 function Column({
@@ -108,6 +126,8 @@ function Column({
   onDragEnd,
   onOver,
   onDrop,
+  onMove,
+  columns,
   readOnly,
 }: {
   col: BoardColumn;
@@ -122,13 +142,15 @@ function Column({
   onDragEnd: () => void;
   onOver: (pos: BoardPos) => void;
   onDrop: () => void;
+  onMove: (row: Row, col: BoardColumn) => void;
+  columns: BoardColumn[];
   readOnly: boolean;
 }) {
   const rows = col.rows.filter((r) => !r.tombstone);
   const active = drag !== null && !readOnly;
 
   return (
-    <section className="group/col flex w-72 shrink-0 flex-col">
+    <section className={`group/col flex shrink-0 flex-col ${rows.length ? "w-72" : "w-60"}`}>
       <header className="flex h-8 shrink-0 items-center gap-2 px-1">
         <StatusIcon category={col.state.category} color={catalogColor(col.state.color)} />
         <h2 className="text-base font-semibold">{col.state.name}</h2>
@@ -137,11 +159,43 @@ function Column({
           <IconButton
             label={`New issue in ${col.state.name}`}
             onClick={() => onCreate(col.state.id)}
-            className="ml-auto opacity-0 transition group-hover/col:opacity-100 focus-visible:opacity-100"
+            className="ml-auto"
           >
             <Plus className="size-3.5" />
           </IconButton>
         )}
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <IconButton label={`${col.state.name} column actions`} className={readOnly ? "ml-auto" : ""}>
+              <MoreHorizontal className="size-3.5" />
+            </IconButton>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="end"
+              sideOffset={4}
+              className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
+            >
+              {!readOnly && (
+                <DropdownMenu.Item
+                  onSelect={() => onCreate(col.state.id)}
+                  className="data-[highlighted]:bg-hover flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
+                >
+                  <Plus className="size-3.5" />
+                  New issue
+                </DropdownMenu.Item>
+              )}
+              <DropdownMenu.Item
+                disabled={!rows[0]}
+                onSelect={() => rows[0] && onSelect(rows[0].reff)}
+                className="data-[highlighted]:bg-hover data-[disabled]:text-mute flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
+              >
+                Open first issue
+                <span className="text-mute ml-auto tabular-nums">{rows.length}</span>
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
       </header>
       <ul
         role="listbox"
@@ -181,6 +235,8 @@ function Column({
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
             onOver={onOver}
+            columns={columns}
+            onMove={onMove}
           />
         ))}
         {rows.length === 0 && (
@@ -238,6 +294,8 @@ function Card({
   onDragStart,
   onDragEnd,
   onOver,
+  columns,
+  onMove,
 }: {
   row: Row;
   members: MemberDto[];
@@ -250,6 +308,8 @@ function Card({
   onDragStart: (reff: string) => void;
   onDragEnd: () => void;
   onOver: (pos: BoardPos) => void;
+  columns: BoardColumn[];
+  onMove: (row: Row, col: BoardColumn) => void;
 }) {
   const el = useRef<HTMLLIElement>(null);
   // Selection moves by keyboard, so it has to drag the viewport with it.
@@ -283,7 +343,7 @@ function Card({
         aria-selected={selected}
         role="option"
         className={[
-          "bg-raised cursor-default rounded border p-2 transition-[border-color,box-shadow,opacity] duration-150",
+          "bg-raised group/card cursor-default rounded border p-2 transition-[border-color,box-shadow,opacity] duration-150",
           selected
             ? "border-accent ring-accent shadow-sm ring-1"
             : "border-line hover:border-line-strong hover:shadow-sm",
@@ -294,9 +354,50 @@ function Card({
           dragging ? "opacity-40" : "",
         ].join(" ")}
       >
-        <p className={`mb-1.5 line-clamp-2 ${row.tombstone ? "text-mute line-through" : ""}`}>
-          {row.title}
-        </p>
+        <div className="mb-1.5 flex items-start gap-1">
+          <p className={`min-w-0 flex-1 line-clamp-2 ${row.tombstone ? "text-mute line-through" : ""}`}>
+            {row.title}
+          </p>
+          {!row.tombstone && (
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger asChild>
+                <IconButton
+                  label={`Move ${row.key_alias ?? row.reff}`}
+                  onClick={(event) => event.stopPropagation()}
+                  className="-mr-1 -mt-1 opacity-0 group-hover/card:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </IconButton>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content
+                  align="end"
+                  sideOffset={4}
+                  className="border-line-strong bg-raised shadow-overlay z-50 min-w-44 rounded-lg border p-1"
+                >
+                  <DropdownMenu.Label className="text-mute px-2 py-1 text-2xs font-semibold uppercase">
+                    Move to
+                  </DropdownMenu.Label>
+                  {columns.map((column) => (
+                    <DropdownMenu.Item
+                      key={column.state.id}
+                      disabled={column.state.id === row.status}
+                      onSelect={() => onMove(row, column)}
+                      className="data-[highlighted]:bg-hover data-[disabled]:text-mute flex cursor-default items-center gap-2 rounded px-2 py-1.5 text-sm outline-none"
+                    >
+                      <StatusIcon
+                        category={column.state.category}
+                        color={catalogColor(column.state.color)}
+                      />
+                      <span className="flex-1">{column.state.name}</span>
+                      <span className="text-mute tabular-nums">{column.rows.length}</span>
+                    </DropdownMenu.Item>
+                  ))}
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           <PriorityIcon priority={row.priority} />
           <span className="text-mute font-mono text-2xs tabular-nums">
