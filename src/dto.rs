@@ -366,6 +366,14 @@ pub struct Row {
     /// dots without a second fetch; older consumers ignore the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_names: Vec<String>,
+    /// Sub-issue progress: done and total live (non-tombstoned) children. `None`
+    /// when the issue has no children, so a card only draws a progress mini-bar
+    /// for issues that actually parent others. Additive/absent-when-none, and set
+    /// only where the child index is cheaply available (the board projection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_done: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_total: Option<u32>,
 }
 
 /// A board column: an ordered slice of rows for one workflow state.

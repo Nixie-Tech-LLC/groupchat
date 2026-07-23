@@ -1424,6 +1424,7 @@ export function App() {
           ) : shown && view === "board" ? (
             <Board
               board={shown}
+              display={display}
               members={members}
               labels={labels}
               selection={selection}
@@ -1434,6 +1435,29 @@ export function App() {
               }}
               onCreate={(status) => setComposing({ status })}
               onDrop={dropCard}
+              onReassign={(row, groupKey) => {
+                const id = currentRef.current;
+                if (!id) return;
+                if (display.group === "priority") {
+                  if (row.priority === groupKey) return;
+                  void predict(row.doc_id, "priority", groupKey, () =>
+                    rpc(id, { cmd: "issue_edit", reff: row.reff, priority: groupKey }),
+                  );
+                } else if (display.group === "assignee") {
+                  // Reassign = make the target the issue's sole assignee (or clear
+                  // it for the unassigned lane). `assign` is add/remove per key, so
+                  // this is a small batch; the doorbell repaints when it lands.
+                  const target = groupKey === "unassigned" ? null : groupKey;
+                  void guard(async () => {
+                    for (const k of row.assignees) {
+                      if (k !== target)
+                        await rpc(id, { cmd: "assign", reff: row.reff, who: [k], add: false });
+                    }
+                    if (target && !row.assignees.includes(target))
+                      await rpc(id, { cmd: "assign", reff: row.reff, who: [target], add: true });
+                  });
+                }
+              }}
               onEdit={(reff, nextField) => {
                 api.select(reff);
                 setDetail(true);

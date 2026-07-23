@@ -517,6 +517,10 @@ pub fn project_row(
                     .collect()
             })
             .unwrap_or_default(),
+        // Sub-issue progress is a board-projection concern (it needs the issues
+        // map to classify each child's status); the base row leaves it absent.
+        child_done: None,
+        child_total: None,
     }
 }
 
@@ -654,6 +658,38 @@ pub fn board_view(
         .get(project_id)
         .map(|b| b.iter().map(|(_, d)| d.clone()).collect())
         .unwrap_or_default();
+    // Sub-issue progress per parent, computed once: total = live children,
+    // done = children whose status is a Done-category state. Built from the same
+    // `catalog.parents` edge map the graph view reads, minus tombstoned children.
+    let mut child_progress: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+    for (child, parent) in &catalog.parents {
+        if catalog.tombstones.contains(child) {
+            continue;
+        }
+        let entry = child_progress.entry(parent.as_str()).or_insert((0, 0));
+        entry.1 += 1;
+        let done = issues
+            .get(child)
+            .is_some_and(|i| catalog.status_category(&i.status) == StatusCategory::Done);
+        if done {
+            entry.0 += 1;
+        }
+    }
+    // Build a board row and stamp its sub-issue progress (absent when childless).
+    let row_of = |doc: &str| -> Row {
+        let mut row = project_row(
+            catalog,
+            aliases,
+            doc,
+            issues.get(doc).map(|i| i.as_ref()),
+            me,
+        );
+        if let Some((done, total)) = child_progress.get(doc) {
+            row.child_done = Some(*done);
+            row.child_total = Some(*total);
+        }
+        row
+    };
     let mut columns = Vec::new();
     for state in &catalog.workflow {
         let mut rows: Vec<Row> = Vec::new();
@@ -666,25 +702,13 @@ pub fn board_view(
                 ib.cmp(&ia).then_with(|| b.cmp(a))
             });
             for doc in done {
-                rows.push(project_row(
-                    catalog,
-                    aliases,
-                    doc,
-                    issues.get(doc.as_str()).map(|i| i.as_ref()),
-                    me,
-                ));
+                rows.push(row_of(doc));
             }
         } else {
             let mut seen = BTreeSet::new();
             for doc in &board_order {
                 if members.contains(&doc) && in_state(doc) && seen.insert(doc.clone()) {
-                    rows.push(project_row(
-                        catalog,
-                        aliases,
-                        doc,
-                        issues.get(doc).map(|i| i.as_ref()),
-                        me,
-                    ));
+                    rows.push(row_of(doc));
                 }
             }
             let mut unlisted: Vec<&&String> = members
@@ -693,13 +717,7 @@ pub fn board_view(
                 .collect();
             unlisted.sort();
             for doc in unlisted {
-                rows.push(project_row(
-                    catalog,
-                    aliases,
-                    doc,
-                    issues.get(doc.as_str()).map(|i| i.as_ref()),
-                    me,
-                ));
+                rows.push(row_of(doc));
             }
         }
         columns.push(BoardColumn {

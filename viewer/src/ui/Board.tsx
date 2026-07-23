@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { MenuContent, MenuItem } from "./layout";
-import { CalendarClock, ChevronRight, ExternalLink, Flag, Gauge, Info, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
+import { CalendarClock, ChevronRight, ExternalLink, Flag, Gauge, Info, ListChecks, MoreHorizontal, Plus, Tags, UserPlus } from "lucide-react";
 
 import { loadBoardScroll, saveBoardScroll } from "../core/boardState";
+import { groupRows, type DisplayState, type RowGroup } from "../core/display";
 import type { IssueField } from "../core/registry";
 import type { BoardColumn, BoardPos, BoardView, LabelDto, MemberDto, Row } from "../types";
-import { AvatarStack, stackFor } from "./Avatar";
+import { AvatarStack, memberName, stackFor } from "./Avatar";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
 import { IconButton } from "./primitives";
@@ -34,6 +35,7 @@ const DUE_TONE = { overdue: "text-danger", soon: "text-warn", later: "text-mute"
  */
 export function Board({
   board,
+  display,
   members,
   labels,
   selection,
@@ -41,10 +43,15 @@ export function Board({
   onSelect,
   onCreate,
   onDrop,
+  onReassign,
   onEdit,
   readOnly,
 }: {
   board: BoardView;
+  /** How the board is grouped. `status` = workflow columns (the default and the
+   *  only axis with drag-ordering); `assignee`/`priority` = swimlane columns
+   *  whose drop reassigns that field instead of moving status. */
+  display: DisplayState;
   /** The ACL, for resolving assignee keys to faces. */
   members: MemberDto[];
   labels: LabelDto[];
@@ -55,9 +62,29 @@ export function Board({
   onCreate: (status: string) => void;
   /** A card landed. `pos` is null when the target column can't be ordered. */
   onDrop: (reff: string, status: string, pos: BoardPos | null) => void;
+  /** A card was dragged into a non-status swimlane: reassign it to `groupKey`
+   *  (a priority string, an assignee key, or `"unassigned"`). */
+  onReassign: (row: Row, groupKey: string) => void;
   onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
   readOnly: boolean;
 }) {
+  if (display.group === "assignee" || display.group === "priority") {
+    return (
+      <GroupedBoard
+        board={board}
+        display={display}
+        members={members}
+        labels={labels}
+        selection={selection}
+        optimistic={optimistic}
+        onSelect={onSelect}
+        onReassign={onReassign}
+        onStatusMove={onDrop}
+        onEdit={onEdit}
+        readOnly={readOnly}
+      />
+    );
+  }
   /** The card in flight, and the column it left. */
   const [drag, setDrag] = useState<{ reff: string; from: string } | null>(null);
   /** Where it would land. Rendered as the gap. */
@@ -133,6 +160,203 @@ export function Board({
         />
       ))}
     </div>
+  );
+}
+
+/**
+ * The board grouped by a field that is *not* status — assignee or priority.
+ *
+ * Columns come from `groupRows` (the same swimlane buckets the list uses), so the
+ * two views agree. The drop verb is different from the status board's: there is no
+ * `boards[P]` position for these axes, so a card dropped into a column reassigns
+ * that field (`onReassign`) rather than moving its status and its order. The card's
+ * own "Move to" menu still changes status — the two verbs stay distinct.
+ */
+function GroupedBoard({
+  board,
+  display,
+  members,
+  labels,
+  selection,
+  optimistic,
+  onSelect,
+  onReassign,
+  onStatusMove,
+  onEdit,
+  readOnly,
+}: {
+  board: BoardView;
+  display: DisplayState;
+  members: MemberDto[];
+  labels: LabelDto[];
+  selection: string | null;
+  optimistic: ReadonlySet<string>;
+  onSelect: (reff: string) => void;
+  onReassign: (row: Row, groupKey: string) => void;
+  onStatusMove: (reff: string, status: string, pos: BoardPos | null) => void;
+  onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
+  readOnly: boolean;
+}) {
+  const [drag, setDrag] = useState<{ reff: string; from: string } | null>(null);
+  const [overCol, setOverCol] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState("");
+
+  const axis = display.group === "priority" ? "priority" : "assignee";
+  const groups = groupRows(board, display);
+  const columns = board.columns;
+  const moveStatus = (row: Row, col: BoardColumn) => onStatusMove(row.reff, col.state.id, boardMovePosition(col));
+  const rowByReff = new Map(board.columns.flatMap((c) => c.rows).map((r) => [r.reff, r]));
+
+  const drop = (group: RowGroup) => {
+    if (!drag) return;
+    const row = rowByReff.get(drag.reff);
+    if (row && group.key !== drag.from) {
+      onReassign(row, group.key);
+      setAnnouncement(`Moved ${row.key_alias ?? row.reff} to ${group.label}`);
+    }
+    setDrag(null);
+    setOverCol(null);
+  };
+
+  return (
+    <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-3" aria-label="Issue board" tabIndex={0}>
+      <p className="sr-only" aria-live="polite">{announcement}</p>
+      {groups.map((group) => (
+        <GroupedColumn
+          key={group.key}
+          group={group}
+          axis={axis}
+          members={members}
+          labels={labels}
+          selection={selection}
+          optimistic={optimistic}
+          columns={columns}
+          active={drag !== null && !readOnly}
+          over={overCol === group.key}
+          readOnly={readOnly}
+          onSelect={onSelect}
+          onDragStart={(reff) => setDrag({ reff, from: group.key })}
+          onDragEnd={() => {
+            setDrag(null);
+            setOverCol(null);
+          }}
+          onOver={() => setOverCol(group.key)}
+          onDrop={() => drop(group)}
+          onMove={moveStatus}
+          onEdit={onEdit}
+        />
+      ))}
+    </div>
+  );
+}
+
+function GroupedColumn({
+  group,
+  axis,
+  members,
+  labels,
+  selection,
+  optimistic,
+  columns,
+  active,
+  over,
+  readOnly,
+  onSelect,
+  onDragStart,
+  onDragEnd,
+  onOver,
+  onDrop,
+  onMove,
+  onEdit,
+}: {
+  group: RowGroup;
+  axis: "assignee" | "priority";
+  members: MemberDto[];
+  labels: LabelDto[];
+  selection: string | null;
+  optimistic: ReadonlySet<string>;
+  columns: BoardColumn[];
+  active: boolean;
+  over: boolean;
+  readOnly: boolean;
+  onSelect: (reff: string) => void;
+  onDragStart: (reff: string) => void;
+  onDragEnd: () => void;
+  onOver: () => void;
+  onDrop: () => void;
+  onMove: (row: Row, col: BoardColumn) => void;
+  onEdit: (reff: string, field: Extract<IssueField, "priority" | "assignee" | "label">) => void;
+}) {
+  const rows = group.rows.filter((r) => !r.tombstone);
+  const unassigned = axis === "assignee" && group.key === "unassigned";
+  return (
+    <section className={`flex shrink-0 flex-col ${rows.length ? "w-72" : "w-60"}`}>
+      <header className="flex h-8 shrink-0 items-center gap-2 px-1">
+        {axis === "priority" ? (
+          <PriorityIcon priority={rows[0]?.priority ?? "none"} />
+        ) : unassigned ? (
+          <span className="border-line text-mute flex size-4 items-center justify-center rounded-full border border-dashed text-[9px]">
+            ?
+          </span>
+        ) : (
+          <AvatarStack members={stackFor([group.key], members)} />
+        )}
+        <h2 className="text-base font-semibold capitalize">
+          {axis === "assignee" && !unassigned ? memberName(group.key, members.find((m) => m.key === group.key)) : group.label}
+        </h2>
+        <span className="text-mute text-sm tabular-nums">{rows.length}</span>
+      </header>
+      <ul
+        aria-label={`${group.label} issues`}
+        data-board-collection
+        className={[
+          "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded p-1 transition-colors",
+          active && over ? "bg-hover" : "",
+        ].join(" ")}
+        onDragOver={(e) => {
+          if (!active) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          onOver();
+        }}
+        onDrop={(e) => {
+          if (!active) return;
+          e.preventDefault();
+          onDrop();
+        }}
+      >
+        {rows.map((row) => (
+          <Card
+            key={row.reff}
+            row={row}
+            members={members}
+            labels={labels}
+            selected={row.reff === selection}
+            pending={optimistic.has(row.doc_id)}
+            dragging={false}
+            gap={null}
+            draggable={!readOnly && !row.tombstone}
+            onSelect={onSelect}
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
+            onOver={() => onOver()}
+            columns={columns}
+            onMove={onMove}
+            onEdit={onEdit}
+          />
+        ))}
+        {rows.length === 0 && (
+          <li
+            className={[
+              "text-mute rounded border border-dashed p-4 text-center text-sm transition-colors",
+              active && over ? "border-accent text-accent" : "border-line",
+            ].join(" ")}
+          >
+            {active && over ? "Drop here" : "—"}
+          </li>
+        )}
+      </ul>
+    </section>
   );
 }
 
@@ -489,7 +713,10 @@ function Card({
             </DropdownMenu.Root>
           )}
         </div>
-        {((row.label_names?.length ?? 0) > 0 || row.due_date != null || row.estimate != null) && (
+        {((row.label_names?.length ?? 0) > 0 ||
+          row.due_date != null ||
+          row.estimate != null ||
+          (row.child_total ?? 0) > 0) && (
           <div className="mb-1.5 flex flex-wrap items-center gap-1">
             {(row.label_names ?? []).slice(0, 3).map((name) => {
               const def = labels.find((l) => l.name === name);
@@ -519,6 +746,17 @@ function Card({
               <span className="text-mute flex items-center gap-1 text-2xs">
                 <Gauge className="size-3" />
                 {row.estimate}
+              </span>
+            )}
+            {(row.child_total ?? 0) > 0 && (
+              <span
+                className={`flex items-center gap-1 text-2xs ${
+                  row.child_done === row.child_total ? "text-ok" : "text-mute"
+                }`}
+                title={`${row.child_done} of ${row.child_total} sub-issues done`}
+              >
+                <ListChecks className="size-3" />
+                {row.child_done}/{row.child_total}
               </span>
             )}
           </div>

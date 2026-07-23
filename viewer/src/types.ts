@@ -90,6 +90,10 @@ export interface Row {
   estimate?: number | null;
   /** Resolved label names (absent/empty = none). */
   label_names?: string[];
+  /** Sub-issue progress: done / total live children. Absent = no children.
+   *  Populated by the board projection only. */
+  child_done?: number | null;
+  child_total?: number | null;
 }
 
 export interface BoardColumn {
@@ -258,6 +262,21 @@ export interface MemberLogEntry {
   role?: string | null;
   /** Whether replay honored the op (false = unauthorized or undecodable). */
   authorized: boolean;
+}
+
+/**
+ * One effective scoped capability assignment — `dto.rs` `AssignmentDto`.
+ *
+ * A role grant (`access_grant`) expands the role's pinned definition into one of
+ * these per capability, each with its own `grant_id` (the revocation handle).
+ * `resource` empty = the Space; `[projectId]` = that project's scope.
+ */
+export interface AssignmentDto {
+  grant_id: string;
+  actor: string;
+  world: string;
+  capability: string;
+  resource: string[];
 }
 
 /** A pinned seed ("remote") — a bootstrap + backfill anchor, never trust. */
@@ -486,6 +505,13 @@ export type Request =
   | { cmd: "workflow_set"; project: string; expect_heads: string[]; body_json: string }
   /** Reply is `text` — every role definition as pretty JSON. */
   | { cmd: "role_list" }
+  /** Reply is `assignments` — effective scoped grants, optionally one actor. */
+  | { cmd: "access_list"; actor?: string | null }
+  /** Expand a role's pinned caps and install them for an actor (Space- or
+   *  project-scoped). All-or-nothing; authority-first. */
+  | { cmd: "access_grant"; actor: string; role: string; project?: string | null }
+  /** Revoke one effective capability assignment by its 64-hex grant id. */
+  | { cmd: "access_revoke"; grant_id: string }
   | { cmd: "join"; ticket: string }
   | { cmd: "seed_list" }
   | { cmd: "log"; since: number }
@@ -511,6 +537,7 @@ export type Response =
   | { kind: "projects"; projects: ProjectDto[] }
   | { kind: "labels"; labels: LabelDto[] }
   | { kind: "members"; members: MemberDto[] }
+  | { kind: "assignments"; rows: AssignmentDto[] }
   | { kind: "member_log"; entries: MemberLogEntry[] }
   | { kind: "seeds"; seeds: SeedDto[] }
   /** A ref resolved to several — a first-class outcome (exit 2), never an error. */

@@ -44,7 +44,7 @@ export function DisplayOptions({
         </IconButton>
       </Popover.Trigger>
       <PopoverContent align="end" className="flex w-64 flex-col gap-3 p-3">
-          <Axis label={view === "board" ? "Grouping (board is by status)" : "Group by"}>
+          <Axis label="Group by">
             {(
               [
                 ["status", "Status"],
@@ -52,15 +52,19 @@ export function DisplayOptions({
                 ["priority", "Priority"],
                 ["none", "None"],
               ] as const
-            ).map(([id, label]) => (
-              <Choice
-                key={id}
-                label={label}
-                active={display.group === id}
-                disabled={view === "board"}
-                onClick={() => onChange({ ...display, group: id as GroupBy })}
-              />
-            ))}
+            )
+              // "None" is a list-only shape — a single-column board is just the
+              // list; the board's other axes (status/assignee/priority) become
+              // its columns.
+              .filter(([id]) => !(view === "board" && id === "none"))
+              .map(([id, label]) => (
+                <Choice
+                  key={id}
+                  label={label}
+                  active={display.group === id}
+                  onClick={() => onChange({ ...display, group: id as GroupBy })}
+                />
+              ))}
           </Axis>
 
           <Axis label="Order by">

@@ -1,8 +1,19 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Hash, Palette, SlidersHorizontal, Tag, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ArrowLeft,
+  Hash,
+  Palette,
+  ShieldCheck,
+  ShieldPlus,
+  SlidersHorizontal,
+  Tag,
+  Trash2,
+  X,
+} from "lucide-react";
 
 import { rpc } from "../api";
-import type { LabelDto, ProjectDto } from "../types";
+import type { AssignmentDto, LabelDto, MemberDto, ProjectDto } from "../types";
+import { memberName } from "./Avatar";
 import { catalogColor } from "./colors";
 import { ColorPicker } from "./ColorPicker";
 import * as ask from "./dialogs";
@@ -11,7 +22,7 @@ import { SurfaceHeader } from "./layout";
 import { Combobox } from "./Picker";
 import { Button, IconButton } from "./primitives";
 
-type Tab = "general" | "labels" | "workflow";
+type Tab = "general" | "labels" | "workflow" | "access";
 
 /**
  * The settings surface — the place a space is administered like an application.
@@ -48,7 +59,7 @@ export function Settings({
   // (and reliably reachable by a headless driver via `open`, no click needed).
   const [tab, setTabState] = useState<Tab>(() => {
     const t = new URLSearchParams(window.location.search).get("tab");
-    return t === "labels" || t === "workflow" ? t : "general";
+    return t === "labels" || t === "workflow" || t === "access" ? t : "general";
   });
   const setTab = (next: Tab) => {
     setTabState(next);
@@ -61,7 +72,7 @@ export function Settings({
   useEffect(() => {
     const onNav = (event: Event) => {
       const t = (event as CustomEvent).detail?.tab;
-      if (t === "general" || t === "labels" || t === "workflow") setTab(t);
+      if (t === "general" || t === "labels" || t === "workflow" || t === "access") setTab(t);
     };
     window.addEventListener("lait:nav", onNav as EventListener);
     return () => window.removeEventListener("lait:nav", onNav as EventListener);
@@ -70,6 +81,7 @@ export function Settings({
     { id: "general", label: "General", icon: <SlidersHorizontal className="size-3.5" /> },
     { id: "labels", label: "Labels", icon: <Tag className="size-3.5" /> },
     { id: "workflow", label: "Workflow", icon: <Palette className="size-3.5" /> },
+    { id: "access", label: "Roles & access", icon: <ShieldCheck className="size-3.5" /> },
   ];
 
   return (
@@ -110,6 +122,15 @@ export function Settings({
             )}
             {tab === "workflow" && (
               <WorkflowPanel
+                spaceId={spaceId}
+                projects={projects}
+                readOnly={readOnly}
+                revision={revision}
+                onError={onError}
+              />
+            )}
+            {tab === "access" && (
+              <AccessPanel
                 spaceId={spaceId}
                 projects={projects}
                 readOnly={readOnly}
@@ -536,5 +557,296 @@ function WorkflowPanel({
         </>
       )}
     </Section>
+  );
+}
+
+// ---- Roles & access ---------------------------------------------------------
+
+interface RoleWire {
+  role_id: string;
+  built_in: boolean;
+  revision: {
+    revision_id: string;
+    body: { name: string; description: string; scope_kind: string; capabilities: string[] };
+  } | null;
+  conflict_heads: string[];
+}
+
+/** The name a role grant carries, falling back to its id. */
+function roleName(r: RoleWire): string {
+  return r.revision?.body.name ?? r.role_id;
+}
+
+/**
+ * Roles & access — the plan-04 authority layer, made browser-operable.
+ *
+ * The engine has always spoken this (`role_list` / `access_list` / `access_grant`
+ * / `access_revoke`); until now it was terminal-only, so a browser-first admin
+ * could see a *membership* role on the Members page but never grant a scoped
+ * capability. This surfaces the role catalogue read-only (authoring a role is a
+ * CAS ceremony best left to the CLI) and makes the *assignment* verbs — grant a
+ * role's capabilities to an actor, revoke one — first-class here.
+ *
+ * A grant expands a role into one assignment per capability, each with its own
+ * `grant_id`; revoke is per capability, so the list is grouped by actor and every
+ * held capability carries its own revoke handle.
+ */
+function AccessPanel({
+  spaceId,
+  projects,
+  readOnly,
+  revision,
+  onError,
+}: {
+  spaceId: string;
+  projects: ProjectDto[];
+  readOnly: boolean;
+  revision: number;
+  onError: (message: string) => void;
+}) {
+  const [roles, setRoles] = useState<RoleWire[] | null>(null);
+  const [members, setMembers] = useState<MemberDto[] | null>(null);
+  const [rows, setRows] = useState<AssignmentDto[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [grantActor, setGrantActor] = useState<string | null>(null);
+  const [grantRole, setGrantRole] = useState<string | null>(null);
+  const [grantProject, setGrantProject] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [r, m, a] = await Promise.all([
+        rpc(spaceId, { cmd: "role_list" }),
+        rpc(spaceId, { cmd: "members" }),
+        rpc(spaceId, { cmd: "access_list" }),
+      ]);
+      if (r.kind === "text") setRoles(JSON.parse(r.text) as RoleWire[]);
+      if (m.kind === "members") setMembers(m.members);
+      if (a.kind === "assignments") setRows(a.rows);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    }
+  }, [spaceId, onError]);
+
+  useEffect(() => {
+    void load();
+  }, [load, revision]);
+
+  const nameOf = useCallback(
+    (actor: string) => memberName(actor, members?.find((m) => m.key === actor)),
+    [members],
+  );
+  const projectLabel = useCallback(
+    (id: string) => projects.find((p) => p.id === id || p.key === id)?.key ?? id,
+    [projects],
+  );
+
+  /** Assignments folded by actor, so each person reads as one block. */
+  const byActor = useMemo(() => {
+    const groups = new Map<string, AssignmentDto[]>();
+    for (const row of rows ?? []) {
+      const list = groups.get(row.actor) ?? [];
+      list.push(row);
+      groups.set(row.actor, list);
+    }
+    return [...groups.entries()].sort((a, b) => nameOf(a[0]).localeCompare(nameOf(b[0])));
+  }, [rows, nameOf]);
+
+  const grant = async () => {
+    if (!grantActor || !grantRole) return;
+    setBusy(true);
+    try {
+      await rpc(spaceId, {
+        cmd: "access_grant",
+        actor: grantActor,
+        role: grantRole,
+        project: grantProject,
+      });
+      setGrantActor(null);
+      setGrantRole(null);
+      setGrantProject(null);
+      await load();
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revoke = (row: AssignmentDto) =>
+    void ask
+      .confirm({
+        title: `Revoke ${row.capability}?`,
+        body: `Removes this one capability from ${nameOf(row.actor)}. Their base membership role is unaffected.`,
+        confirmText: "Revoke",
+        danger: true,
+      })
+      .then(async (ok) => {
+        if (!ok) return;
+        setBusy(true);
+        try {
+          await rpc(spaceId, { cmd: "access_revoke", grant_id: row.grant_id });
+          await load();
+        } catch (e) {
+          onError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setBusy(false);
+        }
+      });
+
+  const grantableRoles = (roles ?? []).filter((r) => r.revision && !r.conflict_heads.length);
+
+  return (
+    <>
+      <Section
+        title="Roles"
+        hint="Named capability sets from the signed policy. Authoring a role is a CAS ceremony — create and edit them with lait role create/edit."
+      >
+        {!roles && <p className="text-mute text-sm">Loading…</p>}
+        <ul className="flex flex-col gap-2">
+          {roles?.map((role) => (
+            <li key={role.role_id} className="border-line rounded border p-3">
+              <div className="flex items-center gap-2">
+                <span className="font-medium">{roleName(role)}</span>
+                {role.built_in && (
+                  <span className="text-accent flex items-center gap-1 text-2xs" title="Immutable">
+                    <ShieldCheck className="size-3" />
+                    built-in
+                  </span>
+                )}
+                <span className="text-mute text-2xs capitalize">
+                  {role.revision?.body.scope_kind ?? ""}
+                </span>
+              </div>
+              {role.revision?.body.description && (
+                <p className="text-dim mt-1 text-sm">{role.revision.body.description}</p>
+              )}
+              <ul className="mt-2 flex flex-wrap gap-1">
+                {(role.revision?.body.capabilities ?? []).map((c) => (
+                  <li
+                    key={c}
+                    className="border-line-strong text-dim rounded-full border px-2 py-px font-mono text-2xs"
+                  >
+                    {c}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      </Section>
+
+      <Section
+        title="Access grants"
+        hint="Capabilities granted to an actor beyond their base membership role, at the Space or a single project."
+      >
+        {!readOnly && (
+          <div className="border-line mb-4 flex flex-wrap items-end gap-2 rounded border p-3">
+            <Combobox
+              label="Member"
+              value={
+                grantActor
+                  ? { id: grantActor, label: nameOf(grantActor) }
+                  : null
+              }
+              placeholder="Member…"
+              options={(members ?? []).map((m) => ({
+                id: m.key,
+                label: memberName(m.key, m),
+                hint: m.role,
+              }))}
+              onPick={setGrantActor}
+            />
+            <Combobox
+              label="Role"
+              value={
+                grantRole
+                  ? {
+                      id: grantRole,
+                      label: roleName(
+                        grantableRoles.find((r) => r.role_id === grantRole) ?? {
+                          role_id: grantRole,
+                          built_in: false,
+                          revision: null,
+                          conflict_heads: [],
+                        },
+                      ),
+                    }
+                  : null
+              }
+              placeholder="Role…"
+              options={grantableRoles.map((r) => ({
+                id: r.role_id,
+                label: roleName(r),
+                hint: r.revision?.body.scope_kind ?? "",
+              }))}
+              onPick={setGrantRole}
+            />
+            <Combobox
+              label="Scope"
+              value={{
+                id: grantProject ?? "",
+                label: grantProject ? projectLabel(grantProject) : "Whole space",
+              }}
+              placeholder="Whole space"
+              options={[
+                { id: "", label: "Whole space" },
+                ...projects.map((p) => ({
+                  id: p.key,
+                  label: p.name,
+                  swatch: catalogColor(p.color),
+                  hint: p.key,
+                })),
+              ]}
+              onPick={(id) => setGrantProject(id === "" ? null : id)}
+            />
+            <Button
+              variant="primary"
+              size="md"
+              disabled={!grantActor || !grantRole || busy}
+              loading={busy}
+              onClick={() => void grant()}
+            >
+              <ShieldPlus className="size-3.5" />
+              Grant
+            </Button>
+          </div>
+        )}
+
+        {!rows && <p className="text-mute text-sm">Loading…</p>}
+        {rows && byActor.length === 0 && (
+          <p className="text-mute text-sm">
+            No scoped grants. Members act with their base role until granted extra capabilities here.
+          </p>
+        )}
+        <ul className="flex flex-col gap-3">
+          {byActor.map(([actor, items]) => (
+            <li key={actor} className="border-line rounded border p-3">
+              <div className="mb-2 font-medium">{nameOf(actor)}</div>
+              <ul className="flex flex-col gap-1">
+                {items.map((row) => (
+                  <li key={row.grant_id} className="flex items-center gap-2 text-sm">
+                    <code className="font-mono text-xs">{row.capability}</code>
+                    <span className="text-mute text-2xs">
+                      {row.resource.length === 0 ? "space" : projectLabel(row.resource[0] ?? "")}
+                    </span>
+                    {!readOnly && (
+                      <IconButton
+                        label={`Revoke ${row.capability}`}
+                        variant="danger"
+                        disabled={busy}
+                        className="ml-auto"
+                        onClick={() => revoke(row)}
+                      >
+                        <X className="size-3.5" />
+                      </IconButton>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      </Section>
+    </>
   );
 }
