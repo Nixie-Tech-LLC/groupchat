@@ -1511,8 +1511,10 @@ export function App() {
           onClose={() => setComposingProject(false)}
           // Land in what you just made. Creating a project and staying on the old
           // board is the app ignoring the thing you came to do.
-          onCreated={(key) => setProject(key)}
-          onError={setError}
+          onCreated={(key) => {
+            api.pickProject(key);
+            setToast(`Created ${key}`);
+          }}
         />
       )}
       <Dialog.Root open={mobileNav} onOpenChange={setMobileNav}>

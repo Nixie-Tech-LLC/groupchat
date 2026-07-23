@@ -31,38 +31,31 @@ export function NewProject({
   taken,
   onClose,
   onCreated,
-  onError,
 }: {
   spaceId: string;
   /** Existing keys, uppercased — the daemon refuses a duplicate. */
   taken: string[];
   onClose: () => void;
   onCreated: (key: string) => void;
-  onError: (m: string) => void;
 }) {
   const [name, setName] = useState("");
   const [key, setKey] = useState("");
   /** Once you edit the key yourself, the name stops driving it. */
   const [manual, setManual] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState("");
 
   const derived = manual ? key : deriveKey(name);
   const upper = derived.toUpperCase();
 
-  const problem =
-    derived === ""
-      ? null // nothing typed yet is not an error, just not ready
-      : !KEY_RE.test(derived)
-        ? "1–8 letters, no digits or punctuation"
-        : taken.includes(upper)
-          ? `${upper} is already a project here`
-          : null;
+  const problem = projectKeyProblem(derived, taken);
 
   const ready = name.trim() !== "" && derived !== "" && !problem && !busy;
 
   const create = async () => {
     if (!ready) return;
     setBusy(true);
+    setFailure("");
     try {
       const r = await rpc(spaceId, { cmd: "project_new", name: name.trim(), key: upper });
       // `project_new` replies with the key as the ref — switch the board to it, so
@@ -70,8 +63,7 @@ export function NewProject({
       if (r.kind === "ref") onCreated(r.reff);
       onClose();
     } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-      onClose();
+      setFailure(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -127,14 +119,20 @@ export function NewProject({
                     problem ? "border-danger" : "border-line focus:border-line-strong"
                   }`}
                   aria-invalid={problem !== null}
+                  aria-describedby="project-key-guidance"
                 />
-                <span className={`text-xs ${problem ? "text-danger" : "text-mute"}`}>
+                <span id="project-key-guidance" className={`text-xs ${problem ? "text-danger" : "text-mute"}`}>
                   {problem ??
                     (upper
                       ? `Issues here will be ${upper}-1, ${upper}-2…`
                       : "Becomes the KEY in KEY-1 — 1–8 letters")}
                 </span>
               </label>
+              {failure && (
+                <p className="border-danger/25 bg-danger/5 text-danger rounded border p-2 text-xs" role="alert">
+                  Project not created. Your name and key are still here: {failure}
+                </p>
+              )}
             </div>
 
             <footer className="border-line flex items-center justify-end gap-2 border-t p-3">
@@ -157,7 +155,7 @@ export function NewProject({
  * letters (`Engineering` → `ENG`). Non-letters are dropped rather than rejected,
  * because a name like "Web 2.0" should still suggest something rather than nothing.
  */
-function deriveKey(name: string): string {
+export function deriveKey(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
   if (words.length === 0) return "";
   if (words.length > 1) {
@@ -168,4 +166,12 @@ function deriveKey(name: string): string {
       .toUpperCase();
   }
   return (words[0] ?? "").replace(/[^A-Za-z]/g, "").slice(0, 3).toUpperCase();
+}
+
+export function projectKeyProblem(key: string, taken: readonly string[]): string | null {
+  if (!key) return null;
+  const upper = key.toUpperCase();
+  if (!KEY_RE.test(key)) return "1–8 letters, no digits or punctuation";
+  if (taken.includes(upper)) return `${upper} is already a project here`;
+  return null;
 }
