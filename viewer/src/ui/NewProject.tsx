@@ -80,9 +80,9 @@ export function NewProject({
   return (
     <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+        <Dialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
         <Dialog.Content
-          className="border-line-strong bg-raised shadow-overlay fixed top-[18vh] left-1/2 z-50 w-[min(440px,92vw)] -translate-x-1/2 rounded-lg border"
+          className="ui-surface border-line-strong bg-raised shadow-overlay fixed top-[18vh] left-1/2 z-50 w-[min(440px,92vw)] -translate-x-1/2 rounded-lg border"
           aria-describedby={undefined}
         >
           <form

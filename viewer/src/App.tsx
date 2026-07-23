@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
 import {
   Inbox as InboxIcon,
+  Command as CommandIcon,
   LayoutGrid,
   List,
   ListFilter,
@@ -22,14 +23,24 @@ import {
   type IssueField,
   type View,
 } from "./core/registry";
+import {
+  formatRoute,
+  loadLastRoute,
+  parseRoute,
+  resolveLocalSpace,
+  saveLastRoute,
+  type ViewerRoute,
+} from "./core/route";
 import { useKeys } from "./core/useKeys";
 import { neighbourState, workTarget } from "./core/workflow";
 import { Activity } from "./ui/Activity";
+import { EmptyState, InlineError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
 import { BulkBar } from "./ui/BulkBar";
 import { DisplayOptions } from "./ui/DisplayOptions";
 import { FilterBar } from "./ui/FilterBar";
 import { Inbox } from "./ui/Inbox";
+import { IssueSearch, rememberIssue } from "./ui/IssueSearch";
 import { Members } from "./ui/Members";
 import { IssueDetail } from "./ui/IssueDetail";
 import { IssueList } from "./ui/IssueList";
@@ -44,6 +55,7 @@ import { DialogHost } from "./ui/dialogs";
 import { Combobox } from "./ui/Picker";
 import { IconButton, TooltipProvider } from "./ui/primitives";
 import { Sidebar } from "./ui/Sidebar";
+import { SavedViews } from "./ui/SavedViews";
 import {
   applyFilter,
   EMPTY_FILTER,
@@ -61,11 +73,14 @@ import {
   type ProjectDto,
   type Row,
   type SpaceRow,
+  type StatusInfo,
   type WorkflowState,
 } from "./types";
 import "./commands";
 
-type Modal = "palette" | "shortcuts" | "workflow" | "roles" | null;
+type Modal = "palette" | "issueSearch" | "shortcuts" | "workflow" | "roles" | null;
+type ThemePreference = "system" | "light" | "dark";
+const THEME_PREFERENCE = "lait.theme";
 
 /**
  * The shell.
@@ -77,34 +92,47 @@ type Modal = "palette" | "shortcuts" | "workflow" | "roles" | null;
  * "click" and "keypress" from drifting apart.
  */
 export function App() {
+  // Read once. The route contains canonical product identity only; this machine
+  // resolves the space id to its own local replica after `/api/spaces` answers.
+  const initialRoute = useRef((() => {
+    const fromUrl = parseRoute(window.location);
+    return fromUrl.spaceId ? fromUrl : (loadLastRoute() ?? fromUrl);
+  })()).current;
   const [spaces, setSpaces] = useState<SpaceRow[]>([]);
+  /** Canonical `ws_…` identity in the URL, distinct from the supervisor's
+   * machine-local store handle used by RPC. */
+  const [routeSpace, setRouteSpace] = useState<string | null>(initialRoute.spaceId);
   const [current, setCurrent] = useState<string | null>(null);
   const [board, setBoard] = useState<BoardView | null>(null);
-  const [selection, setSelection] = useState<string | null>(null);
+  const [selection, setSelection] = useState<string | null>(initialRoute.issue);
   const [modal, setModal] = useState<Modal>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState(true);
-  const [view, setView] = useState<View>("list");
+  const [focusedDetail, setFocusedDetail] = useState(false);
+  const [view, setView] = useState<View>(initialRoute.view);
   const [unread, setUnread] = useState(0);
   /** The composer, and the column it was opened from (null = closed). */
   const [composing, setComposing] = useState<{ status?: string } | null>(null);
   const [composingProject, setComposingProject] = useState(false);
-  const [filter, setFilter] = useState<FilterState>(EMPTY_FILTER);
+  const [filter, setFilter] = useState<FilterState>(initialRoute.filter ?? EMPTY_FILTER);
   const [filterOpen, setFilterOpen] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
   /** Group / order / show-deleted. Loaded once; every change is persisted. */
   const [display, setDisplay] = useState<DisplayState>(loadDisplay);
   const [displayOpen, setDisplayOpen] = useState(false);
+  const [mobileNav, setMobileNav] = useState(false);
   /** Bulk-selection checks, by canonical ref. Distinct from `selection`: the
    *  focus is one row, the checks are a set, and `x` is the bridge. */
   const [checked, setChecked] = useState<ReadonlySet<string>>(new Set());
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number; failed?: string } | null>(null);
   const [labels, setLabels] = useState<LabelDto[]>([]);
   const [members, setMembers] = useState<MemberDto[]>([]);
   const [projects, setProjects] = useState<ProjectDto[]>([]);
+  const [statusInfo, setStatusInfo] = useState<StatusInfo | null>(null);
   /** Which project's board is on screen. `null` = let the daemon's chain pick
    *  (branch key → `project.default` → the only project), same as a bare `lait board`. */
-  const [project, setProject] = useState<string | null>(null);
+  const [project, setProject] = useState<string | null>(initialRoute.project);
   /** The picker a keybinding has asked for. Also an overlay: it owns the keymap. */
   const [field, setField] = useState<IssueField | null>(null);
   /** Doc-ids the daemon says qualify. `null` = the daemon wasn't asked, which is
@@ -119,6 +147,7 @@ export function App() {
    *  and every render a new overlay. */
   const overlay = useRef(new Overlay());
   const [predicted, setPredicted] = useState(0);
+  const [mutationNotice, setMutationNotice] = useState("");
   /** Monotonic load token — see `loadBoard`. A generalisation of an `alive` flag:
    *  it also orders two loads of the *same* space, which `alive` cannot. Bumped
    *  when a load is *requested*, not when it starts: once requests coalesce, the
@@ -131,8 +160,47 @@ export function App() {
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
 
+  useEffect(() => {
+    applyTheme(loadTheme());
+  }, []);
+  const spacesRef = useRef(spaces);
+  spacesRef.current = spaces;
+  const routeSpaceRef = useRef(routeSpace);
+  routeSpaceRef.current = routeSpace;
+
+  /** Apply browser history without waking a daemon or inventing local identity. */
+  const applyRoute = useCallback((route: ViewerRoute) => {
+    setRouteSpace(route.spaceId);
+    const local = resolveLocalSpace(route.spaceId, spacesRef.current);
+    setCurrent(local?.id ?? null);
+    setProject(route.project);
+    setView(route.view);
+    setSelection(route.issue);
+    setFilter(route.filter ?? EMPTY_FILTER);
+    setDetail(route.issue !== null);
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => applyRoute(parseRoute(window.location));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [applyRoute]);
+
+  // Selection can be repaired after a board refresh and a multi-project space can
+  // resolve its initial project asynchronously. Replace keeps the address honest
+  // without turning those automatic corrections into Back-button destinations.
+  useEffect(() => {
+    const href = formatRoute({ spaceId: routeSpace, project, view, issue: selection, filter });
+    if (`${window.location.pathname}${window.location.search}` !== href) {
+      window.history.replaceState(null, "", href);
+    }
+    saveLastRoute({ spaceId: routeSpace, project, view, issue: selection, filter });
+  }, [routeSpace, project, view, selection, filter]);
+
   const space = spaces.find((s) => s.id === current) ?? null;
   const readOnly = space ? isReadOnly(space) : false;
+  const missingProject =
+    project !== null && projects.length > 0 && !projects.some((candidate) => candidate.key === project);
 
   // Overlay first, then filter: a predicted title should be findable by the text
   // you just typed into it, and a predicted status should filter as its new one.
@@ -172,10 +240,18 @@ export function App() {
       setError(null);
       setCurrent((cur) => {
         if (cur) return cur;
+        const requested = routeSpaceRef.current;
+        if (requested) {
+          return resolveLocalSpace(requested, spaces)?.id ?? null;
+        }
         // Attaching an agent brings that agent *online*, so auto-select only our
         // own single unambiguous space — never an agent.
         const mine = spaces.filter((s) => !isReadOnly(s));
-        return mine.length === 1 && mine[0] ? mine[0].id : null;
+        if (mine.length === 1 && mine[0]) {
+          setRouteSpace(mine[0].space);
+          return mine[0].id;
+        }
+        return null;
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -263,11 +339,6 @@ export function App() {
     void loadBoard(current, project);
   }, [current, project, loadBoard]);
 
-  // A project selected in one space does not exist in the next one.
-  useEffect(() => {
-    setProject(null);
-  }, [current]);
-
   /**
    * Name a project once we know there is a choice.
    *
@@ -305,6 +376,7 @@ export function App() {
       setLabels([]);
       setMembers([]);
       setProjects([]);
+      setStatusInfo(null);
       return;
     }
     let alive = true;
@@ -318,6 +390,7 @@ export function App() {
       if (!alive) return;
       if (l?.kind === "labels") setLabels(l.labels);
       if (p?.kind === "projects") setProjects(p.projects);
+      if (s?.kind === "status") setStatusInfo(s);
       if (m?.kind === "members") {
         // `members` carries no alias for **you**: a petname is something you assign
         // to other people, so `replica.rs::members` reports `alias: ""` for `me`.
@@ -381,8 +454,15 @@ export function App() {
 
   // A selection that no longer exists (deleted, filtered away) must not linger.
   useEffect(() => {
-    setSelection((s) => (s && rows.some((r) => r.reff === s) ? s : (rows[0]?.reff ?? null)));
-  }, [rows]);
+    // Preserve a deep-linked issue until its board arrives. Treating the initial
+    // empty rows array as authoritative would erase `?issue=…` before the first
+    // request even had a chance to resolve it.
+    if (!board || (view !== "list" && view !== "board")) return;
+    // Keep an explicit unknown ref so the detail surface can say it is missing.
+    // Redirecting it to the first row would rewrite a broken/shared link into a
+    // different issue and make the failure invisible.
+    setSelection((selected) => selected ?? rows[0]?.reff ?? null);
+  }, [board, view, rows]);
 
   // Checks on rows that left the view are stale writes waiting to happen: a
   // bulk action must only ever touch what the user can currently see checked.
@@ -490,11 +570,14 @@ export function App() {
     async (doc: string, field: Field, value: string, send: () => Promise<unknown>) => {
       overlay.current.set(doc, field, value);
       setPredicted((n) => n + 1);
+      setMutationNotice(`Updating ${field} locally`);
       try {
         await send();
+        setMutationNotice(`${field} saved locally`);
       } catch (e) {
         overlay.current.clearDoc(doc);
         setPredicted((n) => n + 1);
+        setMutationNotice(`${field} was refused; authoritative local value restored`);
         if (!(e instanceof ConfirmRequired)) {
           setError(e instanceof LaitError ? e.message : String(e));
         }
@@ -523,28 +606,47 @@ export function App() {
    */
   const bulk = useCallback(async (fn: (reff: string) => Promise<unknown>) => {
     const targets = rowsRef.current.filter((r) => checkedRef.current.has(r.reff));
-    for (const row of targets) {
+    setBulkProgress({ done: 0, total: targets.length });
+    for (const [index, row] of targets.entries()) {
       try {
         await fn(row.reff);
+        setBulkProgress({ done: index + 1, total: targets.length });
       } catch (e) {
-        setError(e instanceof LaitError ? e.message : String(e));
+        const message = e instanceof LaitError ? e.message : String(e);
+        setBulkProgress({ done: index, total: targets.length, failed: row.reff });
+        setError(`Bulk action stopped at ${row.key_alias ?? row.reff} after ${index} of ${targets.length}: ${message}`);
         return;
       }
     }
+    window.setTimeout(() => setBulkProgress(null), 1600);
   }, []);
 
   const api: AppApi = useMemo(
     () => ({
       openPalette: () => setModal("palette"),
+      openIssueSearch: () => setModal("issueSearch"),
       closePalette: () => setModal(null),
       toggleShortcuts: () => setModal((m) => (m === "shortcuts" ? null : "shortcuts")),
       toggleDetail: () => setDetail((d) => !d),
-      goto: (v) => setView(v),
+      goto: (v) => {
+        const issue = v === "list" || v === "board" ? selection : null;
+        window.history.pushState(
+          null,
+          "",
+          formatRoute({ spaceId: routeSpace, project, view: v, issue, filter }),
+        );
+        setView(v);
+        if (!issue) setSelection(null);
+      },
       openFilter: () => {
         setFilterOpen(true);
         setFocusToken((t) => t + 1);
       },
       toggleSidebar: () => {
+        if (window.matchMedia("(max-width: 960px)").matches) {
+          setMobileNav((open) => !open);
+          return;
+        }
         const p = sidebar.current;
         if (!p) return;
         if (p.isCollapsed()) p.expand();
@@ -556,10 +658,36 @@ export function App() {
         void loadBoard(current, projectRef.current);
         setToast("Refreshed");
       },
-      select: (reff) => setSelection(reff),
+      // Row motion can update selection many times a second. It remains directly
+      // linkable, but replaces the current entry rather than polluting Back with
+      // every arrow-key stop.
+      select: (reff) => {
+        if (routeSpace && reff) rememberIssue(routeSpace, reff);
+        window.history.replaceState(
+          null,
+          "",
+          formatRoute({ spaceId: routeSpace, project, view, issue: reff, filter }),
+        );
+        setSelection(reff);
+      },
       predict: (doc, field, value, send) => void predict(doc, field, value, send),
-      pickSpace: (id) => setCurrent(id),
-      pickProject: (key) => setProject(key),
+      pickSpace: (id) => {
+        const picked = spacesRef.current.find((space) => space.id === id);
+        if (!picked) return;
+        const next = { spaceId: picked.space, project: null, view: "list" as const, issue: null };
+        window.history.pushState(null, "", formatRoute(next));
+        setRouteSpace(picked.space);
+        setCurrent(picked.id);
+        setProject(null);
+        setView("list");
+        setSelection(null);
+      },
+      pickProject: (key) => {
+        const next = { spaceId: routeSpace, project: key, view, issue: null, filter };
+        window.history.pushState(null, "", formatRoute(next));
+        setProject(key);
+        setSelection(null);
+      },
 
       // A picker needs its subject visible: opening the assignee menu over a pane
       // you closed is a menu with no context.
@@ -721,8 +849,22 @@ export function App() {
       openDisplay: () => setDisplayOpen(true),
       openWorkflow: () => setModal("workflow"),
       openRoles: () => setModal("roles"),
+      setTheme: (theme) => applyTheme(theme),
     }),
-    [current, guard, loadBoard, loadSpaces, predict, selectedRow],
+    [
+      applyRoute,
+      current,
+      routeSpace,
+      project,
+      view,
+      selection,
+      filter,
+      guard,
+      loadBoard,
+      loadSpaces,
+      predict,
+      selectedRow,
+    ],
   );
 
   const ctx: Ctx = useMemo(
@@ -810,6 +952,7 @@ export function App() {
   useEffect(() => {
     const t = window.setInterval(() => {
       if (!overlay.current.sweep()) return;
+      setMutationNotice("Local confirmation was delayed; refreshing authoritative state");
       setPredicted((n) => n + 1);
       void loadBoard(currentRef.current, projectRef.current);
       // The detail pane reads off `revision`, not the board.
@@ -833,17 +976,29 @@ export function App() {
         id="sidebar"
         panelRef={sidebar}
         defaultSize="18%"
-        minSize="140px"
+        minSize="180px"
         maxSize="32%"
         collapsible
         collapsedSize={0}
-        className="bg-raised"
+        className="bg-raised max-[960px]:hidden"
       >
-        <Sidebar spaces={spaces} current={current} onPick={api.pickSpace} />
+        <Sidebar
+          spaces={spaces}
+          current={current}
+          projects={projects}
+          currentProject={board?.project.key ?? project}
+          view={view}
+          unread={unread}
+          onPickSpace={api.pickSpace}
+          onPickProject={api.pickProject}
+          onGo={api.goto}
+          onCreateProject={api.createProject}
+          onOpenGovernance={api.openWorkflow}
+        />
       </Panel>
 
       {/* A 1px seam with a 7px hit area: thin to look at, big enough to grab. */}
-      <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
+      <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden">
         <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
       </Separator>
 
@@ -903,22 +1058,24 @@ export function App() {
           </h1>
 
           <span className="ml-auto flex items-center gap-1">
-            {/* Only when it is worth saying. A permanently-lit "live" is noise;
-                a silent failure is worse. So: nothing when healthy, a warning
-                when not. */}
-            {liveness !== "live" && (
-              <span
-                className="text-warn mr-1 flex items-center gap-1.5 text-xs"
-                title={`Doorbell stream: ${liveness}`}
-                role="status"
-              >
-                <span className="bg-warn size-1.5 animate-pulse rounded-full" />
-                {liveness}
-              </span>
-            )}
+            <TrustPopover
+              liveness={liveness}
+              status={statusInfo}
+              space={space}
+              localReady={
+                board !== null ||
+                (statusInfo !== null &&
+                  statusInfo.membership !== "pending" &&
+                  statusInfo.counts_unavailable !== true)
+              }
+            />
 
-            <IconButton label="Search commands" chord="⌘K" onClick={() => run("palette.open")}>
+            <IconButton label="Search issues" chord="Q" onClick={() => run("search.issues")}>
               <Search className="size-4" />
+            </IconButton>
+
+            <IconButton label="Command menu" chord="⌘K" onClick={() => run("palette.open")}>
+              <CommandIcon className="size-4" />
             </IconButton>
 
             {(view === "list" || view === "board") && (
@@ -938,6 +1095,18 @@ export function App() {
                   onOpenChange={setDisplayOpen}
                   onChange={setDisplay}
                 />
+                {routeSpace && board && (
+                  <SavedViews
+                    space={routeSpace}
+                    project={board.project.key}
+                    filter={filter}
+                    display={display}
+                    onApply={(saved) => {
+                      setFilter(saved.filter);
+                      setDisplay(saved.display);
+                    }}
+                  />
+                )}
               </>
             )}
 
@@ -976,11 +1145,7 @@ export function App() {
           </span>
         </header>
 
-        {error && (
-          <p className="border-line text-danger border-b px-4 py-2 text-sm" role="alert">
-            {error}
-          </p>
-        )}
+        {error && <InlineError message={error} onRetry={api.refresh} />}
 
         {filterOpen && (view === "list" || view === "board") && (
           <FilterBar
@@ -995,7 +1160,28 @@ export function App() {
 
         <div className="group/list flex min-h-0 flex-1 flex-col">
           {!current ? (
-            <p className="text-mute p-8 text-center">Pick a space.</p>
+            <EmptyState
+              icon={<PanelLeft className="size-5" />}
+              title={
+                routeSpace
+                  ? "This space is not on this device"
+                  : spaces.length
+                    ? "Choose a local space"
+                    : "No local spaces yet"
+              }
+              body={
+                routeSpace
+                  ? `The link names ${routeSpace}, but no matching local replica is available. Join or restore the space on this device, then refresh.`
+                  : spaces.length
+                    ? "Select a space from the sidebar to open its local replica."
+                    : "Create or join a space with the lait CLI, then refresh this viewer."
+              }
+            />
+          ) : missingProject ? (
+            <EmptyState
+              title="Project not found in this local space"
+              body={`${project} is not available in the current replica. Choose another project from the sidebar or wait for catalog data to arrive.`}
+            />
           ) : view === "inbox" ? (
             <Inbox
               spaceId={current}
@@ -1003,8 +1189,9 @@ export function App() {
               onError={setError}
               onCountChange={setUnread}
               onOpen={(reff) => {
+                api.goto("list");
                 api.select(reff);
-                setView("list");
+                setDetail(true);
               }}
             />
           ) : view === "members" ? (
@@ -1020,7 +1207,11 @@ export function App() {
               members={members}
               revision={revision}
               onError={setError}
-              onOpen={api.select}
+              onOpen={(reff) => {
+                api.goto("list");
+                api.select(reff);
+                setDetail(true);
+              }}
             />
           ) : shown && view === "board" ? (
             <Board
@@ -1028,7 +1219,10 @@ export function App() {
               members={members}
               selection={selection}
               optimistic={optimistic}
-              onSelect={api.select}
+              onSelect={(reff) => {
+                api.select(reff);
+                setDetail(true);
+              }}
               onCreate={(status) => setComposing({ status })}
               onDrop={dropCard}
               readOnly={readOnly}
@@ -1053,24 +1247,38 @@ export function App() {
               onOpen={() => setDetail(true)}
               onCreate={(status) => setComposing({ status })}
               readOnly={readOnly}
+              filtered={isActive(filter)}
             />
           ) : (
-            <p className="text-mute p-8 text-center">Not built yet.</p>
+            <EmptyState title="This view is unavailable" body="The local projection could not be loaded." />
           )}
         </div>
       </Panel>
 
-      {detail && selection && current && board && (view === "list" || view === "board") && (
+      {detail && selection && current && routeSpace && board && (view === "list" || view === "board") && (
         <>
-          <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors">
+          <Separator className="bg-line data-[state=dragging]:bg-accent hover:bg-accent/60 relative w-px outline-none transition-colors max-[960px]:hidden">
             <span className="absolute inset-y-0 -left-[3px] w-[7px]" />
           </Separator>
-          <Panel id="detail" defaultSize="30%" minSize="260px" maxSize="50%">
+          <Panel
+            id="detail"
+            defaultSize="34%"
+            minSize="300px"
+            maxSize="58%"
+            className={
+              focusedDetail
+                ? "ui-detail bg-bg fixed inset-0 z-30"
+                : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg"
+            }
+          >
+            {rows.some((row) => row.reff === selection) ||
+            deletedRows.some((row) => row.reff === selection) ? (
             <IssueDetail
               // Remount on a different issue: a stale draft must not survive into
               // the next one, and `key` says that in one line.
               key={selection}
               spaceId={current}
+              canonicalSpaceId={routeSpace}
               reff={selection}
               states={states}
               members={members}
@@ -1087,14 +1295,45 @@ export function App() {
               onDelete={api.deleteIssue}
               onPredict={api.predict}
               onNavigate={api.select}
+              onClose={() => {
+                api.select(null);
+                setDetail(false);
+                setFocusedDetail(false);
+              }}
+              focused={focusedDetail}
+              onToggleFocus={() => setFocusedDetail((value) => !value)}
+              {...(rows.findIndex((row) => row.reff === selection) > 0
+                ? {
+                    onPrevious: () =>
+                      api.select(
+                        rows[rows.findIndex((row) => row.reff === selection) - 1]!.reff,
+                      ),
+                  }
+                : {})}
+              {...(rows.findIndex((row) => row.reff === selection) >= 0 &&
+              rows.findIndex((row) => row.reff === selection) < rows.length - 1
+                ? {
+                    onNext: () =>
+                      api.select(
+                        rows[rows.findIndex((row) => row.reff === selection) + 1]!.reff,
+                      ),
+                  }
+                : {})}
             />
+            ) : (
+              <EmptyState
+                title="Issue not found in this local project"
+                body={`${selection} is not present in the current local projection. It may belong to another project, still be arriving, or not exist on this replica.`}
+              />
+            )}
           </Panel>
         </>
       )}
 
-      {composing && current && board && (
+      {composing && current && routeSpace && board && (
         <NewIssue
           spaceId={current}
+          canonicalSpaceId={routeSpace}
           projectKey={board.project.key}
           states={states}
           labels={labels}
@@ -1115,9 +1354,44 @@ export function App() {
           onError={setError}
         />
       )}
+      {mobileNav && (
+        <div className="ui-overlay fixed inset-0 z-40 hidden bg-black/45 backdrop-blur-[2px] max-[960px]:block" onMouseDown={() => setMobileNav(false)}>
+          <aside className="ui-drawer bg-raised shadow-overlay h-full w-[min(320px,88vw)]" onMouseDown={(event) => event.stopPropagation()}>
+            <Sidebar
+              spaces={spaces}
+              current={current}
+              projects={projects}
+              currentProject={board?.project.key ?? project}
+              view={view}
+              unread={unread}
+              onPickSpace={(id) => {
+                api.pickSpace(id);
+                setMobileNav(false);
+              }}
+              onPickProject={(key) => {
+                api.pickProject(key);
+                setMobileNav(false);
+              }}
+              onGo={(next) => {
+                api.goto(next);
+                setMobileNav(false);
+              }}
+              onCreateProject={() => {
+                api.createProject();
+                setMobileNav(false);
+              }}
+              onOpenGovernance={() => {
+                api.openWorkflow();
+                setMobileNav(false);
+              }}
+            />
+          </aside>
+        </div>
+      )}
       {checked.size > 0 && !readOnly && current && (
         <BulkBar
           count={checked.size}
+          progress={bulkProgress}
           states={states}
           labels={labels}
           members={members}
@@ -1153,6 +1427,23 @@ export function App() {
       )}
       <DialogHost />
       {modal === "palette" && <Palette ctx={ctx} onClose={() => setModal(null)} />}
+      {modal === "issueSearch" && current && routeSpace && board && (
+        <IssueSearch
+          spaceId={routeSpace}
+          rpcSpaceId={current}
+          rows={board.columns.flatMap((column) => column.rows).filter((row) => !row.tombstone)}
+          onClose={() => setModal(null)}
+          onOpen={(row) => {
+            const destination = projects.find((candidate) => candidate.id === row.project_id);
+            if (destination && destination.key !== board.project.key) {
+              api.pickProject(destination.key);
+            }
+            setView("list");
+            setDetail(true);
+            api.select(row.reff);
+          }}
+        />
+      )}
       {modal === "shortcuts" && <Shortcuts ctx={ctx} onClose={() => setModal(null)} />}
       {modal === "workflow" && current && board && (
         <WorkflowDialog
@@ -1171,6 +1462,7 @@ export function App() {
           {pending.join(" ")} …
         </div>
       )}
+      <p className="sr-only" aria-live="polite">{mutationNotice}</p>
       {toast && (
         <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 -translate-x-1/2 rounded border px-3 py-1.5 text-sm">
           {toast}
@@ -1179,6 +1471,26 @@ export function App() {
     </Group>
     </TooltipProvider>
   );
+}
+
+function loadTheme(): ThemePreference {
+  try {
+    const saved = localStorage.getItem(THEME_PREFERENCE);
+    return saved === "light" || saved === "dark" ? saved : "system";
+  } catch {
+    return "system";
+  }
+}
+
+function applyTheme(theme: ThemePreference): void {
+  if (theme === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = theme;
+  try {
+    if (theme === "system") localStorage.removeItem(THEME_PREFERENCE);
+    else localStorage.setItem(THEME_PREFERENCE, theme);
+  } catch {
+    // Appearance remains applied for this page even when storage is unavailable.
+  }
 }
 
 /**

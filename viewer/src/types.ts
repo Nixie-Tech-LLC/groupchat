@@ -15,7 +15,7 @@
  */
 
 /** dto.rs `SCHEMA_VERSION` — every top-level DTO carries it. */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
 
 /** Unix seconds → Date. The one place the units are converted. */
 export const tsToDate = (ts: number): Date => new Date(ts * 1000);
@@ -137,6 +137,15 @@ export interface IssueView {
   due_date?: number | null;
   estimate?: number | null;
   provisional: boolean;
+  /** Malformed stored records, kept beside the valid projection rather than
+   * silently dropped or laundered into sentinel values. */
+  corrupt_records?: CorruptRecord[];
+}
+
+export interface CorruptRecord {
+  locus: string;
+  reason: string;
+  raw?: Record<string, string>;
 }
 
 export interface FieldChange {
@@ -213,6 +222,8 @@ export interface MemberDto {
   /** "admin" | "member" — from the signed ACL graph. */
   role: string;
   me: boolean;
+  /** Present for agents: the actor whose standing sponsors this identity. */
+  sponsor?: string | null;
   /** Local petname; never synced. The trusted half of the identity model. */
   alias: string;
 }
@@ -253,6 +264,8 @@ export interface PresenceEntry {
   id: string;
   nick: string;
   state: string;
+  online: boolean;
+  last_seen_secs: number;
 }
 
 export interface Event {
@@ -279,8 +292,36 @@ export interface StatusInfo {
   space: string | null;
   issues: number;
   projects: number;
+  /** True means zero counts are unavailable, not an empty space. */
+  counts_unavailable?: boolean;
   /** `admin` | `member` | `pending`. */
   membership: string;
+  degraded_recovery?: DegradedRecoveryHolder[];
+  recovery?: RecoveryStatus | null;
+}
+
+export interface RecoveryArtifactFailure {
+  kind: "undecryptable" | "io";
+  detail: string;
+}
+
+export interface DegradedRecoveryHolder {
+  transcript: string;
+  reason: RecoveryArtifactFailure;
+  is_current_authority?: boolean | null;
+}
+
+export interface RecoveryStatus {
+  authority?: string | null;
+  scheme: "Single" | "FrostThreshold" | "GeneralAccess";
+  k: number;
+  n: number;
+  local_custody:
+    | { state: "not_a_holder" }
+    | { state: "ready" }
+    | { state: "missing" }
+    | { state: "backup_unverified" }
+    | { state: "unreadable"; detail: RecoveryArtifactFailure };
 }
 
 // ---- the supervisor surface (serve-level, not control-plane) ----------------

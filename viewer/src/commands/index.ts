@@ -36,6 +36,14 @@ export const coreCommands = contribute({
       run: (c) => c.app.toggleShortcuts(),
     },
     {
+      id: "search.issues",
+      title: "Search issues",
+      group: "General",
+      keys: ["q"],
+      when: (c) => !c.overlay && hasSpace(c),
+      run: (c) => c.app.openIssueSearch(),
+    },
+    {
       id: "view.refresh",
       title: "Refresh",
       group: "General",
@@ -43,6 +51,18 @@ export const coreCommands = contribute({
       when: (c) => !c.overlay,
       run: (c) => c.app.refresh(),
     },
+    ...(
+      [
+        ["system", "Use system theme"],
+        ["light", "Use light theme"],
+        ["dark", "Use dark theme"],
+      ] as const
+    ).map(([theme, title]) => ({
+      id: `appearance.${theme}`,
+      title,
+      group: "Appearance",
+      run: (c: Ctx) => c.app.setTheme(theme),
+    })),
     {
       id: "overlay.close",
       title: "Close",

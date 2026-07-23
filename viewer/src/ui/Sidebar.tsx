@@ -1,112 +1,190 @@
-import { Bot, Folder } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  ChevronDown,
+  CircleDot,
+  Folder,
+  Inbox,
+  LayoutGrid,
+  List,
+  Plus,
+  Settings2,
+  Users,
+} from "lucide-react";
 
-import { isReadOnly, type SpaceRow } from "../types";
+import type { View } from "../core/registry";
+import type { ProjectDto, SpaceRow } from "../types";
+import { catalogColor } from "./colors";
+import { cn, IconButton } from "./primitives";
 
-/**
- * The sidebar body. Resizing and collapsing are the *panel's* job (see App) —
- * this only renders what is in it, so the layout mechanics and the content stay
- * independently replaceable.
- *
- * Your spaces and your agents' spaces are separate sections on purpose. They are
- * not the same kind of thing: an agent's daemon signs with the agent's key, the
- * engine refuses writes there, and mixing them into one list would be the UI
- * quietly implying otherwise.
- */
+/** Linear-shaped navigation over lait's local identities and projects. */
 export function Sidebar({
   spaces,
   current,
-  onPick,
+  projects,
+  currentProject,
+  view,
+  unread,
+  onPickSpace,
+  onPickProject,
+  onGo,
+  onCreateProject,
+  onOpenGovernance,
 }: {
   spaces: SpaceRow[];
   current: string | null;
-  onPick: (id: string) => void;
+  projects: ProjectDto[];
+  currentProject: string | null;
+  view: View;
+  unread: number;
+  onPickSpace: (id: string) => void;
+  onPickProject: (key: string) => void;
+  onGo: (view: View) => void;
+  onCreateProject: () => void;
+  onOpenGovernance: () => void;
 }) {
-  const mine = spaces.filter((s) => !isReadOnly(s));
-  const agents = spaces.filter(isReadOnly);
+  const space = spaces.find((s) => s.id === current) ?? null;
+  const agent = space?.identity.kind === "agent" ? space.identity.name : null;
 
   return (
-    <nav className="flex h-full min-h-0 flex-col overflow-y-auto p-2">
-      <Section title="Spaces" />
-      <SpaceList rows={mine} current={current} onPick={onPick} empty="No spaces yet." />
-      {agents.length > 0 && (
-        <>
-          <Section title="Agents" hint="Read-only — writes would sign as the agent" />
-          <SpaceList rows={agents} current={current} onPick={onPick} empty="" />
-        </>
+    <nav aria-label="Workspace" className="flex h-full min-h-0 flex-col p-2">
+      <SpaceSwitcher spaces={spaces} current={current} onPick={onPickSpace} />
+
+      {agent && (
+        <div className="border-line bg-bg text-dim mx-1 mt-2 flex items-start gap-2 rounded border p-2 text-xs">
+          <Bot className="mt-0.5 size-3.5 shrink-0" />
+          <span>
+            Observing as <strong className="text-fg">{agent}</strong>. Writes are disabled.
+          </span>
+        </div>
       )}
+
+      <div className="mt-3 flex flex-col gap-px">
+        <NavItem icon={<Inbox />} label="Inbox" active={view === "inbox"} badge={unread} onClick={() => onGo("inbox")} />
+        <NavItem icon={<CircleDot />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
+      </div>
+
+      <Section
+        title="Projects"
+        action={
+          !agent ? (
+            <IconButton label="New project" onClick={onCreateProject} className="size-5">
+              <Plus className="size-3" />
+            </IconButton>
+          ) : null
+        }
+      />
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {projects.length === 0 ? (
+          <p className="text-mute px-2 py-1 text-sm">No projects yet.</p>
+        ) : (
+          projects.map((project) => {
+            const active = project.key === currentProject;
+            return (
+              <div key={project.id} className="mb-0.5">
+                <button
+                  onClick={() => onPickProject(project.key)}
+                  className={cn(
+                    "flex h-7 w-full items-center gap-2 rounded px-2 text-left text-sm",
+                    active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
+                  )}
+                >
+                  <span className="size-2 shrink-0 rounded-sm" style={{ background: catalogColor(project.color) }} />
+                  <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                  <span className="text-mute font-mono text-2xs">{project.key}</span>
+                </button>
+                {active && (
+                  <div className="ml-4 border-l border-line pl-1">
+                    <NavItem compact icon={<List />} label="Issues" active={view === "list"} onClick={() => onGo("list")} />
+                    <NavItem compact icon={<LayoutGrid />} label="Board" active={view === "board"} onClick={() => onGo("board")} />
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      <div className="border-line mt-2 flex flex-col gap-px border-t pt-2">
+        <NavItem icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => onGo("activity")} />
+        <NavItem icon={<Users />} label="Members" active={view === "members"} onClick={() => onGo("members")} />
+        <NavItem icon={<Settings2 />} label="Governance" onClick={onOpenGovernance} />
+      </div>
     </nav>
   );
 }
 
-function Section({ title, hint }: { title: string; hint?: string }) {
+function SpaceSwitcher({ spaces, current, onPick }: { spaces: SpaceRow[]; current: string | null; onPick: (id: string) => void }) {
+  const selected = spaces.find((s) => s.id === current) ?? null;
   return (
-    <h2
-      className="text-mute mt-4 mb-1 px-2 text-2xs font-semibold tracking-[0.08em] uppercase first:mt-1"
-      title={hint}
-    >
-      {title}
-    </h2>
-  );
-}
-
-function SpaceList({
-  rows,
-  current,
-  onPick,
-  empty,
-}: {
-  rows: SpaceRow[];
-  current: string | null;
-  onPick: (id: string) => void;
-  empty: string;
-}) {
-  if (rows.length === 0) {
-    return empty ? <p className="text-mute px-2 py-1 text-sm">{empty}</p> : null;
-  }
-  return (
-    <ul role="listbox" className="flex flex-col gap-px">
-      {rows.map((s) => {
-        // Narrow once and carry the name: the discriminant is what proves an
-        // agent *has* a name, so reading it off the union would be a lie.
-        const agent = s.identity.kind === "agent" ? s.identity.name : null;
-        return (
-          <li key={s.id}>
+    <details className="group relative">
+      <summary className="hover:bg-hover flex h-8 list-none items-center gap-2 rounded px-2 font-semibold [&::-webkit-details-marker]:hidden">
+        {selected?.identity.kind === "agent" ? <Bot className="text-mute size-4" /> : <Folder className="text-mute size-4" />}
+        <span className="min-w-0 flex-1 truncate">{selected?.name || selected?.space || "Choose a space"}</span>
+        {selected && <StatusDot status={selected.status} />}
+        <ChevronDown className="text-mute size-3 transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="border-line-strong bg-raised shadow-overlay absolute inset-x-0 top-9 z-40 max-h-72 overflow-y-auto rounded-lg border p-1">
+        {spaces.length === 0 ? (
+          <p className="text-mute px-2 py-3 text-center text-sm">No local spaces</p>
+        ) : (
+          spaces.map((space) => (
             <button
-              role="option"
-              aria-selected={s.id === current}
-              onClick={() => onPick(s.id)}
-              // `truncate` needs a min-w-0 flex child; without it a long space
-              // name pushes the status dot out of the panel instead of eliding.
-              className={[
-                "flex w-full items-center gap-2 rounded px-2 py-1 text-left transition-colors",
-                s.id === current ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
-              ].join(" ")}
-              title={agent ? `${agent}'s space (read-only) — ${s.path}` : s.path}
-            >
-              {agent ? (
-                <Bot className="text-mute size-3.5 shrink-0" />
-              ) : (
-                <Folder className="text-mute size-3.5 shrink-0" />
+              key={`${space.id}-${space.identity.kind === "agent" ? space.identity.name : "own"}`}
+              onClick={(event) => {
+                onPick(space.id);
+                event.currentTarget.closest("details")?.removeAttribute("open");
+              }}
+              className={cn(
+                "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm",
+                space.id === current ? "bg-active" : "hover:bg-hover",
               )}
-              <span className="min-w-0 flex-1 truncate">{s.name || s.space}</span>
-              <StatusDot status={s.status} />
+            >
+              {space.identity.kind === "agent" ? <Bot className="text-mute size-3.5" /> : <Folder className="text-mute size-3.5" />}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate">{space.name || space.space}</span>
+                <span className="text-mute block truncate text-xs">
+                  {space.identity.kind === "agent" ? `Agent · ${space.identity.name}` : "Your local actor"}
+                </span>
+              </span>
+              <StatusDot status={space.status} />
             </button>
-          </li>
-        );
-      })}
-    </ul>
+          ))
+        )}
+      </div>
+    </details>
   );
 }
 
-/** `up` | `idle` | `missing`, exactly as `lait spaces` reports it. */
+function Section({ title, action }: { title: string; action?: React.ReactNode }) {
+  return (
+    <div className="mt-4 mb-1 flex h-5 items-center px-2">
+      <h2 className="text-mute text-2xs font-semibold tracking-[0.08em] uppercase">{title}</h2>
+      {action && <span className="ml-auto">{action}</span>}
+    </div>
+  );
+}
+
+function NavItem({ icon, label, active, badge, compact, onClick }: { icon: React.ReactElement; label: string; active?: boolean; badge?: number; compact?: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-current={active ? "page" : undefined}
+      className={cn(
+        "flex w-full items-center gap-2 rounded px-2 text-left text-sm",
+        compact ? "h-6" : "h-7",
+        active ? "bg-active text-fg" : "text-dim hover:bg-hover hover:text-fg",
+      )}
+    >
+      <span className="text-mute [&>svg]:size-3.5">{icon}</span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {!!badge && <span className="bg-accent text-accent-fg min-w-4 rounded-full px-1 text-center text-2xs tabular-nums">{badge}</span>}
+    </button>
+  );
+}
+
 function StatusDot({ status }: { status: SpaceRow["status"] }) {
   const cls = { up: "bg-ok", idle: "bg-mute", missing: "bg-danger" }[status];
-  return (
-    <span
-      className={`size-1.5 shrink-0 rounded-full ${cls}`}
-      title={status}
-      role="img"
-      aria-label={status}
-    />
-  );
+  const label = { up: "Local daemon running", idle: "Local daemon idle", missing: "Local replica unavailable" }[status];
+  return <span className={cn("size-1.5 shrink-0 rounded-full", cls)} title={label} role="img" aria-label={label} />;
 }

@@ -92,10 +92,10 @@ function Shell({
   return (
     <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+        <Dialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="border-line-strong bg-raised shadow-overlay fixed top-[10vh] left-1/2 z-50 flex max-h-[75vh] w-[min(560px,94vw)] -translate-x-1/2 flex-col overflow-hidden rounded-lg border"
+          className="ui-surface border-line-strong bg-raised shadow-overlay fixed top-[10vh] left-1/2 z-50 flex max-h-[75vh] w-[min(560px,94vw)] -translate-x-1/2 flex-col overflow-hidden rounded-lg border"
         >
           <header className="border-line flex shrink-0 items-center gap-2 border-b px-4 py-3">
             <Dialog.Title className="font-semibold">{title}</Dialog.Title>
@@ -179,7 +179,11 @@ export function WorkflowDialog({
                         color={catalogColor(s.color)}
                       />
                       <span>{s.name}</span>
-                      <span className="text-mute text-2xs capitalize">{s.category}</span>
+                      {s.name.trim().toLowerCase() !== s.category.replaceAll("_", " ") && (
+                        <span className="text-mute text-2xs capitalize">
+                          {s.category.replaceAll("_", " ")}
+                        </span>
+                      )}
                     </li>
                   ))}
                 </ul>

@@ -26,8 +26,8 @@
 import { parseBinding, type Binding } from "./keys";
 import type { Field } from "./overlay";
 
-/** The root surfaces. A view is not a route — there is no URL to be wrong about,
- *  and the browser's back button belongs to the browser. */
+/** The root surfaces. These are also the stable view segments in the viewer URL;
+ *  see `route.ts` for the canonical, machine-independent route contract. */
 export type View = "list" | "board" | "inbox" | "activity" | "members";
 
 /**
@@ -65,6 +65,7 @@ export interface Ctx {
 
 export interface AppApi {
   openPalette(): void;
+  openIssueSearch(): void;
   closePalette(): void;
   toggleShortcuts(): void;
   toggleSidebar(): void;
@@ -116,6 +117,8 @@ export interface AppApi {
   openWorkflow(): void;
   /** Show the space's role definitions. */
   openRoles(): void;
+  /** Set this browser's appearance without touching shared space state. */
+  setTheme(theme: "system" | "light" | "dark"): void;
 }
 
 export interface Command {

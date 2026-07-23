@@ -51,6 +51,7 @@ export function Board({
   const [drag, setDrag] = useState<{ reff: string; from: string } | null>(null);
   /** Where it would land. Rendered as the gap. */
   const [over, setOver] = useState<{ col: string; pos: BoardPos } | null>(null);
+  const [announcement, setAnnouncement] = useState("");
 
   const finish = (col: BoardColumn) => {
     if (!drag || !over) return reset();
@@ -60,6 +61,7 @@ export function Board({
     // instead (`replica.rs:858-869`). So there is no position to ask for, and
     // asking anyway would write to a list this column ignores.
     onDrop(drag.reff, col.state.id, isDone ? null : over.pos);
+    setAnnouncement(`Moved ${drag.reff} to ${col.state.name}`);
     reset();
   };
 
@@ -70,6 +72,7 @@ export function Board({
 
   return (
     <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto p-3">
+      <p className="sr-only" aria-live="polite">{announcement}</p>
       {board.columns.map((col) => (
         <Column
           key={col.state.id}
@@ -141,6 +144,8 @@ function Column({
         )}
       </header>
       <ul
+        role="listbox"
+        aria-label={`${col.state.name} issues`}
         className={[
           "flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded p-1 transition-colors",
           // The whole column lights up as a target, because the drop is a *status*
@@ -278,8 +283,10 @@ function Card({
         aria-selected={selected}
         role="option"
         className={[
-          "bg-raised cursor-default rounded border p-2 transition-colors",
-          selected ? "border-accent ring-accent ring-1" : "border-line hover:border-line-strong",
+          "bg-raised cursor-default rounded border p-2 transition-[border-color,box-shadow,opacity] duration-150",
+          selected
+            ? "border-accent ring-accent shadow-sm ring-1"
+            : "border-line hover:border-line-strong hover:shadow-sm",
           row.provisional ? "opacity-60" : "",
           row.tombstone ? "opacity-60" : "",
           // The card left the deck: dim the hole it came from rather than removing

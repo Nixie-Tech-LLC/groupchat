@@ -1,0 +1,79 @@
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { ProjectDto, SpaceRow } from "../types";
+import { Sidebar } from "./Sidebar";
+import { TooltipProvider } from "./primitives";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true;
+
+describe("Sidebar navigation", () => {
+  let host: HTMLDivElement | null = null;
+  let root: ReturnType<typeof createRoot> | null = null;
+
+  afterEach(() => {
+    if (root) act(() => root?.unmount());
+    host?.remove();
+    root = null;
+    host = null;
+  });
+
+  it("routes named destinations and governance to their real actions", () => {
+    const onGo = vi.fn();
+    const onGovernance = vi.fn();
+    host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+
+    act(() => {
+      root?.render(
+        <TooltipProvider><Sidebar
+          spaces={[space]}
+          current={space.id}
+          projects={[project]}
+          currentProject={project.key}
+          view="list"
+          unread={3}
+          onPickSpace={vi.fn()}
+          onPickProject={vi.fn()}
+          onGo={onGo}
+          onCreateProject={vi.fn()}
+          onOpenGovernance={onGovernance}
+        /></TooltipProvider>,
+      );
+    });
+
+    click("Board");
+    expect(onGo).toHaveBeenCalledWith("board");
+    click("Governance");
+    expect(onGovernance).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain("3");
+  });
+
+  function click(label: string) {
+    const button = [...host!.querySelectorAll("button")].find((item) => item.textContent?.includes(label));
+    expect(button).toBeTruthy();
+    act(() => button?.click());
+  }
+});
+
+const space: SpaceRow = {
+  id: "local-hash",
+  space: "ws_test",
+  name: "Test space",
+  path: "C:/test",
+  origin: "test",
+  last_opened: 0,
+  status: "up",
+  identity: { kind: "own" },
+  projects: [],
+};
+
+const project: ProjectDto = {
+  id: "prj_test",
+  key: "WEB",
+  name: "Web",
+  color: "blue",
+};

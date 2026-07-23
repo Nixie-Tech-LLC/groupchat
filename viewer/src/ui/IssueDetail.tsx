@@ -3,16 +3,22 @@ import {
   AlertTriangle,
   ArchiveRestore,
   Ban,
+  ChevronLeft,
+  ChevronRight,
   CircleDot,
+  Copy,
   CornerDownRight,
   GitMerge,
   Info,
+  Maximize2,
+  Minimize2,
   Plus,
   Trash2,
   X,
 } from "lucide-react";
 
 import { rpc } from "../api";
+import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
@@ -53,6 +59,7 @@ import { dueLabel, dueToInput, dueTone, short, when } from "./time";
  */
 export function IssueDetail({
   spaceId,
+  canonicalSpaceId,
   reff,
   states,
   members,
@@ -66,9 +73,15 @@ export function IssueDetail({
   onDelete,
   onPredict,
   onNavigate,
+  onClose,
+  onPrevious,
+  onNext,
+  focused,
+  onToggleFocus,
   revision,
 }: {
   spaceId: string;
+  canonicalSpaceId: string;
   reff: string;
   states: WorkflowState[];
   /** The signed ACL, for the assignee picker. Keys are the only real identity. */
@@ -88,6 +101,11 @@ export function IssueDetail({
   onPredict: (doc: string, field: PredictField, value: string, send: () => Promise<unknown>) => void;
   /** Select another issue — following a graph edge (parent, sub-issue, blocker). */
   onNavigate: (reff: string) => void;
+  onClose: () => void;
+  onPrevious?: () => void;
+  onNext?: () => void;
+  focused: boolean;
+  onToggleFocus: () => void;
   /** Bumped by the doorbell; re-reads without this pane knowing why. */
   revision: number;
 }) {
@@ -95,8 +113,13 @@ export function IssueDetail({
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [graph, setGraph] = useState<GraphView | null>(null);
   const [draft, setDraft] = useState("");
-  const [comment, setComment] = useState("");
+  const [comment, setComment] = useState(() => loadDraft(canonicalSpaceId, reff, "comment"));
   const titleRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(
+    () => saveDraft(canonicalSpaceId, reff, "comment", comment),
+    [canonicalSpaceId, reff, comment],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -163,6 +186,7 @@ export function IssueDetail({
 
   const state = states.find((s) => s.id === issue.status);
   const project = projects.find((p) => p.id === issue.project_id);
+  const locked = readOnly || issue.provisional;
 
   const saveTitle = () => {
     const next = draft.trim();
@@ -174,7 +198,7 @@ export function IssueDetail({
   const setPicker = (f: IssueField) => (o: boolean) => onOpenField(o ? f : null);
 
   return (
-    <aside className="border-line flex h-full min-h-0 flex-col overflow-y-auto border-l">
+    <aside className="issue-detail border-line flex h-full min-h-0 flex-col overflow-y-auto border-l">
       <header className="border-line flex h-11 shrink-0 items-center gap-2 border-b px-3">
         <span className="text-mute font-mono text-xs tabular-nums">
           {issue.key_alias ?? issue.reff}
@@ -189,13 +213,28 @@ export function IssueDetail({
             deleted
           </span>
         )}
-        {!readOnly &&
+        <span className="ml-auto flex items-center gap-0.5">
+          <IconButton label="Previous issue" onClick={onPrevious} disabled={!onPrevious}>
+            <ChevronLeft className="size-3.5" />
+          </IconButton>
+          <IconButton label="Next issue" onClick={onNext} disabled={!onNext}>
+            <ChevronRight className="size-3.5" />
+          </IconButton>
+          <IconButton
+            label="Copy issue link"
+            onClick={() => void navigator.clipboard.writeText(window.location.href)}
+          >
+            <Copy className="size-3.5" />
+          </IconButton>
+          <IconButton label={focused ? "Return to split view" : "Focus issue"} onClick={onToggleFocus}>
+            {focused ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
+          </IconButton>
+        {!locked &&
           (tombstone ? (
             // Restore wins over a concurrent delete (engine rule), so this is
             // safe to offer without a confirmation of its own.
             <IconButton
               label="Restore issue"
-              className="ml-auto"
               onClick={() =>
                 void send(() => rpc(spaceId, { cmd: "issue_restore", reff: issue.reff }))
               }
@@ -206,21 +245,47 @@ export function IssueDetail({
             <IconButton
               label="Delete issue"
               variant="danger"
-              className="ml-auto"
               onClick={() => onDelete(issue.reff)}
             >
               <Trash2 className="size-3.5" />
             </IconButton>
           ))}
+          <IconButton label="Close issue" chord="Esc" onClick={onClose}>
+            <X className="size-3.5" />
+          </IconButton>
+        </span>
       </header>
 
-      <div className="flex flex-col gap-4 p-4">
+      <div className="issue-detail-body flex flex-col gap-4 p-4">
+        {issue.provisional && (
+          <div className="border-warn/30 bg-warn/5 text-dim flex gap-2 rounded border p-3 text-sm">
+            <Info className="text-warn mt-0.5 size-3.5 shrink-0" />
+            <span>
+              This issue is known to the local catalog, but its body is still arriving. Metadata may be incomplete; editing stays unavailable until the projection is ready.
+            </span>
+          </div>
+        )}
+        {!!issue.corrupt_records?.length && (
+          <details className="border-danger/30 bg-danger/5 rounded border p-3 text-sm">
+            <summary className="text-danger flex items-center gap-2 font-medium">
+              <AlertTriangle className="size-3.5" />
+              {issue.corrupt_records.length} stored {issue.corrupt_records.length === 1 ? "record needs" : "records need"} attention
+            </summary>
+            <ul className="text-dim mt-2 flex flex-col gap-1 pl-5 text-xs">
+              {issue.corrupt_records.map((record, index) => (
+                <li key={`${record.locus}-${index}`}>
+                  <code>{record.locus}</code>: {record.reason}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         {/* A textarea, not an input: a long title should wrap rather than scroll
             sideways past the edge of the pane. */}
         <textarea
           ref={titleRef}
           value={draft}
-          readOnly={readOnly}
+          readOnly={locked}
           rows={Math.max(1, Math.ceil(draft.length / 40))}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={saveTitle}
@@ -234,7 +299,7 @@ export function IssueDetail({
               titleRef.current?.blur();
             }
           }}
-          className="resize-none bg-transparent text-lg font-semibold outline-none"
+          className="issue-detail-title resize-none bg-transparent text-lg font-semibold outline-none"
           aria-label="Title"
         />
 
@@ -250,12 +315,12 @@ export function IssueDetail({
           Status row above already does, and it would be the one piece of this pane
           that came from somewhere else.
         */}
-        <dl className="flex flex-col gap-1 text-sm">
+        <dl className="issue-detail-properties flex flex-col gap-1 text-sm">
           <Prop label="Status">
             <Combobox
               variant="bare"
               label="Status"
-              disabled={readOnly}
+              disabled={locked}
               open={pickerOpen("status")}
               onOpenChange={setPicker("status")}
               value={{
@@ -287,7 +352,7 @@ export function IssueDetail({
               variant="bare"
               label="Priority"
               className="capitalize"
-              disabled={readOnly}
+              disabled={locked}
               open={pickerOpen("priority")}
               onOpenChange={setPicker("priority")}
               value={{
@@ -315,7 +380,7 @@ export function IssueDetail({
               variant="bare"
               multi
               label="Assignees"
-              disabled={readOnly}
+              disabled={locked}
               open={pickerOpen("assignee")}
               onOpenChange={setPicker("assignee")}
               selected={issue.assignees}
@@ -362,7 +427,7 @@ export function IssueDetail({
               variant="bare"
               multi
               label="Labels"
-              disabled={readOnly}
+              disabled={locked}
               open={pickerOpen("label")}
               onOpenChange={setPicker("label")}
               // The registry is keyed by id, but `Request::Label` resolves **names**
@@ -408,7 +473,7 @@ export function IssueDetail({
           <Prop label="Due date">
             <DueDate
               value={issue.due_date ?? null}
-              readOnly={readOnly}
+              readOnly={locked}
               onChange={(due) =>
                 void send(() => rpc(spaceId, { cmd: "issue_edit", reff, due }))
               }
@@ -419,7 +484,7 @@ export function IssueDetail({
             <Combobox
               variant="bare"
               label="Estimate"
-              disabled={readOnly}
+              disabled={locked}
               value={
                 issue.estimate != null
                   ? { id: String(issue.estimate), label: `${issue.estimate} pt` }
@@ -442,7 +507,7 @@ export function IssueDetail({
             <Combobox
               variant="bare"
               label="Project"
-              disabled={readOnly}
+              disabled={locked}
               open={pickerOpen("project")}
               onOpenChange={setPicker("project")}
               value={
@@ -469,8 +534,9 @@ export function IssueDetail({
         </dl>
 
         <Description
+          draftKey={{ spaceId: canonicalSpaceId, reff }}
           value={issue.description}
-          readOnly={readOnly}
+          readOnly={locked}
           onSave={(description) => void edit({ description })}
         />
 
@@ -481,7 +547,7 @@ export function IssueDetail({
             reff={issue.reff}
             projectId={issue.project_id}
             states={states}
-            readOnly={readOnly}
+            readOnly={locked}
             send={send}
             onNavigate={onNavigate}
           />
@@ -491,7 +557,7 @@ export function IssueDetail({
           events={events}
           comments={issue.comments}
           memberOf={memberOf}
-          readOnly={readOnly}
+          readOnly={locked}
           meKey={members.find((m) => m.me)?.key ?? null}
           onReact={(comment, emoji, on) =>
             void send(() => rpc(spaceId, { cmd: "react", reff, comment, emoji, on }))
@@ -501,7 +567,7 @@ export function IssueDetail({
           }
         />
 
-        {!readOnly && (
+        {!locked && (
           <textarea
             value={comment}
             placeholder="Leave a comment…  (⌘/Ctrl + Enter)"
@@ -513,6 +579,7 @@ export function IssueDetail({
                 e.preventDefault();
                 const body = comment.trim();
                 setComment("");
+                clearDraft(canonicalSpaceId, reff, "comment");
                 void rpc(spaceId, { cmd: "comment", reff, body }).catch((err) =>
                   onError(err instanceof Error ? err.message : String(err)),
                 );
@@ -1260,21 +1327,33 @@ function Event({ event: e, resolveName }: { event: ActivityEvent; resolveName: N
 /** Description: a draft you commit, not a field that saves per keystroke — a
  *  doorbell mid-typing would otherwise fight the cursor. */
 function Description({
+  draftKey,
   value,
   readOnly,
   onSave,
 }: {
+  draftKey: { spaceId: string; reff: string };
   value: string;
   readOnly: boolean;
   onSave: (v: string) => void;
 }) {
-  const [draft, setDraft] = useState(value);
-  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(
+    () => loadDraft(draftKey.spaceId, draftKey.reff, "description") || value,
+  );
+  const [editing, setEditing] = useState(
+    () => loadDraft(draftKey.spaceId, draftKey.reff, "description") !== "",
+  );
 
   // Adopt server truth whenever we're not the one holding the pen.
   useEffect(() => {
     if (!editing) setDraft(value);
   }, [value, editing]);
+
+  useEffect(() => {
+    if (editing && draft !== value) {
+      saveDraft(draftKey.spaceId, draftKey.reff, "description", draft);
+    }
+  }, [draftKey.spaceId, draftKey.reff, draft, editing, value]);
 
   if (readOnly || (!editing && value)) {
     return (
@@ -1309,11 +1388,15 @@ function Description({
       onChange={(e) => setDraft(e.target.value)}
       onBlur={() => {
         setEditing(false);
-        if (draft !== value) onSave(draft);
+        if (draft !== value) {
+          clearDraft(draftKey.spaceId, draftKey.reff, "description");
+          onSave(draft);
+        }
       }}
       onKeyDown={(e) => {
         if (e.key === "Escape") {
           setDraft(value);
+          clearDraft(draftKey.spaceId, draftKey.reff, "description");
           setEditing(false);
         }
       }}

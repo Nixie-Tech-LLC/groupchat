@@ -20,6 +20,7 @@ import { IconButton, Kbd } from "./primitives";
  */
 export function BulkBar({
   count,
+  progress,
   states,
   labels,
   members,
@@ -31,6 +32,7 @@ export function BulkBar({
   onClear,
 }: {
   count: number;
+  progress: { done: number; total: number; failed?: string } | null;
   states: WorkflowState[];
   labels: LabelDto[];
   members: MemberDto[];
@@ -44,6 +46,11 @@ export function BulkBar({
   return (
     <div className="border-line-strong bg-raised shadow-overlay fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-lg border px-3 py-1.5">
       <span className="text-sm font-medium tabular-nums">{count} selected</span>
+      {progress && (
+        <span className={progress.failed ? "text-danger text-xs" : "text-mute text-xs"} role="status" aria-live="polite">
+          {progress.failed ? `Stopped at ${progress.failed}` : `${progress.done}/${progress.total} complete`}
+        </span>
+      )}
       <span className="bg-line mx-1 h-4 w-px" />
 
       <Combobox

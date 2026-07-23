@@ -40,14 +40,14 @@ export function Palette({ ctx, onClose }: { ctx: Ctx; onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex justify-center bg-black/45 pt-[12vh] backdrop-blur-[2px]"
+      className="ui-overlay fixed inset-0 z-50 flex justify-center bg-black/45 pt-[12vh] backdrop-blur-[2px]"
       onMouseDown={onClose}
     >
       <Command
         label="Command palette"
         loop
         onMouseDown={(e) => e.stopPropagation()}
-        className="border-line-strong bg-raised shadow-overlay flex h-fit max-h-[60vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
+        className="ui-surface border-line-strong bg-raised shadow-overlay flex h-fit max-h-[60vh] w-[min(560px,92vw)] flex-col overflow-hidden rounded-lg border"
         filter={cmdkFilter}
       >
         <Command.Input

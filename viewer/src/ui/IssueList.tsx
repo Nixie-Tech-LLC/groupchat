@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronRight, Plus, Trash2 } from "lucide-react";
 
 import type { RowGroup } from "../core/display";
 import type { MemberDto, Row, WorkflowState } from "../types";
@@ -35,6 +35,7 @@ export function IssueList({
   onOpen,
   onCreate,
   readOnly,
+  filtered,
 }: {
   groups: RowGroup[];
   /** The trash — tombstoned rows from `list all:true`, rendered as their own
@@ -55,6 +56,7 @@ export function IssueList({
   onOpen: (reff: string) => void;
   onCreate: (status: string) => void;
   readOnly: boolean;
+  filtered: boolean;
 }) {
   const visible = (g: RowGroup) => g.rows.filter((r) => !r.tombstone);
   const total = groups.reduce((n, g) => n + visible(g).length, 0);
@@ -111,7 +113,11 @@ export function IssueList({
         )}
         {total === 0 && deleted.length === 0 && (
           <p className="text-mute p-8 text-center">
-            Nothing here yet. Press <Kbd>c</Kbd> to file the first issue.
+            {filtered ? (
+              "No issues match the current filters. Clear or adjust them to see more."
+            ) : (
+              <>Nothing here yet. Press <Kbd>c</Kbd> to file the first issue.</>
+            )}
           </p>
         )}
       </div>
@@ -163,6 +169,7 @@ function Group({
   onCreate: (status: string) => void;
   readOnly: boolean;
 }) {
+  const [collapsed, setCollapsed] = useState(false);
   // An emptied group stays visible under status grouping (a status that exists
   // is a column that exists — filter.ts's rule); a derived group with no rows
   // is nothing at all, so it goes.
@@ -180,6 +187,14 @@ function Group({
       {/* Sticky so you never lose which bucket you are reading — the one piece of
           context a long list silently takes away. */}
       <header className="bg-raised/95 border-line sticky top-0 z-10 flex h-9 items-center gap-2 border-b px-4 backdrop-blur-sm">
+        <button
+          onClick={() => setCollapsed((value) => !value)}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${title}`}
+          aria-expanded={!collapsed}
+          className="text-mute hover:text-fg -ml-2 flex size-5 items-center justify-center rounded"
+        >
+          <ChevronRight className={`size-3 transition-transform ${collapsed ? "" : "rotate-90"}`} />
+        </button>
         <GroupIcon group={group} members={members} />
         <h2 className="text-base font-semibold capitalize">{title}</h2>
         <span className="text-mute text-sm tabular-nums">{rows.length}</span>
@@ -194,7 +209,7 @@ function Group({
           </IconButton>
         )}
       </header>
-      <ul>
+      {!collapsed && <ul role="listbox" aria-label={`${title} issues`}>
         {rows.map((row) => (
           <IssueRow
             key={row.reff}
@@ -211,7 +226,7 @@ function Group({
             readOnly={readOnly}
           />
         ))}
-      </ul>
+      </ul>}
     </section>
   );
 }

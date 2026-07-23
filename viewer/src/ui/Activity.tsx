@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle } from "lucide-react";
+import { Activity as ActivityIcon, AlertTriangle, LoaderCircle } from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
 import type { ActivityEvent, MemberDto } from "../types";
+import { EmptyState } from "./AppState";
 import { memberName } from "./Avatar";
 import { when } from "./time";
 
@@ -57,9 +58,23 @@ export function Activity({
     };
   }, [spaceId, revision, onError]);
 
-  if (!events) return <p className="text-mute p-4 text-sm">Loading…</p>;
+  if (!events) {
+    return (
+      <EmptyState
+        icon={<LoaderCircle className="size-5 animate-spin" />}
+        title="Loading activity"
+        body="Reading the local session history."
+      />
+    );
+  }
   if (events.length === 0) {
-    return <p className="text-mute p-8 text-center">No activity yet.</p>;
+    return (
+      <EmptyState
+        icon={<ActivityIcon className="size-5" />}
+        title="No activity yet"
+        body="Changes made in this session will appear here."
+      />
+    );
   }
 
   return (

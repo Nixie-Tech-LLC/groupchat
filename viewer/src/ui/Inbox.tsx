@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { AtSign, CheckCheck, MessageSquare, SignalHigh } from "lucide-react";
+import { AtSign, CheckCheck, Inbox as InboxIcon, LoaderCircle, MessageSquare, SignalHigh } from "lucide-react";
 
 import { rpc } from "../api";
 import type { InboxEntry } from "../types";
+import { EmptyState } from "./AppState";
 import { short, when } from "./time";
 
 /**
@@ -63,7 +64,15 @@ export function Inbox({
     void load(false);
   }, [load, revision]);
 
-  if (!entries) return <p className="text-mute p-4 text-sm">Loading…</p>;
+  if (!entries) {
+    return (
+      <EmptyState
+        icon={<LoaderCircle className="size-5 animate-spin" />}
+        title="Loading inbox"
+        body="Reading notifications from this local replica."
+      />
+    );
+  }
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -84,9 +93,11 @@ export function Inbox({
       </div>
 
       {entries.length === 0 ? (
-        <p className="text-mute p-8 text-center">
-          Nothing addressed to you. This is the good outcome.
-        </p>
+        <EmptyState
+          icon={<InboxIcon className="size-5" />}
+          title="You’re all caught up"
+          body="Nothing in this local space is currently addressed to you."
+        />
       ) : (
         <ul className="min-h-0 flex-1 overflow-y-auto">
           {entries.map((e, i) => (

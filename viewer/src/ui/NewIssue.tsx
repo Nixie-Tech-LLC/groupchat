@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 
 import { rpc } from "../api";
+import { clearDraft, loadDraft, saveDraft } from "../core/drafts";
 import {
   PRIORITY_ORDER,
   type LabelDto,
@@ -35,6 +36,7 @@ import { short } from "./time";
  */
 export function NewIssue({
   spaceId,
+  canonicalSpaceId,
   projectKey,
   states,
   labels,
@@ -44,6 +46,7 @@ export function NewIssue({
   onError,
 }: {
   spaceId: string;
+  canonicalSpaceId: string;
   projectKey: string;
   states: WorkflowState[];
   labels: LabelDto[];
@@ -53,8 +56,9 @@ export function NewIssue({
   onClose: () => void;
   onError: (m: string) => void;
 }) {
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const draftSubject = `new:${projectKey}`;
+  const [title, setTitle] = useState(() => loadDraft(canonicalSpaceId, draftSubject, "new-title"));
+  const [body, setBody] = useState(() => loadDraft(canonicalSpaceId, draftSubject, "new-body"));
   const [priority, setPriority] = useState<Priority>("none");
   const [status, setStatus] = useState(defaultStatus ?? states[0]?.id ?? "backlog");
   /** Label **names** — `issue_new` resolves names, not ids, and creates on first use. */
@@ -66,6 +70,15 @@ export function NewIssue({
 
   const state = states.find((s) => s.id === status) ?? null;
   const landsIn = states[0]?.id ?? "backlog";
+
+  useEffect(
+    () => saveDraft(canonicalSpaceId, draftSubject, "new-title", title),
+    [canonicalSpaceId, draftSubject, title],
+  );
+  useEffect(
+    () => saveDraft(canonicalSpaceId, draftSubject, "new-body", body),
+    [canonicalSpaceId, draftSubject, body],
+  );
 
   const create = async () => {
     const t = title.trim();
@@ -85,6 +98,8 @@ export function NewIssue({
       if (r.kind === "ref" && status !== landsIn) {
         await rpc(spaceId, { cmd: "issue_edit", reff: r.reff, status });
       }
+      clearDraft(canonicalSpaceId, draftSubject, "new-title");
+      clearDraft(canonicalSpaceId, draftSubject, "new-body");
       if (again) {
         // "Create more": keep the scaffolding, clear the prose. Filing five
         // related issues shouldn't mean re-picking the same labels five times.
@@ -104,9 +119,9 @@ export function NewIssue({
   return (
     <Dialog.Root open onOpenChange={(o) => !o && onClose()}>
       <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+        <Dialog.Overlay className="ui-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
         <Dialog.Content
-          className="border-line-strong bg-raised shadow-overlay fixed top-[12vh] left-1/2 z-50 flex w-[min(640px,94vw)] -translate-x-1/2 flex-col rounded-lg border"
+          className="ui-surface border-line-strong bg-raised shadow-overlay fixed top-[12vh] left-1/2 z-50 flex w-[min(640px,94vw)] -translate-x-1/2 flex-col rounded-lg border"
           // The title lives in the body as the composer's own input, so the
           // accessible name is given here rather than rendered twice.
           aria-describedby={undefined}
