@@ -92,6 +92,35 @@
   color-scheme: dark;
 }
 
+/* Compact is the issue tracker's default. Comfortable is deliberately a root
+   scale, not a handful of taller list rows: cards, toolbars, menus, controls and
+   type must keep the same rhythm when the user asks for more breathing room. */
+:root[data-density="comfortable"] {
+  --spacing: 4.5px;
+  --text-2xs: 11px;
+  --text-2xs--line-height: 15px;
+  --text-xs: 12px;
+  --text-xs--line-height: 17px;
+  --text-sm: 13px;
+  --text-sm--line-height: 18px;
+  --text-base: 14px;
+  --text-base--line-height: 21px;
+  --text-lg: 16px;
+  --text-lg--line-height: 23px;
+}
+
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight;
+  }
+  [aria-current="true"],
+  [aria-selected="true"],
+  [aria-pressed="true"] {
+    forced-color-adjust: none;
+    border-color: Highlight;
+  }
+}
+
 @layer base {
   html,
   body,

@@ -83,7 +83,9 @@ import "./commands";
 
 type Modal = "palette" | "issueSearch" | "shortcuts" | "workflow" | "roles" | null;
 type ThemePreference = "system" | "light" | "dark";
+type DensityPreference = "compact" | "comfortable";
 const THEME_PREFERENCE = "lait.theme";
+const DENSITY_PREFERENCE = "lait.density";
 
 /**
  * The shell.
@@ -165,9 +167,11 @@ export function App() {
   // Bumped on every doorbell for this space: the detail pane re-reads off it.
   const [revision, setRevision] = useState(0);
   const sidebar = usePanelRef();
+  const [density, setDensity] = useState<DensityPreference>(() => loadDensity());
 
   useEffect(() => {
     applyTheme(loadTheme());
+    applyDensity(loadDensity());
   }, []);
   const spacesRef = useRef(spaces);
   spacesRef.current = spaces;
@@ -1206,6 +1210,11 @@ export function App() {
                   view={view}
                   open={displayOpen}
                   onOpenChange={setDisplayOpen}
+                  density={density}
+                  onDensityChange={(nextDensity) => {
+                    setDensity(nextDensity);
+                    applyDensity(nextDensity);
+                  }}
                   onChange={(nextDisplay) => {
                     if (nextDisplay.deleted !== display.deleted) {
                       api.select(null);
@@ -1697,6 +1706,25 @@ function applyTheme(theme: ThemePreference): void {
     else localStorage.setItem(THEME_PREFERENCE, theme);
   } catch {
     // Appearance remains applied for this page even when storage is unavailable.
+  }
+}
+
+function loadDensity(): DensityPreference {
+  try {
+    return localStorage.getItem(DENSITY_PREFERENCE) === "comfortable" ? "comfortable" : "compact";
+  } catch {
+    return "compact";
+  }
+}
+
+function applyDensity(density: DensityPreference): void {
+  if (density === "comfortable") document.documentElement.dataset.density = density;
+  else delete document.documentElement.dataset.density;
+  try {
+    if (density === "comfortable") localStorage.setItem(DENSITY_PREFERENCE, density);
+    else localStorage.removeItem(DENSITY_PREFERENCE);
+  } catch {
+    // The current page still reflects the choice when storage is unavailable.
   }
 }
 

@@ -21,6 +21,8 @@ export function DisplayOptions({
   open,
   onOpenChange,
   onChange,
+  density,
+  onDensityChange,
 }: {
   display: DisplayState;
   /** Which root surface is showing — grouping is disabled on the board. */
@@ -28,6 +30,8 @@ export function DisplayOptions({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onChange: (d: DisplayState) => void;
+  density: "compact" | "comfortable";
+  onDensityChange: (density: "compact" | "comfortable") => void;
 }) {
   const changed =
     display.group !== "status" || display.order !== "board" || display.deleted;
@@ -92,6 +96,11 @@ export function DisplayOptions({
               active={display.deleted}
               onClick={() => onChange({ ...display, deleted: true })}
             />
+          </Axis>
+
+          <Axis label="Density">
+            <Choice label="Compact" active={density === "compact"} onClick={() => onDensityChange("compact")} />
+            <Choice label="Comfortable" active={density === "comfortable"} onClick={() => onDensityChange("comfortable")} />
           </Axis>
         </Popover.Content>
       </Popover.Portal>
