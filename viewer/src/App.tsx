@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from "react-resizable-panels";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   Command as CommandIcon,
   ListFilter,
@@ -1300,7 +1301,7 @@ export function App() {
             className={
               focusedDetail
                 ? "ui-detail bg-bg fixed inset-0 z-30"
-                : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg"
+                : "ui-detail max-[960px]:fixed max-[960px]:inset-0 max-[960px]:z-30 max-[960px]:bg-bg max-[960px]:pt-[env(safe-area-inset-top)] max-[960px]:pb-[env(safe-area-inset-bottom)]"
             }
           >
             {rows.some((row) => row.reff === selection) ||
@@ -1394,9 +1395,14 @@ export function App() {
           onError={setError}
         />
       )}
-      {mobileNav && (
-        <div className="ui-overlay fixed inset-0 z-40 hidden bg-black/45 backdrop-blur-[2px] max-[960px]:block" onMouseDown={() => setMobileNav(false)}>
-          <aside className="ui-drawer bg-raised shadow-overlay h-full w-[min(320px,88vw)]" onMouseDown={(event) => event.stopPropagation()}>
+      <Dialog.Root open={mobileNav} onOpenChange={setMobileNav}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="ui-overlay fixed inset-0 z-40 hidden bg-black/45 backdrop-blur-[2px] max-[960px]:block" />
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="ui-drawer bg-raised shadow-overlay fixed inset-y-0 left-0 z-40 hidden w-[min(320px,88vw)] pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] outline-none max-[960px]:block"
+          >
+            <Dialog.Title className="sr-only">Workspace navigation</Dialog.Title>
             <Sidebar
               spaces={spaces}
               current={current}
@@ -1441,9 +1447,9 @@ export function App() {
                 setMobileNav(false);
               }}
             />
-          </aside>
-        </div>
-      )}
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
       {checked.size > 0 && !readOnly && current && (
         <BulkBar
           count={checked.size}
