@@ -35,7 +35,7 @@ import { neighbourState, workTarget } from "./core/workflow";
 import { loadFavoriteProjects, loadRecentIssues, toggleFavoriteProject } from "./core/personalNav";
 import { loadSavedViews, type SavedView } from "./core/savedViews";
 import { Activity } from "./ui/Activity";
-import { EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
+import { classifyFailure, EmptyState, InlineError, recoveryForError, TrustPopover } from "./ui/AppState";
 import { Board } from "./ui/Board";
 import { BulkBar } from "./ui/BulkBar";
 import { DisplayOptions } from "./ui/DisplayOptions";
@@ -1236,6 +1236,7 @@ export function App() {
         {error && (
           <InlineError
             {...recoveryForError(error)}
+            failureKind={classifyFailure(error)}
             message={error}
             onRetry={api.refresh}
             onDismiss={() => setError(null)}

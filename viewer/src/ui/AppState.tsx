@@ -91,6 +91,7 @@ export function InlineError({
   onRetry,
   onCopy,
   onDismiss,
+  failureKind,
 }: {
   title?: string;
   message: string;
@@ -98,9 +99,10 @@ export function InlineError({
   onRetry?: () => void;
   onCopy?: () => void;
   onDismiss?: () => void;
+  failureKind?: FailureKind;
 }) {
   return (
-    <div className="border-danger/25 bg-danger/5 text-danger flex items-center gap-2 border-b px-3 py-2 text-sm" role="alert">
+    <div className="border-danger/25 bg-danger/5 text-danger flex items-center gap-2 border-b px-3 py-2 text-sm" role="alert" data-failure-kind={failureKind}>
       <AlertTriangle className="size-3.5 shrink-0" />
       <span className="min-w-0 flex-1">
         {title && <strong className="mr-1">{title}.</strong>}
@@ -127,17 +129,56 @@ export function InlineError({
   );
 }
 
+export type FailureKind =
+  | "offline"
+  | "incompatible"
+  | "authorization"
+  | "read-only"
+  | "invalid-reference"
+  | "stale"
+  | "ambiguity"
+  | "conflict"
+  | "provisional"
+  | "corrupt"
+  | "rejected"
+  | "pending-sync"
+  | "unknown";
+
+export function classifyFailure(message: string): FailureKind {
+  if (/read.?only/i.test(message)) return "read-only";
+  if (/permission|unauthori|forbidden/i.test(message)) return "authorization";
+  if (/version|schema|implementation mismatch|incompatible|upgrade required/i.test(message)) return "incompatible";
+  if (/connect|daemon|network|fetch|offline/i.test(message)) return "offline";
+  if (/not found|unknown (issue|project|reference)|invalid ref/i.test(message)) return "invalid-reference";
+  if (/stale|expected (revision|head)|head changed/i.test(message)) return "stale";
+  if (/ambiguous|multiple matches/i.test(message)) return "ambiguity";
+  if (/conflict|collision|concurrent/i.test(message)) return "conflict";
+  if (/provisional|still arriving/i.test(message)) return "provisional";
+  if (/corrupt|undecodable|malformed/i.test(message)) return "corrupt";
+  if (/pending|queued|synchroniz/i.test(message)) return "pending-sync";
+  if (/reject|refused|validation|invalid/i.test(message)) return "rejected";
+  return "unknown";
+}
+
 export function recoveryForError(message: string): {
   title: string;
   retryLabel: string;
 } {
-  if (/connect|daemon|network|fetch|offline/i.test(message)) {
-    return { title: "Local service unavailable", retryLabel: "Reconnect" };
+  switch (classifyFailure(message)) {
+    case "offline": return { title: "Local service unavailable", retryLabel: "Reconnect" };
+    case "incompatible": return { title: "Viewer update required", retryLabel: "Refresh" };
+    case "authorization": return { title: "Change not allowed", retryLabel: "Refresh" };
+    case "read-only": return { title: "Read-only space", retryLabel: "Refresh" };
+    case "invalid-reference": return { title: "Reference unavailable", retryLabel: "Refresh" };
+    case "stale": return { title: "Data changed elsewhere", retryLabel: "Reload" };
+    case "ambiguity": return { title: "Reference is ambiguous", retryLabel: "Refresh" };
+    case "conflict": return { title: "Concurrent change detected", retryLabel: "Reload" };
+    case "provisional": return { title: "Data is still arriving", retryLabel: "Refresh" };
+    case "corrupt": return { title: "Stored data needs attention", retryLabel: "Refresh" };
+    case "rejected": return { title: "Change rejected", retryLabel: "Retry" };
+    case "pending-sync": return { title: "Change is pending", retryLabel: "Refresh" };
+    default: return { title: "Something didn’t finish", retryLabel: "Retry" };
   }
-  if (/permission|unauthori|read.?only|refused/i.test(message)) {
-    return { title: "Change not allowed", retryLabel: "Refresh" };
-  }
-  return { title: "Something didn’t finish", retryLabel: "Retry" };
 }
 
 /**

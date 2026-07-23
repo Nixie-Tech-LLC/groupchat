@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   ApplicationState,
+  classifyFailure,
   InlineError,
   LoadingState,
   recoveryDiagnostics,
@@ -76,13 +77,28 @@ describe("application state vocabulary", () => {
       retryLabel: "Reconnect",
     });
     expect(recoveryForError("Unauthorized: space is read-only")).toEqual({
-      title: "Change not allowed",
+      title: "Read-only space",
       retryLabel: "Refresh",
     });
     expect(recoveryForError("Unexpected projection failure")).toEqual({
       title: "Something didn’t finish",
       retryLabel: "Retry",
     });
+  });
+
+  it("classifies the complete viewer failure vocabulary", () => {
+    expect(classifyFailure("network offline")).toBe("offline");
+    expect(classifyFailure("schema version incompatible")).toBe("incompatible");
+    expect(classifyFailure("unauthorized")).toBe("authorization");
+    expect(classifyFailure("agent is read-only")).toBe("read-only");
+    expect(classifyFailure("unknown issue reference")).toBe("invalid-reference");
+    expect(classifyFailure("stale expected revision")).toBe("stale");
+    expect(classifyFailure("ambiguous: multiple matches")).toBe("ambiguity");
+    expect(classifyFailure("concurrent conflict")).toBe("conflict");
+    expect(classifyFailure("provisional body still arriving")).toBe("provisional");
+    expect(classifyFailure("corrupt undecodable record")).toBe("corrupt");
+    expect(classifyFailure("validation rejected")).toBe("rejected");
+    expect(classifyFailure("queued pending synchronization")).toBe("pending-sync");
   });
 
   function render(node: React.ReactNode) {
