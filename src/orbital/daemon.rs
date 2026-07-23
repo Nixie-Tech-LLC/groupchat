@@ -73,6 +73,10 @@ pub struct OrbitalDaemon {
     /// beside the Station (which never exposes its own transport). Invite
     /// creation signs exactly these into Coordinates.
     advertised_routes: Vec<runtime::coordinates::ApproachRoute>,
+    /// A retained transport handle (the Station never exposes its own): lets
+    /// the manual `connect` nudge teach routes from a pasted Coordinates link
+    /// before dialing.
+    transport: Arc<dyn Transport>,
     /// The routing Session. `None` until this device holds standing — an
     /// un-admitted joiner serves control (Status/Connect/Members) and drives
     /// Contact before it can dock, then docks lazily once admission lands.
@@ -131,45 +135,95 @@ impl OrbitalDaemon {
                 &[runtime::contact::CONTACT_ALPN, runtime::PRESENCE_ALPN],
             )
             .await?;
-        // Retain a transport clone for invite route advertisement before the
-        // Station consumes one into its Comms.
+        // Retain a transport clone for invite route advertisement (and the
+        // manual `connect` nudge) before the Station consumes one into its
+        // Comms.
         let retained_transport = transport.clone();
+        // Resolve the routes this Station will advertise — in invites AND in
+        // its Beacons: the transport's currently-dialable direct addresses
+        // (bounded wait for a fresh iroh endpoint), canonicalized. A
+        // relay/discovery transport returns none — its invites are
+        // address-free (bare ids resolve).
+        let advertised_addrs = retained_transport
+            .advertised_routes(Duration::from_secs(3))
+            .await
+            .unwrap_or_default();
+        let advertised_routes = runtime::coordinates::canonical_routes(&advertised_addrs);
+        // W0-S1: the gossip bootstrap union — pinned seeds, the verified
+        // invite ticket's approach Station, and persisted Neighbor registry
+        // entries holding an unexpired route lease. Identities only; the
+        // eclipse fence governs everything learned after this.
+        let my_id = retained_transport.my_id();
+        let mut bootstrap: Vec<crate::ids::DeviceId> =
+            load_seeds(home).into_iter().map(|s| s.id).collect();
+        // The ticket's approach Station: teach the transport its signed direct
+        // routes so the first dial resolves (Coordinates-only, no shared
+        // registry), and bootstrap the swarm from it.
+        if let Some(coords) = mechanics.pending_coordinates() {
+            if let Ok(verified) = coords.verify() {
+                if !verified.approach_routes.is_empty() {
+                    // PeerId is a DeviceId — the approach Station's key is
+                    // its dialable peer id.
+                    retained_transport
+                        .learn(verified.approach_station.clone(), &verified.approach_routes);
+                }
+                bootstrap.push(verified.approach_station.clone());
+            }
+        }
+        // Persisted Neighbors with live route leases (S1(c)): dead-hub
+        // recovery — surviving peers keep finding each other without the
+        // approach Station.
+        if let Ok(registry) =
+            runtime::NeighborRegistry::load(&orbital_store_root(home).join(space.as_str()), &space)
+        {
+            for (station, routes) in registry.bootstrap_candidates(now_secs() * 1_000) {
+                let device = station.as_device();
+                let addrs: Vec<std::net::SocketAddr> = routes
+                    .iter()
+                    .filter(|h| h.scheme == 1)
+                    .filter_map(|h| {
+                        std::str::from_utf8(&h.bytes)
+                            .ok()
+                            .and_then(|t| t.parse().ok())
+                    })
+                    .collect();
+                if !addrs.is_empty() {
+                    retained_transport.learn(device.clone(), &addrs);
+                }
+                bootstrap.push(device);
+            }
+        }
+        bootstrap.sort();
+        bootstrap.dedup();
+        bootstrap.retain(|p| p != &my_id);
+        // The Beacon advertisement (scheme 1: UTF-8 socket address) — the same
+        // routes invites carry, in route-hint form, canonically sorted.
+        let mut advertise: Vec<runtime::beacon::RouteHint> = advertised_routes
+            .iter()
+            .map(|r| runtime::beacon::RouteHint {
+                scheme: 1,
+                bytes: r.to_socket().to_string().into_bytes(),
+            })
+            .collect();
+        advertise.sort();
+        advertise.dedup();
+        advertise.truncate(runtime::beacon::MAX_ROUTE_HINTS);
         let station = rt
             .orbit(&space)
             .map_err(|e| anyhow!("acquire orbit: {e:?}"))?
             .activate(ActivationOptions {
                 drain_deadline: Duration::from_secs(5),
-                comms: Some(comms_options(transport, device_seed, &mechanics)),
+                comms: Some(comms_options(
+                    transport,
+                    device_seed,
+                    &mechanics,
+                    bootstrap,
+                    advertise,
+                )),
                 observation_capacity: 0,
             })
             .map_err(|e| anyhow!("activate: {e:?}"))?;
         let identity = Runtime::identity_from_seed(&device_seed);
-        // Resolve the routes this Station will advertise in invites: the
-        // transport's currently-dialable direct addresses (bounded wait for a
-        // fresh iroh endpoint), canonicalized. A relay/discovery transport
-        // returns none — its invites are address-free (bare ids resolve).
-        let advertised_routes = runtime::coordinates::canonical_routes(
-            &retained_transport
-                .advertised_routes(Duration::from_secs(3))
-                .await
-                .unwrap_or_default(),
-        );
-        // Joiner bootstrap: if we are not yet admitted and entered with
-        // Coordinates, teach the transport the approach Station's signed direct
-        // routes so the first Contact dial resolves — Coordinates-only, no
-        // shared registry, no MemNet learn.
-        if !mechanics.am_i_member() {
-            if let Some(coords) = mechanics.pending_coordinates() {
-                if let Ok(verified) = coords.verify() {
-                    if !verified.approach_routes.is_empty() {
-                        // PeerId is a DeviceId — the approach Station's key is
-                        // its dialable peer id.
-                        retained_transport
-                            .learn(verified.approach_station.clone(), &verified.approach_routes);
-                    }
-                }
-            }
-        }
         // Dock now if we already hold standing (founder / re-opened member);
         // otherwise defer until admission lands (an un-admitted joiner cannot
         // dock, but must still serve control to drive its own Contact).
@@ -209,6 +263,7 @@ impl OrbitalDaemon {
             mechanics,
             station,
             advertised_routes,
+            transport: retained_transport,
             session: Mutex::new(session),
             identity,
             device_seed,
@@ -250,7 +305,21 @@ impl OrbitalDaemon {
             &self.identity,
             CLOCK.get_or_init(|| SystemUlidSource),
         );
-        router.route(req, &self.facts()).0
+        // A background Contact can advance the authority frontier between a
+        // submit's resolve and its commit; that typed refusal committed
+        // nothing and is safe to retry. Absorb the transient here so the
+        // ambient convergence plane never turns a user's write into an error.
+        let mut resp = router.route(req.clone(), &self.facts()).0;
+        for _ in 0..3 {
+            match &resp {
+                Response::Error { message, .. } if message == "membership changed — retry" => {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    resp = router.route(req.clone(), &self.facts()).0;
+                }
+                _ => break,
+            }
+        }
+        resp
     }
 
     fn facts(&self) -> RouterFacts {
@@ -447,9 +516,52 @@ impl OrbitalDaemon {
     fn dispatch_station(&self, req: Request) -> Response {
         match req {
             Request::Connect { ticket } => self.connect(&ticket),
-            Request::Who => Response::Who { peers: vec![] },
+            Request::Who => Response::Who { peers: self.who() },
             other => unreachable!("misclassified station request: {other:?}"),
         }
+    }
+
+    /// The reconciled presence assembly: the persistent Neighbor registry's
+    /// advisory reachability (fed by verified Beacons, swarm membership
+    /// events, and Contact outcomes) projected into presence rows. The same
+    /// truth `status.online_peers` counts — the two surfaces cannot disagree.
+    fn who(&self) -> Vec<crate::control::PresenceEntry> {
+        let aliases = read_aliases(&self.home);
+        let now = now_secs();
+        self.station
+            .neighbors()
+            .into_iter()
+            .map(|n| {
+                let id = n.station.as_device().to_string();
+                let online = n.reachability == runtime::Reachability::Reachable;
+                let state = match n.reachability {
+                    runtime::Reachability::Reachable => "online",
+                    runtime::Reachability::Unreachable => "offline",
+                    runtime::Reachability::Unknown => "away",
+                };
+                let last_seen_secs = if n.last_seen_ms == 0 {
+                    0
+                } else {
+                    now.saturating_sub(n.last_seen_ms / 1_000)
+                };
+                crate::control::PresenceEntry {
+                    nick: aliases.get(&id).cloned().unwrap_or_default(),
+                    id,
+                    state: state.to_string(),
+                    online,
+                    last_seen_secs,
+                }
+            })
+            .collect()
+    }
+
+    /// The one number both `status` and `who` report as "online".
+    fn online_peers(&self) -> usize {
+        self.station
+            .neighbors()
+            .iter()
+            .filter(|n| n.reachability == runtime::Reachability::Reachable)
+            .count()
     }
 
     /// Status, subscription, and locally derived projection surfaces.
@@ -556,7 +668,7 @@ impl OrbitalDaemon {
             nick: String::new(),
             name,
             description,
-            online_peers: self.station.neighbors().len(),
+            online_peers: self.online_peers(),
             space: Some(self.station.space_id().as_str().to_string()),
             counts_unavailable: counts.is_none(),
             issues,
@@ -646,7 +758,7 @@ impl OrbitalDaemon {
             space: Some(space.as_str()),
             name: "",
             membership,
-            online_peers: self.station.neighbors().len(),
+            online_peers: self.online_peers(),
             projects,
             issues,
             expected_space: expected_space.as_deref(),
@@ -1124,19 +1236,43 @@ impl OrbitalDaemon {
     }
 
     fn connect(&self, link: &str) -> Response {
-        // A running daemon "connecting" to a peer id triggers an administrative
-        // Contact if we know the Neighbor. Coordinates entry itself happens at
-        // `lait join` (store bootstrap); here we accept a station id to dial.
+        // The manual nudge (W0-S5): a running daemon "connecting" triggers an
+        // administrative Contact now, bypassing backoff. Accepts a station id
+        // to dial, or a Coordinates link — whose signed approach routes are
+        // taught to the transport first, so the dial resolves even after the
+        // peer's addresses changed. Coordinates *entry* (store bootstrap)
+        // stays `lait join`'s job.
+        let link = link.trim();
         let station =
-            crate::ids::DeviceId::parse(link.trim()).and_then(|d| StationId::from_device(&d));
+            match crate::ids::DeviceId::parse(link).and_then(|d| StationId::from_device(&d)) {
+                Some(station) => Some(station),
+                None => runtime::SignedCoordinates::parse_link(link)
+                    .ok()
+                    .and_then(|c| c.verify().ok())
+                    .and_then(|v| {
+                        if !v.approach_routes.is_empty() {
+                            self.transport
+                                .learn(v.approach_station.clone(), &v.approach_routes);
+                        }
+                        StationId::from_device(&v.approach_station)
+                    }),
+            };
         match station {
             Some(station) => match self.station.contact(&station, ContactOptions) {
-                Ok(_) => Response::Ok {
-                    message: Some("contacted".into()),
+                Ok(outcome) => Response::Ok {
+                    message: Some(format!(
+                        "contacted — {} bytes moved{}",
+                        outcome.bytes_moved,
+                        if outcome.convergence.advanced() {
+                            ", new material incorporated"
+                        } else {
+                            ", already converged"
+                        }
+                    )),
                 },
                 Err(e) => Response::err(format!("contact: {e:?}")),
             },
-            None => Response::err("connect expects a station id"),
+            None => Response::err("connect expects a station id or an invite link"),
         }
     }
 
@@ -1367,6 +1503,8 @@ fn comms_options(
     transport: Arc<dyn Transport>,
     seed: [u8; 32],
     mechanics: &OrbitalMechanics,
+    bootstrap: Vec<crate::ids::DeviceId>,
+    advertise: Vec<runtime::beacon::RouteHint>,
 ) -> CommsOptions {
     let export = mechanics.clone();
     let frontier = mechanics.clone();
@@ -1381,8 +1519,10 @@ fn comms_options(
             frontier: Arc::new(move || frontier.current_frontier()),
         },
         gossip: Some(GossipOptions {
-            bootstrap: vec![],
-            advertise: vec![],
+            bootstrap,
+            advertise,
+            // The heartbeat floor's base; emission is edge-triggered
+            // (contact_driver §4.1) and this only bounds staleness.
             beacon_interval: Duration::from_secs(10),
         }),
         whole_deadline: Duration::from_secs(30),
@@ -1472,6 +1612,14 @@ fn remove_seed(home: &Path, needle: &str) -> usize {
         save_seeds(home, &seeds);
     }
     removed
+}
+
+/// The local petname map (`aliases.json` beside the home).
+fn read_aliases(home: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read(home.join("aliases.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 /// Set or clear a **local** petname for a key in `aliases.json` beside the

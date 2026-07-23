@@ -1829,8 +1829,21 @@ pub fn specs() -> Vec<Spec> {
                 A::val("dir", "Create the joined space's store under this directory."),
             ],
             Special::Join,
-        )
-        .alias(&["connect"]),
+        ),
+        Spec::req(
+            "connect",
+            "Nudge the daemon to contact a peer now (a station id, or an invite link \
+             whose host to reach). Joining a new space is `lait join`.",
+            vec![A::pos(
+                "target",
+                "A station/device id, or an invite link for this space.",
+            )],
+            |m| {
+                Ok(Request::Connect {
+                    ticket: req_str(m, "target"),
+                })
+            },
+        ),
         Spec {
             subs: vec![
                 Spec::req(
