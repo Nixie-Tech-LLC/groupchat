@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { rpc } from "../api";
 import { cmdkFilter } from "../core/fuzzy";
 import { loadRecentIssues, rememberRecentIssue } from "../core/personalNav";
+import { indexBy } from "../core/performance";
 import type { ProjectDto, Row, WorkflowState } from "../types";
 import { catalogColor } from "./colors";
 import { PriorityIcon, StatusIcon } from "./icons";
@@ -88,9 +89,21 @@ export function IssueSearch({
       .sort((a, b) => b.score - a.score)
       .map(({ row }) => row);
   }, [available, query]);
+  const projectById = useMemo(
+    () => indexBy(projects, (project) => project.id),
+    [projects],
+  );
+  const stateById = useMemo(
+    () => indexBy(states, (state) => state.id),
+    [states],
+  );
+  const availableByRef = useMemo(
+    () => indexBy(available, (row) => row.reff),
+    [available],
+  );
 
   const choose = (reff: string) => {
-    const row = available.find((candidate) => candidate.reff === reff);
+    const row = availableByRef.get(reff);
     if (!row) return;
     rememberIssue(spaceId, reff);
     onClose();
@@ -126,11 +139,11 @@ export function IssueSearch({
           )}
           {!query.trim() && recents.length > 0 && (
             <Command.Group heading="Recent" className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
-              {recents.map((row) => <IssueResult key={`recent-${row.reff}`} row={row} recent projects={projects} states={states} onOpen={choose} />)}
+              {recents.map((row) => <IssueResult key={`recent-${row.reff}`} row={row} recent projectById={projectById} stateById={stateById} onOpen={choose} />)}
             </Command.Group>
           )}
           <Command.Group heading={query.trim() ? `${results.length} results` : "All issues"} className="[&_[cmdk-group-heading]]:text-mute [&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-2xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase">
-            {results.map((row) => <IssueResult key={row.reff} row={row} projects={projects} states={states} onOpen={choose} />)}
+            {results.map((row) => <IssueResult key={row.reff} row={row} projectById={projectById} stateById={stateById} onOpen={choose} />)}
           </Command.Group>
         </Command.List>
       </Command>
@@ -138,9 +151,9 @@ export function IssueSearch({
   );
 }
 
-function IssueResult({ row, recent, projects, states, onOpen }: { row: Row; recent?: boolean; projects: ProjectDto[]; states: WorkflowState[]; onOpen: (reff: string) => void }) {
-  const project = projects.find((candidate) => candidate.id === row.project_id);
-  const state = states.find((candidate) => candidate.id === row.status);
+function IssueResult({ row, recent, projectById, stateById, onOpen }: { row: Row; recent?: boolean; projectById: ReadonlyMap<string, ProjectDto>; stateById: ReadonlyMap<string, WorkflowState>; onOpen: (reff: string) => void }) {
+  const project = projectById.get(row.project_id);
+  const state = stateById.get(row.status);
   return (
     <Command.Item
       value={row.reff}

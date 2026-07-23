@@ -32,6 +32,7 @@ import { describeChanges, describeEvent, type NameResolver } from "../core/activ
 import type { Field as PredictField } from "../core/overlay";
 import type { IssueField } from "../core/registry";
 import { inverseWorkAction, primaryWorkAction, workTarget } from "../core/workflow";
+import { boundedTail } from "../core/performance";
 import {
   type GraphView,
   type LinkDto,
@@ -697,6 +698,7 @@ export function IssueDetail({
         )}
 
         <Timeline
+          key={reff}
           events={events}
           comments={issue.comments}
           memberOf={memberOf}
@@ -1323,6 +1325,7 @@ function Timeline({
   onReact: (comment: string, emoji: string, on: boolean) => void;
   onReply: (replyTo: string, body: string) => void;
 }) {
+  const [visibleCount, setVisibleCount] = useState(40);
   // The naming policy lives here, where the member list is: a key becomes an alias,
   // "you", or a short prefix. `describeEvent` only decides *whether* there is a name.
   const resolveName: NameResolver = (key) => nameOf(key, memberOf(key));
@@ -1343,8 +1346,15 @@ function Timeline({
     return out.sort((a, b) => a.at - b.at || a.order - b.order);
   }, [events, comments]);
 
-  const repliesOf = (c: CommentDto): CommentDto[] =>
-    c.id ? comments.filter((r) => r.parent === c.id) : [];
+  const repliesByParent = useMemo(() => {
+    const indexed = new Map<string, CommentDto[]>();
+    for (const comment of comments) {
+      if (!comment.parent) continue;
+      indexed.set(comment.parent, [...(indexed.get(comment.parent) ?? []), comment]);
+    }
+    return indexed;
+  }, [comments]);
+  const visibleEntries = boundedTail(entries, visibleCount);
 
   return (
     <section className="flex flex-col gap-3">
@@ -1362,13 +1372,22 @@ function Timeline({
       </h3>
 
       {entries.length === 0 && <p className="text-mute text-sm">Nothing yet.</p>}
+      {entries.length > visibleCount && (
+        <Button
+          variant="ghost"
+          onClick={() => setVisibleCount((count) => count + 40)}
+          className="self-start"
+        >
+          Show {Math.min(40, entries.length - visibleCount)} earlier changes
+        </Button>
+      )}
 
-      {entries.map((entry) =>
+      {visibleEntries.map((entry) =>
         entry.kind === "comment" ? (
           <Comment
             key={`c${entry.order}`}
             comment={entry.comment}
-            replies={repliesOf(entry.comment)}
+            replies={entry.comment.id ? (repliesByParent.get(entry.comment.id) ?? []) : []}
             memberOf={memberOf}
             readOnly={readOnly}
             meKey={meKey}

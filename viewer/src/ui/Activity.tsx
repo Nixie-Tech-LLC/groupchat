@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Activity as ActivityIcon, AlertTriangle } from "lucide-react";
 
 import { rpc } from "../api";
 import { describeChanges, describeEvent, type NameResolver } from "../core/activity";
+import { boundedTail, indexBy } from "../core/performance";
 import type { ActivityEvent, MemberDto } from "../types";
 import { EmptyState, LoadingState } from "./AppState";
 import { memberName } from "./Avatar";
@@ -40,8 +41,13 @@ export function Activity({
   onOpen: (reff: string) => void;
 }) {
   const [events, setEvents] = useState<ActivityEvent[] | null>(null);
+  const [visibleCount, setVisibleCount] = useState(80);
+  const memberByKey = useMemo(
+    () => indexBy(members, (member) => member.key),
+    [members],
+  );
   const resolveName: NameResolver = (key) =>
-    memberName(key, members.find((m) => m.key === key));
+    memberName(key, memberByKey.get(key));
 
   useEffect(() => {
     let alive = true;
@@ -78,8 +84,18 @@ export function Activity({
 
   return (
     <ul className="min-h-0 flex-1 overflow-y-auto">
+      {events.length > visibleCount && (
+        <li className="border-line/60 border-b p-2 text-center">
+          <button
+            className="text-accent rounded px-2 py-1 text-sm"
+            onClick={() => setVisibleCount((count) => count + 80)}
+          >
+            Show {Math.min(80, events.length - visibleCount)} older changes
+          </button>
+        </li>
+      )}
       {/* Newest first: the feed answers "what just happened", not "what happened". */}
-      {[...events].reverse().map((e) => (
+      {[...boundedTail(events, visibleCount)].reverse().map((e) => (
         <li
           key={e.seq}
           onClick={() => onOpen(e.reff)}

@@ -95,10 +95,22 @@ export function stackFor(
   keys: readonly string[],
   members: readonly MemberDto[],
 ): Array<{ key: string; alias: string; me: boolean }> {
+  const indexed = memberIndexes.get(members) ?? indexMembers(members);
   return keys.map((key) => {
-    const m = members.find((x) => x.key === key);
+    const m = indexed.get(key);
     return { key, alias: m?.alias ?? "", me: m?.me ?? false };
   });
+}
+
+/** Row and card rendering calls `stackFor` once per record. Cache the immutable
+ * ACL projection by array identity so that becomes O(assignees), not O(rows ×
+ * assignees × members), without pushing lookup plumbing through every component. */
+const memberIndexes = new WeakMap<readonly MemberDto[], ReadonlyMap<string, MemberDto>>();
+
+function indexMembers(members: readonly MemberDto[]): ReadonlyMap<string, MemberDto> {
+  const indexed = new Map(members.map((member) => [member.key, member]));
+  memberIndexes.set(members, indexed);
+  return indexed;
 }
 
 /**

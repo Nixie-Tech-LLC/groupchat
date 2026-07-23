@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { CheckSquare, ChevronRight, Copy, ExternalLink, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 
 import type { RowGroup } from "../core/display";
+import { indexBy } from "../core/performance";
 import type { MemberDto, Row, WorkflowState } from "../types";
 import { Avatar, AvatarStack, memberName, stackFor } from "./Avatar";
 import { ApplicationState } from "./AppState";
@@ -64,6 +65,10 @@ export function IssueList({
   filtered: boolean;
 }) {
   const visible = (g: RowGroup) => g.rows.filter((r) => !r.tombstone);
+  const stateById = useMemo(
+    () => indexBy(states, (state) => state.id),
+    [states],
+  );
   const total = deletedMode
     ? deleted.length
     : groups.reduce((n, g) => n + visible(g).length, 0);
@@ -79,7 +84,7 @@ export function IssueList({
             key={group.key}
             group={group}
             rows={visible(group)}
-            states={states}
+            stateById={stateById}
             members={members}
             selection={selection}
             checked={checked}
@@ -103,7 +108,7 @@ export function IssueList({
                 <IssueRow
                   key={row.reff}
                   row={row}
-                  state={states.find((s) => s.id === row.status)}
+                  state={stateById.get(row.status)}
                   members={members}
                   selected={row.reff === selection}
                   checked={checked.has(row.reff)}
@@ -152,7 +157,7 @@ function GroupIcon({ group, members }: { group: RowGroup; members: MemberDto[] }
 function Group({
   group,
   rows,
-  states,
+  stateById,
   members,
   selection,
   checked,
@@ -165,7 +170,7 @@ function Group({
 }: {
   group: RowGroup;
   rows: Row[];
-  states: WorkflowState[];
+  stateById: ReadonlyMap<string, WorkflowState>;
   members: MemberDto[];
   selection: string | null;
   checked: ReadonlySet<string>;
@@ -221,7 +226,7 @@ function Group({
           <IssueRow
             key={row.reff}
             row={row}
-            state={states.find((s) => s.id === row.status)}
+            state={stateById.get(row.status)}
             members={members}
             selected={row.reff === selection}
             checked={checked.has(row.reff)}
