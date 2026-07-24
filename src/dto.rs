@@ -308,6 +308,137 @@ pub struct ProjectDto {
     pub name: String,
     pub key: String,
     pub color: String,
+    /// Overview markdown (additive; empty when unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Lead actor key (empty = none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lead: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_date: Option<u64>,
+    /// Soft-hidden (archived). Additive; absent-when-false so pre-archive
+    /// consumers decode unchanged. Clients hide these from pickers and
+    /// all-project lists but can still open one directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Owning team id (empty = none; GOV-7). Additive.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub team: String,
+}
+
+/// One project milestone with its derived progress (SCOPE-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MilestoneDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_date: Option<u64>,
+    /// Live (non-tombstoned) issues targeting this milestone.
+    pub total: u32,
+    /// Of those, issues in a Done-category state.
+    pub done: u32,
+}
+
+/// One cycle with its derived counts (BOARD-11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    pub total: u32,
+    pub done: u32,
+}
+
+/// One initiative with its derived roll-up (SCOPE-8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitiativeDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_date: Option<u64>,
+    /// Member project KEYs (resolved; unknown ids are dropped).
+    pub projects: Vec<String>,
+    /// Live issues across the member projects.
+    pub total: u32,
+    pub done: u32,
+}
+
+/// One team (GOV-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDto {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lead: String,
+    pub members: Vec<String>,
+    /// KEYs of the projects this team owns.
+    pub projects: Vec<String>,
+}
+
+/// One triage-intake item (SCOPE-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageDto {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub submitted_by: String,
+    pub ts: u64,
+    /// "" (pending) | `accepted` | `declined` | `duplicate`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
+    /// The canonical reff of the accepted/duplicated issue, when decided.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reff: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decided_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+/// Attachment metadata as projected on an issue (CREATE-5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentMetaDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mime: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    pub ts: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+/// One project status update, projected for the updates feed (SCOPE-1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdateDto {
+    pub id: String,
+    /// The authoring actor key.
+    pub author: String,
+    /// Post time, unix seconds.
+    pub ts: u64,
+    pub body: String,
+    /// `on_track` | `at_risk` | `off_track` | "" (none).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub health: String,
 }
 
 /// A label registry entry.
@@ -345,6 +476,25 @@ pub struct Row {
     pub assignees: Vec<ActorId>,
     pub tombstone: bool,
     pub provisional: bool,
+    /// Due date, unix seconds. Additive with absent-when-none serialization so
+    /// pre-duedate consumers keep decoding the same bytes for undated rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<u64>,
+    /// Estimate points (scale is the team's convention, not the schema's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<u32>,
+    /// Resolved label names (empty when none). Additive so a card can show label
+    /// dots without a second fetch; older consumers ignore the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub label_names: Vec<String>,
+    /// Sub-issue progress: done and total live (non-tombstoned) children. `None`
+    /// when the issue has no children, so a card only draws a progress mini-bar
+    /// for issues that actually parent others. Additive/absent-when-none, and set
+    /// only where the child index is cheaply available (the board projection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_done: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_total: Option<u32>,
 }
 
 /// A board column: an ordered slice of rows for one workflow state.
@@ -376,6 +526,23 @@ pub struct CommentDto {
     pub author_nick: Option<String>,
     pub ts: u64,
     pub body: String,
+    /// Canonical comment id (`cmt_…`). Absent on comments stored before
+    /// comment identity existed — those cannot anchor reactions or replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The comment this one replies to (one level of nesting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Emoji reactions, grouped: each emoji with the actors who reacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<ReactionDto>,
+}
+
+/// One emoji's reactions on one comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionDto {
+    pub emoji: String,
+    pub actors: Vec<ActorId>,
 }
 
 /// The full issue projection — populated by lazily loading the issue doc
@@ -401,6 +568,23 @@ pub struct IssueView {
     pub comments: Vec<CommentDto>,
     pub created_by: ActorId,
     pub created_at: u64,
+    /// Due date, unix seconds (absent = none). Additive, like `Row.due_date`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<u32>,
+    /// Subscribed actors, independent of assignment (INBOX-9). Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<ActorId>,
+    /// The targeted milestone id (SCOPE-1). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
+    /// The scheduled cycle id (BOARD-11). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<String>,
+    /// Attachment metadata (CREATE-5) — payloads come from `attachment get`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentMetaDto>,
     pub provisional: bool,
     /// Records under this issue that failed to project (see [`CorruptRecord`]).
     ///

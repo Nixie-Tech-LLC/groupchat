@@ -141,6 +141,12 @@ pub enum Request {
         labels: Vec<String>,
         #[serde(default)]
         body: Option<String>,
+        /// Due date: unix seconds or `YYYY-MM-DD` (UTC midnight).
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points.
+        #[serde(default)]
+        estimate: Option<u32>,
     },
     IssueEdit {
         reff: String,
@@ -154,6 +160,13 @@ pub enum Request {
         /// no `LoroText` cursor; the daemon applies it as a text update).
         #[serde(default)]
         description: Option<String>,
+        /// Due date: unix seconds, `YYYY-MM-DD` (UTC midnight), or `none` to
+        /// clear. Absent = untouched.
+        #[serde(default)]
+        due: Option<String>,
+        /// Estimate points, or `none` to clear. Absent = untouched.
+        #[serde(default)]
+        estimate: Option<String>,
     },
     IssueMove {
         reff: String,
@@ -178,6 +191,21 @@ pub enum Request {
     Comment {
         reff: String,
         body: String,
+        /// The comment id being replied to (from `IssueView.comments[].id`),
+        /// when this comment is a reply. One level of nesting.
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    /// Toggle an emoji reaction on a comment. Writes no history event — a
+    /// reaction is a social signal, not a change of record.
+    React {
+        reff: String,
+        /// The target comment's id (`IssueView.comments[].id`).
+        comment: String,
+        emoji: String,
+        /// `true` (default) adds the reaction; `false` removes it.
+        #[serde(default = "default_true")]
+        on: bool,
     },
     IssueDelete {
         reff: String,
@@ -249,14 +277,249 @@ pub enum Request {
     ProjectNew {
         name: String,
         key: String,
+        #[serde(default)]
+        color: Option<String>,
     },
     ProjectList,
+    ProjectEdit {
+        /// KEY or `prj_` id.
+        project: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        target: Option<String>,
+        /// Soft-hide toggle: `Some(true)` archives, `Some(false)` restores,
+        /// `None` leaves it untouched (CUSTOM-9).
+        #[serde(default)]
+        archived: Option<bool>,
+        /// Owning team (key/name/`tm_` id), or "" / "none" to clear (GOV-7).
+        #[serde(default)]
+        team: Option<String>,
+    },
+    /// Hard-delete an EMPTY project (CUSTOM-10): refused while any issue —
+    /// live or tombstoned — still references it.
+    ProjectDelete {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Subscribe to (or unsubscribe from) an issue's activity without holding
+    /// its assignment (INBOX-9). Reply: `Ref`.
+    Follow {
+        reff: String,
+        /// `true` (default) follows; `false` unfollows.
+        #[serde(default = "default_true")]
+        on: bool,
+    },
+    /// A project's milestones with derived progress (SCOPE-1). Reply:
+    /// `Milestones`.
+    MilestoneList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a project milestone (SCOPE-1).
+    MilestoneSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing milestone (name or `mls_` id); absent creates one.
+        #[serde(default)]
+        milestone: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        target: Option<String>,
+        /// Tombstone the milestone (issues keep their register; it reads as
+        /// cleared once the milestone is gone).
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Point an issue at a milestone in its project, or clear it with
+    /// `milestone: None`/"none".
+    IssueMilestone {
+        reff: String,
+        #[serde(default)]
+        milestone: Option<String>,
+    },
+    /// A project's cycles with derived counts (BOARD-11). Reply: `Cycles`.
+    CycleList {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Create, edit, or tombstone a cycle (BOARD-11).
+    CycleSet {
+        /// KEY or `prj_` id.
+        project: String,
+        /// Existing cycle (name or `cyc_` id); absent creates one.
+        #[serde(default)]
+        cycle: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear. Absent leaves it untouched.
+        #[serde(default)]
+        start: Option<String>,
+        #[serde(default)]
+        end: Option<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Schedule an issue into a cycle, or clear it.
+    IssueCycle {
+        reff: String,
+        #[serde(default)]
+        cycle: Option<String>,
+    },
+    /// Every live initiative with its roll-up (SCOPE-8). Reply: `Initiatives`.
+    InitiativeList,
+    /// Create, edit, or tombstone an initiative (SCOPE-8).
+    InitiativeSet {
+        /// Existing initiative (name or `ini_` id); absent creates one.
+        #[serde(default)]
+        initiative: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        /// Owner actor key, or "" / "none" to clear.
+        #[serde(default)]
+        owner: Option<String>,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+        /// `YYYY-MM-DD`, or "none" to clear.
+        #[serde(default)]
+        target: Option<String>,
+        /// Project refs to add to / remove from the membership.
+        #[serde(default)]
+        add_projects: Vec<String>,
+        #[serde(default)]
+        remove_projects: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// Every live team with its owned projects (GOV-7). Reply: `Teams`.
+    TeamList,
+    /// Create, edit, or tombstone a team (GOV-7; admin-only).
+    TeamSet {
+        /// Existing team (KEY, name, or `tm_` id); absent creates one.
+        #[serde(default)]
+        team: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        /// Short handle, set at creation, immutable after.
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        icon: Option<String>,
+        /// Lead actor key, or "" / "none" to clear.
+        #[serde(default)]
+        lead: Option<String>,
+        /// Actor keys to add to / remove from the membership.
+        #[serde(default)]
+        add_members: Vec<String>,
+        #[serde(default)]
+        remove_members: Vec<String>,
+        #[serde(default)]
+        remove: bool,
+    },
+    /// The triage intake queue, pending first (SCOPE-7). Reply: `TriageItems`.
+    TriageList,
+    /// Report work into the intake queue — outside every project workflow
+    /// until reviewed (SCOPE-7).
+    TriageSubmit {
+        title: String,
+        #[serde(default)]
+        body: Option<String>,
+        /// Where this came from (an integration name, "cli", …).
+        #[serde(default)]
+        source: Option<String>,
+    },
+    /// Decide a pending triage item: `accepted` (into `project`), `declined`,
+    /// or `duplicate` (of `target`). Exactly once per item.
+    TriageDecide {
+        /// The `trg_` intake id.
+        id: String,
+        outcome: String,
+        #[serde(default)]
+        project: Option<String>,
+        /// The duplicated issue's ref (duplicate outcome).
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    /// Attach a bounded file to an issue (CREATE-5). `data_b64` is the
+    /// standard-base64 payload (raw size ≤ 256 KiB). Reply: `Ref`.
+    Attach {
+        reff: String,
+        name: String,
+        #[serde(default)]
+        mime: Option<String>,
+        data_b64: String,
+        /// A comment id to associate the file with.
+        #[serde(default)]
+        comment: Option<String>,
+    },
+    /// Remove an attachment record.
+    Detach {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
+    },
+    /// One attachment's payload (CREATE-5). Reply: `Attachment`.
+    AttachmentGet {
+        reff: String,
+        /// The `att_` attachment id.
+        id: String,
+    },
+    /// A project's status-update feed, newest first (SCOPE-1). Reply: `Updates`.
+    ProjectUpdates {
+        /// KEY or `prj_` id.
+        project: String,
+    },
+    /// Append an immutable status update to a project's feed (SCOPE-1).
+    ProjectUpdatePost {
+        /// KEY or `prj_` id.
+        project: String,
+        body: String,
+        /// `on_track` | `at_risk` | `off_track` | "" (none).
+        #[serde(default)]
+        health: Option<String>,
+    },
     LabelNew {
         name: String,
         #[serde(default)]
         color: Option<String>,
     },
     LabelList,
+    LabelEdit {
+        /// Name or `lbl_` id.
+        label: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        color: Option<String>,
+    },
+    LabelDelete {
+        /// Name or `lbl_` id.
+        label: String,
+    },
+    SpaceRename {
+        name: String,
+    },
+    /// Set (or clear, empty) the space's overview description (SCOPE-2).
+    SpaceDescribe {
+        description: String,
+    },
     Activity {
         #[serde(default)]
         since: u64,
@@ -279,6 +542,13 @@ pub enum Request {
     },
     MemberRemove {
         who: String,
+    },
+    /// Elevate or demote an existing member (admin-only): a signed
+    /// `SetGrants` on the ACL. `admin: true` promotes, `false` demotes to a
+    /// plain writing member. Refused for agents and for the last admin.
+    MemberSetRole {
+        who: String,
+        admin: bool,
     },
     /// Sponsor an agent keypair. Any human member may sponsor;
     /// the agent is sealed the space key but holds no membership or content
@@ -431,6 +701,11 @@ pub enum Request {
     AccessRevoke {
         grant_id: String,
     },
+    /// Activate this build's reviewed IssuesWorld implementation for the
+    /// Space (admin-authored ACL action; idempotent when already active).
+    /// The activation is what receipts pin — a build whose descriptor differs
+    /// from the active one should run this before writing.
+    WorldUpgrade,
     /// A project's workflow revision head(s).
     WorkflowShow {
         project: String,
@@ -574,6 +849,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
@@ -589,8 +865,33 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::History { .. }
         | Request::ProjectNew { .. }
         | Request::ProjectList
+        | Request::ProjectEdit { .. }
+        | Request::ProjectUpdates { .. }
+        | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneList { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleList { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeList
+        | Request::InitiativeSet { .. }
+        | Request::TeamList
+        | Request::TeamSet { .. }
+        | Request::TriageList
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
+        | Request::AttachmentGet { .. }
         | Request::LabelNew { .. }
         | Request::LabelList
+        | Request::LabelEdit { .. }
+        | Request::LabelDelete { .. }
+        | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         | Request::Activity { .. }
         | Request::RoleList
         | Request::RoleShow { .. }
@@ -605,6 +906,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         // ---- Mechanics: membership, admission, ceremonies, custody, devices ----
         Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
+        | Request::MemberSetRole { .. }
         | Request::Members
         | Request::MemberLog
         | Request::AgentAdd { .. }
@@ -627,6 +929,7 @@ pub fn classify(req: &Request) -> RequestOwner {
         | Request::AccessList { .. }
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
+        | Request::WorldUpgrade
         | Request::Id => Mechanics,
 
         // ---- Station: connect/neighbor/Contact ----
@@ -665,6 +968,8 @@ pub fn representative_requests() -> Vec<Request> {
             priority: None,
             labels: vec![],
             body: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueEdit {
             reff: s(),
@@ -672,6 +977,8 @@ pub fn representative_requests() -> Vec<Request> {
             status: None,
             priority: None,
             description: None,
+            due: None,
+            estimate: None,
         },
         Request::IssueMove {
             reff: s(),
@@ -691,6 +998,13 @@ pub fn representative_requests() -> Vec<Request> {
         Request::Comment {
             reff: s(),
             body: s(),
+            reply_to: None,
+        },
+        Request::React {
+            reff: s(),
+            comment: s(),
+            emoji: s(),
+            on: true,
         },
         Request::IssueDelete { reff: s() },
         Request::IssueRestore { reff: s() },
@@ -725,13 +1039,114 @@ pub fn representative_requests() -> Vec<Request> {
         Request::ProjectNew {
             name: s(),
             key: s(),
+            color: None,
         },
         Request::ProjectList,
+        Request::ProjectEdit {
+            project: s(),
+            name: None,
+            color: None,
+            description: None,
+            lead: None,
+            start: None,
+            target: None,
+            archived: None,
+            team: None,
+        },
+        Request::ProjectUpdates { project: s() },
+        Request::ProjectUpdatePost {
+            project: s(),
+            body: s(),
+            health: None,
+        },
+        Request::ProjectDelete { project: s() },
+        Request::Follow {
+            reff: s(),
+            on: true,
+        },
+        Request::MilestoneList { project: s() },
+        Request::MilestoneSet {
+            project: s(),
+            milestone: None,
+            name: None,
+            target: None,
+            remove: false,
+        },
+        Request::IssueMilestone {
+            reff: s(),
+            milestone: None,
+        },
+        Request::CycleList { project: s() },
+        Request::CycleSet {
+            project: s(),
+            cycle: None,
+            name: None,
+            start: None,
+            end: None,
+            remove: false,
+        },
+        Request::IssueCycle {
+            reff: s(),
+            cycle: None,
+        },
+        Request::InitiativeList,
+        Request::InitiativeSet {
+            initiative: None,
+            name: None,
+            description: None,
+            owner: None,
+            health: None,
+            target: None,
+            add_projects: vec![],
+            remove_projects: vec![],
+            remove: false,
+        },
+        Request::TeamList,
+        Request::TeamSet {
+            team: None,
+            name: None,
+            key: None,
+            icon: None,
+            lead: None,
+            add_members: vec![],
+            remove_members: vec![],
+            remove: false,
+        },
+        Request::TriageList,
+        Request::TriageSubmit {
+            title: s(),
+            body: None,
+            source: None,
+        },
+        Request::TriageDecide {
+            id: s(),
+            outcome: s(),
+            project: None,
+            target: None,
+            note: None,
+        },
+        Request::Attach {
+            reff: s(),
+            name: s(),
+            mime: None,
+            data_b64: s(),
+            comment: None,
+        },
+        Request::Detach { reff: s(), id: s() },
+        Request::AttachmentGet { reff: s(), id: s() },
         Request::LabelNew {
             name: s(),
             color: None,
         },
         Request::LabelList,
+        Request::LabelEdit {
+            label: s(),
+            name: None,
+            color: None,
+        },
+        Request::LabelDelete { label: s() },
+        Request::SpaceRename { name: s() },
+        Request::SpaceDescribe { description: s() },
         Request::Activity { since: 0 },
         Request::RoleList,
         Request::RoleShow { role: s() },
@@ -764,6 +1179,7 @@ pub fn representative_requests() -> Vec<Request> {
             project: None,
         },
         Request::AccessRevoke { grant_id: s() },
+        Request::WorldUpgrade,
         Request::WorkflowShow { project: s() },
         Request::WorkflowValidate { body_json: s() },
         Request::WorkflowSet {
@@ -778,6 +1194,10 @@ pub fn representative_requests() -> Vec<Request> {
             as_name: None,
         },
         Request::MemberRemove { who: s() },
+        Request::MemberSetRole {
+            who: s(),
+            admin: false,
+        },
         Request::AgentAdd { key: s() },
         Request::KeyRotate,
         Request::InviteRevoke { invite: s() },
@@ -902,6 +1322,10 @@ pub enum Response {
     Projects {
         projects: Vec<ProjectDto>,
     },
+    /// A project's status-update feed (reply to [`Request::ProjectUpdates`]).
+    Updates {
+        updates: Vec<crate::dto::ProjectUpdateDto>,
+    },
     Labels {
         labels: Vec<LabelDto>,
     },
@@ -919,6 +1343,32 @@ pub enum Response {
     /// Pinned seeds ("remotes") and their reachability.
     Seeds {
         seeds: Vec<SeedDto>,
+    },
+    /// Reply to [`Request::MilestoneList`].
+    Milestones {
+        milestones: Vec<crate::dto::MilestoneDto>,
+    },
+    /// Reply to [`Request::CycleList`].
+    Cycles {
+        cycles: Vec<crate::dto::CycleDto>,
+    },
+    /// Reply to [`Request::InitiativeList`].
+    Initiatives {
+        initiatives: Vec<crate::dto::InitiativeDto>,
+    },
+    /// Reply to [`Request::TeamList`].
+    Teams {
+        teams: Vec<crate::dto::TeamDto>,
+    },
+    /// Reply to [`Request::TriageList`].
+    TriageItems {
+        items: Vec<crate::dto::TriageDto>,
+    },
+    /// Reply to [`Request::AttachmentGet`] — the full record incl. payload.
+    Attachment {
+        name: String,
+        mime: String,
+        data_b64: String,
     },
     /// A ref resolved to many candidates, represented as a first-class outcome,
     /// or, when `near_miss_for` is set, matched **nothing** and these are the
@@ -1067,6 +1517,10 @@ pub struct StatusInfo {
     /// The space display name (synced catalog value; empty on a joiner
     /// whose catalog hasn't arrived yet).
     pub name: String,
+    /// The space overview description (synced catalog value; empty when unset).
+    /// Additive so pre-SCOPE-2 clients decode the status unchanged.
+    #[serde(default)]
+    pub description: String,
     pub online_peers: usize,
     pub space: Option<String>,
     pub issues: usize,

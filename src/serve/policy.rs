@@ -42,6 +42,13 @@ pub fn is_read(req: &Request) -> bool {
         | Request::RoleList
         | Request::RoleShow { .. }
         | Request::AccessList { .. }
+        | Request::ProjectUpdates { .. }
+        | Request::MilestoneList { .. }
+        | Request::CycleList { .. }
+        | Request::InitiativeList
+        | Request::TeamList
+        | Request::TriageList
+        | Request::AttachmentGet { .. }
         | Request::WorkflowShow { .. }
         | Request::WorkflowValidate { .. }
         | Request::Hello { .. } => true,
@@ -56,6 +63,7 @@ pub fn is_read(req: &Request) -> bool {
         | Request::Assign { .. }
         | Request::Label { .. }
         | Request::Comment { .. }
+        | Request::React { .. }
         | Request::IssueDelete { .. }
         | Request::IssueRestore { .. }
         | Request::IssueLink { .. }
@@ -67,10 +75,29 @@ pub fn is_read(req: &Request) -> bool {
         | Request::IssueStop { .. }
         // …the registries…
         | Request::ProjectNew { .. }
+        | Request::ProjectEdit { .. }
+        | Request::ProjectUpdatePost { .. }
+        | Request::ProjectDelete { .. }
+        | Request::Follow { .. }
+        | Request::MilestoneSet { .. }
+        | Request::IssueMilestone { .. }
+        | Request::CycleSet { .. }
+        | Request::IssueCycle { .. }
+        | Request::InitiativeSet { .. }
+        | Request::TeamSet { .. }
+        | Request::TriageSubmit { .. }
+        | Request::TriageDecide { .. }
+        | Request::Attach { .. }
+        | Request::Detach { .. }
         | Request::LabelNew { .. }
+        | Request::LabelEdit { .. }
+        | Request::LabelDelete { .. }
+        | Request::SpaceRename { .. }
+        | Request::SpaceDescribe { .. }
         // …the ACL, every op of which is signed by whoever's daemon runs it…
         | Request::MemberAdd { .. }
         | Request::MemberRemove { .. }
+        | Request::MemberSetRole { .. }
         | Request::MemberAlias { .. }
         | Request::KeyRotate
         | Request::InviteRevoke { .. }
@@ -101,6 +128,8 @@ pub fn is_read(req: &Request) -> bool {
         | Request::AccessGrant { .. }
         | Request::AccessRevoke { .. }
         | Request::WorkflowSet { .. }
+        // …implementation activation is a signed ACL write…
+        | Request::WorldUpgrade
         // …and node control.
         | Request::ConfigReload
         | Request::Stop => false,
